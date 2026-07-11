@@ -170,6 +170,26 @@ This fetches and normalizes real financials, runs a DCF with placeholder
 assumptions, and prints the result. Raw provider responses are saved under
 `data/raw/` for auditing.
 
+### Probe latency and bursts
+
+Phase 4 keeps provider work inside a bounded budget: each FMP request uses a
+6-second timeout, at most 2 retries, capped 2-second retry waits, and a default
+provider concurrency of 3. The worst degraded path remains short enough to
+return a controlled response within normal Vercel function limits.
+
+Run the repeatable fixture-backed cold/warm/burst probe with no API key:
+
+```bash
+python scripts/load_probe.py
+```
+
+Probe a running local server or Vercel deployment:
+
+```bash
+python scripts/load_probe.py --base-url http://127.0.0.1:8000
+python scripts/load_probe.py --base-url https://your-project.vercel.app
+```
+
 ## Project layout
 
 ```
@@ -186,6 +206,7 @@ docs/
   index.html        # customer landing page + live API valuation UI
 scripts/
   smoke_fetch.py    # live end-to-end check against the real FMP API
+  load_probe.py     # cold/warm/same-ticker burst latency probe
 tests/
   test_dcf_engine.py   # spreadsheet-verified cases, validation, hypothesis invariants
   test_data_layer.py   # client + normalization tests over fixture payloads

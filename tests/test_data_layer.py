@@ -465,7 +465,7 @@ def test_retries_on_429_with_backoff_then_succeeds():
 
     result = asyncio.run(scenario())
     assert result.income[0]["revenue"] == 391_035_000_000
-    assert sleeps == [5.0, 5.0]  # capped Retry-After on both 429s
+    assert sleeps == [2.0, 2.0]  # capped Retry-After on both 429s
 
 
 def test_invalid_retry_after_uses_bounded_jittered_backoff():

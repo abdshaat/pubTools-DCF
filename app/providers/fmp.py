@@ -32,6 +32,10 @@ from ..exceptions import (
 )
 
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/stable"
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 6.0
+DEFAULT_MAX_RETRIES = 2
+DEFAULT_PROVIDER_CONCURRENCY = 3
+DEFAULT_MAX_RETRY_AFTER_SECONDS = 2.0
 # FMP's starter plans currently allow historical statement `limit` values up to 5.
 # Fetching five annual candidates is enough to avoid mixing incomplete recent
 # filings while keeping the API compatible with the user's current provider plan.
@@ -81,12 +85,12 @@ class FMPClient:
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
         transport: httpx.AsyncBaseTransport | None = None,
-        max_retries: int = 3,
-        timeout: float = 10.0,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        timeout: float = DEFAULT_PROVIDER_TIMEOUT_SECONDS,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         raw_sink: RawSink | None = None,
-        provider_concurrency: int = 3,
-        max_retry_after_seconds: float = 5.0,
+        provider_concurrency: int = DEFAULT_PROVIDER_CONCURRENCY,
+        max_retry_after_seconds: float = DEFAULT_MAX_RETRY_AFTER_SECONDS,
         jitter: Callable[[], float] = random.random,
     ):
         if provider_concurrency < 1:
