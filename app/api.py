@@ -26,7 +26,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Path, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from . import MODEL_VERSION
 from .dcf_engine import DCFValidationError, compute_dcf, compute_sensitivity_grid
@@ -80,6 +80,28 @@ def _parse_revenue_growth(raw: str) -> list[float]:
     return values
 
 
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
+}
+
+_LANDING_PAGE_CSP = "; ".join(
+    [
+        "default-src 'self'",
+        "base-uri 'none'",
+        "connect-src 'self' http://127.0.0.1:* http://localhost:*",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        "img-src 'self' data:",
+        "object-src 'none'",
+        "script-src 'self' 'unsafe-inline'",
+        "style-src 'self' 'unsafe-inline'",
+    ]
+)
+
+
 def create_app(
     fmp_client: FMPClient | None = None,
     ttl_seconds: float = 4 * 3600,
@@ -117,6 +139,7 @@ def create_app(
         request.state.request_id = str(uuid4())
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
+        response.headers.update(_SECURITY_HEADERS)
         return response
 
     # --- error mapping (see app/exceptions.py for the rationale) ---
@@ -210,6 +233,13 @@ def create_app(
         return _error(request, 503, detail, "provider_unavailable", detail)
 
     # --- routes ---
+
+    @app.get("/", include_in_schema=False)
+    async def landing_page() -> FileResponse:
+        return FileResponse(
+            FilePath(__file__).parent.parent / "docs" / "index.html",
+            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+        )
 
     @app.get(
         "/v1/valuations/{ticker}",

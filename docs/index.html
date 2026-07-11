@@ -418,6 +418,42 @@
   }
   .copy:hover { border-color: var(--code-accent); color: var(--code-accent); }
   .copy:focus-visible { outline: 2px solid var(--code-accent); outline-offset: 1px; }
+  .actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 18px; }
+  .run {
+    border: none; background: var(--accent); color: var(--accent-ink);
+    border-radius: 6px; padding: 10px 16px; font-size: 14px; font-weight: 650;
+    font-family: inherit; cursor: pointer;
+  }
+  .run:hover { filter: brightness(0.96); }
+  .run:disabled { cursor: not-allowed; opacity: 0.6; }
+  .run:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .result-card {
+    margin-top: 18px; border: 1px solid var(--line); border-radius: 10px;
+    background: var(--paper); overflow: hidden;
+  }
+  .result-card[hidden] { display: none; }
+  .result-head {
+    display: flex; justify-content: space-between; gap: 12px; align-items: center;
+    padding: 12px 16px; border-bottom: 1px solid var(--line);
+  }
+  .result-title { font-weight: 650; }
+  .result-status {
+    font-family: var(--font-mono); font-size: 12px; color: var(--muted); text-align: right;
+  }
+  .result-summary {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; padding: 16px;
+  }
+  .metric {
+    border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+    background: var(--panel);
+  }
+  .metric .label {
+    display: block; font-family: var(--font-mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.08em; color: var(--faint);
+  }
+  .metric .value { display: block; margin-top: 4px; font-size: 20px; font-weight: 700; }
+  .result-json { margin: 0 16px 16px; max-height: 320px; }
 
   footer {
     margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line);
@@ -706,8 +742,9 @@ FMP_API_KEY=your-key-here</code></pre>
 </section>
 
 <section id="builder">
-  <h2>Endpoint builder</h2>
-  <p>Enter your assumptions and get a ready-to-use endpoint URL. Values you'd quote as
+  <h2>Try the API</h2>
+  <p>Enter your assumptions, call the API from this page, and keep the generated endpoint URL.
+  Values you'd quote as
   percentages go in as percentages here — the builder converts them to the decimal form the
   API expects, validates them against the same rules the server enforces, and emits parameters
   in canonical order (canonically-ordered URLs are HTTP-cacheable and dedupe cleanly).</p>
@@ -717,7 +754,7 @@ FMP_API_KEY=your-key-here</code></pre>
     <div class="grid">
       <div class="field">
         <label for="b-base">Base URL</label>
-        <input id="b-base" type="text" value="http://127.0.0.1:8000" spellcheck="false">
+        <input id="b-base" type="text" value="" placeholder="Same origin" spellcheck="false">
       </div>
       <div class="field">
         <label for="b-ticker">Ticker</label>
@@ -755,6 +792,19 @@ FMP_API_KEY=your-key-here</code></pre>
     </fieldset>
 
     <div class="builder-errors" id="b-errors" role="alert" aria-live="polite"></div>
+
+    <div class="actions">
+      <button class="run" type="button" id="run-valuation">Run valuation</button>
+    </div>
+
+    <div class="result-card" id="result-card" hidden>
+      <div class="result-head">
+        <span class="result-title" id="result-title">Valuation result</span>
+        <span class="result-status" id="result-status"></span>
+      </div>
+      <div class="result-summary" id="result-summary"></div>
+      <pre class="result-json"><code id="result-json"></code></pre>
+    </div>
 
     <div class="urlout" id="urlbox">
       <div class="label-row">
@@ -1099,6 +1149,13 @@ FMP_API_KEY=your-key-here</code></pre>
 
   var $ = function (id) { return document.getElementById(id); };
   var mode = "single";
+  var currentUrl = "";
+
+  function defaultBaseUrl() {
+    return window.location.protocol.indexOf("http") === 0
+      ? window.location.origin
+      : "http://127.0.0.1:8000";
+  }
 
   function growthCount() {
     if (mode === "single") return 1;
@@ -1143,7 +1200,7 @@ FMP_API_KEY=your-key-here</code></pre>
   function update() {
     var errors = [];
     var ticker = $("b-ticker").value.trim().toUpperCase();
-    var base = $("b-base").value.trim().replace(/\/+$/, "");
+    var base = ($("b-base").value.trim() || defaultBaseUrl()).replace(/\/+$/, "");
     var wacc = pct("b-wacc");
     var tg = pct("b-tg");
     var margin = pct("b-margin");
@@ -1178,15 +1235,19 @@ FMP_API_KEY=your-key-here</code></pre>
     });
 
     var urlBox = $("urlbox"), curlBox = $("curlbox");
+    var runButton = $("run-valuation");
     if (errors.length) {
       urlBox.classList.add("invalid");
       curlBox.classList.add("invalid");
+      runButton.disabled = true;
+      currentUrl = "";
       $("b-url").textContent = "Fix the fields above to generate your endpoint.";
       $("b-curl").textContent = "—";
       return;
     }
     urlBox.classList.remove("invalid");
     curlBox.classList.remove("invalid");
+    runButton.disabled = false;
 
     // canonical (alphabetical) parameter order — cache-friendly
     var growthStr = growths.map(fmtDec).join(",");
@@ -1201,8 +1262,85 @@ FMP_API_KEY=your-key-here</code></pre>
     var qs = params.map(function (p) { return p[0] + "=" + encodeURIComponent(p[1]); }).join("&");
     var url = base + "/v1/valuations/" + ticker + "?" + qs;
 
+    currentUrl = url;
     $("b-url").textContent = url;
     $("b-curl").textContent = 'curl -H "X-API-Key: YOUR_KEY" "' + url + '"';
+  }
+
+  function money(value, currency) {
+    if (typeof value !== "number" || !isFinite(value)) return "n/a";
+    try {
+      return new Intl.NumberFormat(undefined, {
+        style: "currency",
+        currency: currency || "USD",
+        maximumFractionDigits: 2
+      }).format(value);
+    } catch (e) {
+      return value.toFixed(2);
+    }
+  }
+
+  function pctText(value) {
+    if (typeof value !== "number" || !isFinite(value)) return "n/a";
+    return (value >= 0 ? "+" : "") + value.toFixed(1) + "%";
+  }
+
+  function showResult(title, status, body) {
+    var card = $("result-card");
+    var summary = $("result-summary");
+    card.hidden = false;
+    $("result-title").textContent = title;
+    $("result-status").textContent = status;
+    $("result-json").textContent = JSON.stringify(body, null, 2);
+    summary.innerHTML = "";
+
+    if (!body || body.error) return;
+    [
+      ["Intrinsic value", money(body.intrinsic_value_per_share, body.currency)],
+      ["Current price", money(body.current_price, body.currency)],
+      ["Upside", pctText(body.upside_pct)],
+      ["Statement", body.base_financials ? body.base_financials.source_period : "n/a"]
+    ].forEach(function (item) {
+      var metric = document.createElement("div");
+      metric.className = "metric";
+      var label = document.createElement("span");
+      label.className = "label";
+      label.textContent = item[0];
+      var value = document.createElement("span");
+      value.className = "value";
+      value.textContent = item[1];
+      metric.appendChild(label);
+      metric.appendChild(value);
+      summary.appendChild(metric);
+    });
+  }
+
+  async function runValuation() {
+    update();
+    if (!currentUrl) return;
+    var button = $("run-valuation");
+    button.disabled = true;
+    button.textContent = "Running...";
+    showResult("Valuation result", "Loading", { status: "loading", url: currentUrl });
+    try {
+      var response = await fetch(currentUrl, { headers: { "Accept": "application/json" } });
+      var text = await response.text();
+      var body;
+      try {
+        body = text ? JSON.parse(text) : {};
+      } catch (e) {
+        body = { detail: text || "Empty response" };
+      }
+      showResult(response.ok ? "Valuation result" : "API error", "HTTP " + response.status, body);
+    } catch (e) {
+      showResult("Request failed", "Network error", {
+        detail: e && e.message ? e.message : "Unable to call the API from this browser.",
+        url: currentUrl
+      });
+    } finally {
+      button.disabled = false;
+      button.textContent = "Run valuation";
+    }
   }
 
   function setMode(next) {
@@ -1215,6 +1353,7 @@ FMP_API_KEY=your-key-here</code></pre>
 
   $("mode-single").addEventListener("click", function () { setMode("single"); });
   $("mode-peryear").addEventListener("click", function () { setMode("peryear"); });
+  $("run-valuation").addEventListener("click", runValuation);
 
   ["b-base", "b-ticker", "b-wacc", "b-tg", "b-margin", "b-tax", "b-years"].forEach(function (id) {
     $(id).addEventListener("input", function () {
@@ -1255,6 +1394,7 @@ FMP_API_KEY=your-key-here</code></pre>
   }
 
   renderGrowthInputs();
+  $("b-base").value = defaultBaseUrl();
   update();
 })();
 </script>

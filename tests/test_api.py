@@ -395,3 +395,22 @@ def test_health_endpoint():
         response = test_client.get("/health")
     assert response.status_code == 200
     assert response.json()["model_version"] == MODEL_VERSION
+
+
+def test_root_serves_customer_landing_page():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/")
+    assert response.status_code == 200
+    assert "text/html" in response.headers["content-type"]
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+    assert response.headers["X-Frame-Options"] == "DENY"
+    assert response.headers["Referrer-Policy"] == "no-referrer"
+    assert "geolocation=()" in response.headers["Permissions-Policy"]
+    csp = response.headers["Content-Security-Policy"]
+    assert "default-src 'self'" in csp
+    assert "frame-ancestors 'none'" in csp
+    assert "object-src 'none'" in csp
+    assert "connect-src 'self'" in csp
+    assert "Run valuation" in response.text
+    assert "/v1/valuations/" in response.text

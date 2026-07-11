@@ -78,7 +78,7 @@ the selected data auditable.
 | Normalization — provider payloads → canonical `BaseFinancials` | `app/normalization.py` | ✅ done |
 | Fundamentals service — fetch + normalize + TTL cache | `app/fundamentals.py` | ✅ done |
 | API layer — FastAPI routes, validation, error mapping | `app/api.py`, `app/schemas.py` | ✅ done |
-| Customer docs — API reference + interactive endpoint builder | `docs/index.html` | ✅ done |
+| Customer website — landing page, API reference, and live valuation UI | `docs/index.html` served at `/` | ✅ done |
 | Postgres / Redis storage, per-key metering | — | planned |
 
 The engine is a pure function — `compute_dcf(base_financials, assumptions) ->
@@ -135,10 +135,10 @@ Then try it:
 GET http://127.0.0.1:8000/v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30&revenue_growth=0.05
 ```
 
-Interactive OpenAPI docs at `http://127.0.0.1:8000/docs`; health probe at
-`/health`. Customer-facing documentation — including an endpoint builder
-that turns a form of assumptions into a ready-to-hit URL — lives in
-[`docs/index.html`](docs/index.html).
+Customer landing page at `http://127.0.0.1:8000/`; interactive OpenAPI docs at
+`http://127.0.0.1:8000/docs`; health probe at `/health`. The landing page is
+served from [`docs/index.html`](docs/index.html) and includes a browser UI that
+calls `/v1/valuations/{ticker}` directly from the current site origin.
 
 ### Fetch live data
 
@@ -171,7 +171,7 @@ app/
   fundamentals.py   # FundamentalsService: fetch + normalize + TTL cache
   providers/fmp.py  # async FMP client: retries, backoff, raw-response sink
 docs/
-  index.html        # customer API reference + interactive endpoint builder
+  index.html        # customer landing page + live API valuation UI
 scripts/
   smoke_fetch.py    # live end-to-end check against the real FMP API
 tests/
