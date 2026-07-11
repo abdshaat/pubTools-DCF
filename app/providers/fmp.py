@@ -31,7 +31,10 @@ from ..exceptions import (
 )
 
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/stable"
-STATEMENT_FETCH_LIMIT = 8
+# FMP's starter plans currently allow historical statement `limit` values up to 5.
+# Fetching five annual candidates is enough to avoid mixing incomplete recent
+# filings while keeping the API compatible with the user's current provider plan.
+STATEMENT_FETCH_LIMIT = 5
 
 # (endpoint path, needs limit param)
 _STATEMENT_ENDPOINTS = [

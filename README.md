@@ -51,7 +51,7 @@ upstream provider call each time — the FMP free tier allows only ~250/day.
 
 ### Statement freshness
 
-The API fetches up to eight annual candidates from each financial-statement
+The API fetches up to five annual candidates from each financial-statement
 endpoint. It joins income, balance-sheet, and cash-flow records by annual period
 and exact statement date, verifies fiscal-year and currency compatibility, then
 selects the newest complete filing set. Duplicate periods prefer the newest

@@ -329,7 +329,7 @@ def test_statement_fetch_requests_multiple_candidate_periods():
             await client.fetch_fundamentals("AAPL")
 
     asyncio.run(scenario())
-    assert observed_limits == ["8", "8", "8"]
+    assert observed_limits == ["5", "5", "5"]
 
 
 def test_provider_rejects_malformed_statement_record_list():
