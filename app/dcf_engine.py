@@ -14,7 +14,16 @@ discussion, per CLAUDE.md):
     per-year margin ramp).
 """
 
-from .models import Assumptions, BaseFinancials, Valuation, YearProjection
+from dataclasses import replace
+from typing import Optional
+
+from .models import (
+    Assumptions,
+    BaseFinancials,
+    SensitivityGrid,
+    Valuation,
+    YearProjection,
+)
 
 
 class DCFValidationError(ValueError):
@@ -38,6 +47,9 @@ def _validate(base: BaseFinancials, assumptions: Assumptions) -> None:
             "revenue_growth",
             "must be a single value or one value per projection year",
         )
+
+    if assumptions.wacc <= 0:
+        raise DCFValidationError("wacc", "must be positive")
 
     if assumptions.terminal_growth >= assumptions.wacc:
         raise DCFValidationError(
@@ -122,4 +134,43 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
         intrinsic_value_per_share=intrinsic_value_per_share,
         current_price=base.current_price,
         upside_pct=upside_pct,
+    )
+
+
+# Grid offsets per CLAUDE.md: WACC +/-1% x terminal growth +/-0.5%.
+WACC_OFFSETS = (-0.01, 0.0, 0.01)
+TERMINAL_GROWTH_OFFSETS = (-0.005, 0.0, 0.005)
+
+
+def compute_sensitivity_grid(
+    base: BaseFinancials, assumptions: Assumptions
+) -> SensitivityGrid:
+    """3x3 grid of intrinsic value per share around the caller's WACC and
+    terminal growth. Pure like compute_dcf. The center cell always equals
+    the point estimate; combinations that would break the Gordon formula
+    (g >= WACC, or WACC <= 0) come back as None rather than erroring, so
+    one bad corner doesn't cost the caller the whole grid.
+    """
+    # round() strips float-add artifacts (0.09 - 0.01 = 0.07999...) so the
+    # echoed axis values are clean
+    wacc_values = tuple(round(assumptions.wacc + o, 10) for o in WACC_OFFSETS)
+    growth_values = tuple(
+        round(assumptions.terminal_growth + o, 10) for o in TERMINAL_GROWTH_OFFSETS
+    )
+
+    rows: list[tuple[Optional[float], ...]] = []
+    for wacc in wacc_values:
+        row: list[Optional[float]] = []
+        for growth in growth_values:
+            if wacc <= 0 or growth >= wacc:
+                row.append(None)
+            else:
+                shifted = replace(assumptions, wacc=wacc, terminal_growth=growth)
+                row.append(compute_dcf(base, shifted).intrinsic_value_per_share)
+        rows.append(tuple(row))
+
+    return SensitivityGrid(
+        wacc_values=wacc_values,
+        terminal_growth_values=growth_values,
+        per_share_values=tuple(rows),
     )

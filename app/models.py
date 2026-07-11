@@ -5,7 +5,7 @@ unit-convention rule in CLAUDE.md.
 """
 
 from dataclasses import dataclass
-from typing import Sequence, Union
+from typing import Optional, Sequence, Union
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,18 @@ class YearProjection:
     fcf: float
     discount_factor: float
     pv_fcf: float
+
+
+@dataclass(frozen=True)
+class SensitivityGrid:
+    """Intrinsic value per share across WACC (rows) x terminal growth
+    (columns) around the caller's assumptions. Cells where the combination
+    is invalid (terminal growth >= WACC, or WACC <= 0) are None.
+    """
+
+    wacc_values: tuple[float, ...]
+    terminal_growth_values: tuple[float, ...]
+    per_share_values: tuple[tuple[Optional[float], ...], ...]
 
 
 @dataclass(frozen=True)

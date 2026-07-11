@@ -5,8 +5,14 @@ Public surface is the pure DCF engine and its data types. The API layer
 should depend on these, never the other way around.
 """
 
-from .dcf_engine import DCFValidationError, compute_dcf
-from .models import Assumptions, BaseFinancials, Valuation, YearProjection
+from .dcf_engine import DCFValidationError, compute_dcf, compute_sensitivity_grid
+from .models import (
+    Assumptions,
+    BaseFinancials,
+    SensitivityGrid,
+    Valuation,
+    YearProjection,
+)
 
 MODEL_VERSION = "0.1.0"
 
@@ -15,7 +21,9 @@ __all__ = [
     "BaseFinancials",
     "DCFValidationError",
     "MODEL_VERSION",
+    "SensitivityGrid",
     "Valuation",
     "YearProjection",
     "compute_dcf",
+    "compute_sensitivity_grid",
 ]

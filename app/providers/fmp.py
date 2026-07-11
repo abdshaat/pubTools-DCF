@@ -20,7 +20,12 @@ from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
-from ..exceptions import ProviderAuthError, ProviderError, TickerNotFoundError
+from ..exceptions import (
+    ProviderAuthError,
+    ProviderError,
+    TickerNotCoveredError,
+    TickerNotFoundError,
+)
 
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/stable"
 
@@ -108,6 +113,15 @@ class FMPClient:
                     raise ProviderAuthError(
                         f"FMP rejected the API key (HTTP {response.status_code})"
                     )
+                # 402 Payment Required: FMP returns this for any symbol
+                # outside the account's plan coverage. On restricted plans it
+                # also comes back for symbols that don't exist, so we surface
+                # a distinct "not covered" error rather than asserting the
+                # ticker is unknown. Neither 402 nor 404 is retried — the
+                # answer won't change, and retrying would waste the daily
+                # provider-call budget.
+                if response.status_code == 402:
+                    raise TickerNotCoveredError(ticker)
                 if response.status_code == 404:
                     raise TickerNotFoundError(ticker)
                 if response.status_code == 429 or response.status_code >= 500:

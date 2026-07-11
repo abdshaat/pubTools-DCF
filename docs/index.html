@@ -1,0 +1,895 @@
+<title>DCF Valuation API — Documentation</title>
+<style>
+  :root {
+    --paper: #fafaf7;
+    --ink: #1c2320;
+    --muted: #5b6862;
+    --faint: #8a948f;
+    --line: #e2e6e1;
+    --accent: #0b7a55;
+    --accent-ink: #ffffff;
+    --panel: #f1f3ef;
+    --code-bg: #1b2226;
+    --code-ink: #d7e0da;
+    --code-accent: #3ecf9a;
+    --code-str: #9ecbff;
+    --code-num: #f0b263;
+    --warn: #b45309;
+    --warn-bg: #fdf3e4;
+    --err: #b3261e;
+    --ok-bg: #e7f2ec;
+    --sidebar-bg: #14181a;
+    --sidebar-ink: #aeb8b2;
+    --sidebar-active: #3ecf9a;
+    --method-bg: #0b7a55;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #101413;
+      --ink: #dde4df;
+      --muted: #93a09a;
+      --faint: #6b7772;
+      --line: #263029;
+      --accent: #3ecf9a;
+      --accent-ink: #08130e;
+      --panel: #171d1a;
+      --code-bg: #161c1f;
+      --code-ink: #cfd9d3;
+      --warn: #e8a04c;
+      --warn-bg: #2a2118;
+      --err: #ef8b84;
+      --ok-bg: #14241d;
+      --sidebar-bg: #0b0e0d;
+      --method-bg: #0f8f65;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #101413;
+    --ink: #dde4df;
+    --muted: #93a09a;
+    --faint: #6b7772;
+    --line: #263029;
+    --accent: #3ecf9a;
+    --accent-ink: #08130e;
+    --panel: #171d1a;
+    --code-bg: #161c1f;
+    --code-ink: #cfd9d3;
+    --warn: #e8a04c;
+    --warn-bg: #2a2118;
+    --err: #ef8b84;
+    --ok-bg: #14241d;
+    --sidebar-bg: #0b0e0d;
+    --method-bg: #0f8f65;
+  }
+  :root[data-theme="light"] {
+    --paper: #fafaf7;
+    --ink: #1c2320;
+    --muted: #5b6862;
+    --faint: #8a948f;
+    --line: #e2e6e1;
+    --accent: #0b7a55;
+    --accent-ink: #ffffff;
+    --panel: #f1f3ef;
+    --code-bg: #1b2226;
+    --code-ink: #d7e0da;
+    --warn: #b45309;
+    --warn-bg: #fdf3e4;
+    --err: #b3261e;
+    --ok-bg: #e7f2ec;
+    --sidebar-bg: #14181a;
+    --method-bg: #0b7a55;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.65 -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+  }
+  code, pre, .mono {
+    font-family: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+  }
+
+  .layout { display: flex; min-height: 100vh; }
+
+  /* ---------- sidebar ---------- */
+  nav {
+    width: 248px;
+    flex-shrink: 0;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-ink);
+    padding: 28px 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav .brand {
+    padding: 0 24px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    margin-bottom: 16px;
+  }
+  nav .brand .name {
+    color: #fff;
+    font-weight: 650;
+    font-size: 15px;
+    letter-spacing: 0.01em;
+  }
+  nav .brand .ver {
+    font-size: 12px;
+    color: var(--sidebar-active);
+    font-family: Consolas, monospace;
+  }
+  nav .group {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #6b7772;
+    padding: 18px 24px 6px;
+  }
+  nav a {
+    display: block;
+    padding: 6px 24px;
+    color: var(--sidebar-ink);
+    text-decoration: none;
+    font-size: 13.5px;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { color: #fff; }
+  nav a:focus-visible { outline: 2px solid var(--sidebar-active); outline-offset: -2px; }
+  nav a.active { color: var(--sidebar-active); border-left-color: var(--sidebar-active); }
+
+  /* ---------- main ---------- */
+  main { flex: 1; min-width: 0; padding: 48px 56px 120px; }
+  .content { max-width: 780px; }
+
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
+  h2 {
+    font-size: 21px;
+    margin: 0 0 14px;
+    padding-top: 56px;
+    letter-spacing: -0.005em;
+    text-wrap: balance;
+  }
+  h3 { font-size: 16px; margin: 28px 0 10px; }
+  p { max-width: 68ch; margin: 0 0 14px; }
+  .lede { font-size: 17.5px; color: var(--muted); max-width: 62ch; }
+  section { border-bottom: 1px solid var(--line); padding-bottom: 40px; }
+  section:last-child { border-bottom: none; }
+  a { color: var(--accent); }
+
+  .eyebrow {
+    font-family: Consolas, monospace;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--accent);
+    margin: 0 0 6px;
+  }
+
+  /* endpoint signature chip */
+  .endpoint {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin: 14px 0 20px;
+    overflow-x: auto;
+  }
+  .endpoint .method {
+    background: var(--method-bg);
+    color: var(--accent-ink);
+    font-family: Consolas, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 9px;
+    border-radius: 4px;
+    letter-spacing: 0.04em;
+  }
+  .endpoint code { font-size: 14px; white-space: nowrap; }
+
+  /* code panels */
+  pre {
+    background: var(--code-bg);
+    color: var(--code-ink);
+    border-radius: 8px;
+    padding: 16px 18px;
+    font-size: 13px;
+    line-height: 1.6;
+    overflow-x: auto;
+    margin: 14px 0 20px;
+  }
+  pre .k { color: var(--code-accent); }
+  pre .s { color: var(--code-str); }
+  pre .n { color: var(--code-num); }
+  pre .c { color: #7d8a84; }
+  code {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+    font-size: 0.86em;
+  }
+  pre code { background: none; border: none; padding: 0; font-size: inherit; }
+
+  .panel-label {
+    font-family: Consolas, monospace;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--faint);
+    margin: 18px 0 -8px;
+  }
+
+  /* tables */
+  .tablewrap { overflow-x: auto; margin: 14px 0 20px; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th {
+    text-align: left;
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--faint);
+    font-weight: 600;
+    padding: 8px 14px 8px 0;
+    border-bottom: 1px solid var(--line);
+  }
+  td {
+    padding: 10px 14px 10px 0;
+    border-bottom: 1px solid var(--line);
+    vertical-align: top;
+  }
+  td:first-child code { white-space: nowrap; }
+  .req { color: var(--err); font-size: 12px; font-weight: 600; }
+  .opt { color: var(--faint); font-size: 12px; }
+  .status { font-family: Consolas, monospace; font-weight: 700; white-space: nowrap; }
+  .status.ok { color: var(--accent); }
+  .status.err { color: var(--err); }
+
+  .note {
+    background: var(--warn-bg);
+    border-left: 3px solid var(--warn);
+    border-radius: 0 6px 6px 0;
+    padding: 12px 16px;
+    margin: 16px 0;
+    font-size: 14.5px;
+    max-width: 68ch;
+  }
+  .note strong { color: var(--warn); }
+
+  /* ---------- endpoint builder ---------- */
+  .builder {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 24px;
+    margin-top: 18px;
+  }
+  .builder h3 { margin-top: 0; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px 20px;
+    margin-bottom: 4px;
+  }
+  .field label {
+    display: block;
+    font-size: 12.5px;
+    font-weight: 600;
+    margin-bottom: 5px;
+  }
+  .field .hint { color: var(--faint); font-weight: 400; }
+  .field input, .field select {
+    width: 100%;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: Consolas, monospace;
+    font-size: 14px;
+  }
+  .field input:focus-visible, .field select:focus-visible, .growth-years input:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+    border-color: var(--accent);
+  }
+  .growth-years { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+  .growth-years .yr { width: 92px; }
+  .growth-years .yr label {
+    display: block; font-size: 11px; color: var(--faint); margin-bottom: 3px;
+    font-family: Consolas, monospace;
+  }
+  .growth-years input {
+    width: 100%; padding: 7px 8px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--paper); color: var(--ink);
+    font-family: Consolas, monospace; font-size: 13.5px;
+  }
+  fieldset { border: none; padding: 0; margin: 16px 0 0; }
+  legend { font-size: 12.5px; font-weight: 600; padding: 0; margin-bottom: 6px; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+  .seg button {
+    border: none; background: var(--paper); color: var(--muted);
+    padding: 7px 14px; font-size: 13px; cursor: pointer; font-family: inherit;
+  }
+  .seg button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+  .builder-errors { margin: 14px 0 0; }
+  .builder-errors div {
+    color: var(--err); font-size: 13.5px; padding: 2px 0;
+    font-family: Consolas, monospace;
+  }
+  .urlout {
+    margin-top: 18px;
+    background: var(--code-bg);
+    border-radius: 8px;
+    padding: 14px 16px;
+  }
+  .urlout .label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+  .urlout .lbl {
+    font-family: Consolas, monospace; font-size: 11px; letter-spacing: 0.1em;
+    text-transform: uppercase; color: #7d8a84;
+  }
+  .urlout output {
+    display: block;
+    font-family: Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.6;
+    color: var(--code-accent);
+    word-break: break-all;
+  }
+  .urlout.invalid output { color: #7d8a84; }
+  .copy {
+    background: transparent;
+    border: 1px solid #3a4742;
+    color: var(--code-ink);
+    border-radius: 5px;
+    padding: 4px 12px;
+    font-size: 12.5px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .copy:hover { border-color: var(--code-accent); color: var(--code-accent); }
+  .copy:focus-visible { outline: 2px solid var(--code-accent); outline-offset: 1px; }
+
+  footer {
+    margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line);
+    font-size: 13px; color: var(--faint); max-width: 68ch;
+  }
+
+  @media (max-width: 860px) {
+    nav { display: none; }
+    main { padding: 32px 20px 80px; }
+  }
+</style>
+
+<div class="layout">
+<nav aria-label="Documentation">
+  <div class="brand">
+    <div class="name">DCF Valuation API</div>
+    <div class="ver">v1 &middot; model 0.1.0</div>
+  </div>
+  <div class="group">Getting started</div>
+  <a href="#overview">Overview</a>
+  <a href="#quickstart">Quickstart</a>
+  <a href="#authentication">Authentication</a>
+  <div class="group">Tools</div>
+  <a href="#builder">Endpoint builder</a>
+  <div class="group">API reference</div>
+  <a href="#valuations">Get a valuation</a>
+  <a href="#parameters">Query parameters</a>
+  <a href="#response">Response schema</a>
+  <a href="#errors">Validation &amp; errors</a>
+  <a href="#health">Health check</a>
+  <div class="group">Notes</div>
+  <a href="#methodology">Methodology</a>
+  <a href="#disclaimer">Disclaimer</a>
+</nav>
+
+<main>
+<div class="content">
+
+<section id="overview">
+  <p class="eyebrow">API Documentation</p>
+  <h1>DCF Valuation API</h1>
+  <p class="lede">Request a discounted cash flow valuation for any supported US stock with your own
+  assumptions in a single GET request. The response includes every intermediate number —
+  base financials, year-by-year projections, discount factors, terminal value — so you can
+  audit the math down to the dollar.</p>
+
+  <div class="endpoint">
+    <span class="method">GET</span>
+    <code>/v1/valuations/{ticker}</code>
+  </div>
+
+  <p>You supply the assumptions; we supply the financials. Company fundamentals (revenue, EBIT,
+  D&amp;A, capex, working capital, debt, share count) are fetched from our data provider,
+  normalized into a canonical schema, and combined with your inputs by a deterministic
+  valuation engine. Identical requests return identical results for a given
+  <code>model_version</code> and source period.</p>
+
+  <p><strong>v1 scope:</strong> non-financial US large caps. Banks and insurers are rejected with
+  <code>422</code> — a standard free-cash-flow DCF doesn't apply to financial balance sheets.</p>
+</section>
+
+<section id="quickstart">
+  <h2>Quickstart</h2>
+  <p>Value Apple with a 9% discount rate, 2.5% perpetual growth, 30% EBIT margin, and a
+  five-year growth ramp from 8% down to 4%:</p>
+
+  <div class="panel-label">Request</div>
+  <pre><code>curl "<span class="s">https://api.example.com/v1/valuations/AAPL</span>?\
+<span class="k">wacc</span>=<span class="n">0.09</span>&amp;\
+<span class="k">terminal_growth</span>=<span class="n">0.025</span>&amp;\
+<span class="k">ebit_margin</span>=<span class="n">0.30</span>&amp;\
+<span class="k">revenue_growth</span>=<span class="n">0.08,0.07,0.06,0.05,0.04</span>&amp;\
+<span class="k">projection_years</span>=<span class="n">5</span>"</code></pre>
+
+  <p>All rates are decimals: <code>0.09</code> means 9%. <code>revenue_growth</code> takes a single
+  value applied to every year, or one comma-separated value per projection year. Prefer not to
+  hand-write URLs? Use the <a href="#builder">endpoint builder</a> below.</p>
+</section>
+
+<section id="authentication">
+  <h2>Authentication</h2>
+  <p>Requests are authenticated with an API key sent in the <code>X-API-Key</code> header:</p>
+  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> <span class="s">"https://api.example.com/v1/valuations/AAPL?..."</span></code></pre>
+  <div class="note"><strong>Preview:</strong> per-customer API keys and usage metering are not yet
+  enforced in the current release. The header is accepted and will become mandatory before
+  general availability — include it now so your integration doesn't break later.</div>
+</section>
+
+<section id="builder">
+  <h2>Endpoint builder</h2>
+  <p>Enter your assumptions and get a ready-to-use endpoint URL. Values you'd quote as
+  percentages go in as percentages here — the builder converts them to the decimal form the
+  API expects, validates them against the same rules the server enforces, and emits parameters
+  in canonical order (canonically-ordered URLs are HTTP-cacheable and dedupe cleanly).</p>
+
+  <div class="builder">
+    <h3>Your assumptions</h3>
+    <div class="grid">
+      <div class="field">
+        <label for="b-base">Base URL</label>
+        <input id="b-base" type="text" value="https://api.example.com" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="b-ticker">Ticker</label>
+        <input id="b-ticker" type="text" value="AAPL" maxlength="10" spellcheck="false" autocapitalize="characters">
+      </div>
+      <div class="field">
+        <label for="b-wacc">WACC <span class="hint">%</span></label>
+        <input id="b-wacc" type="number" value="9" step="0.1" min="0.1">
+      </div>
+      <div class="field">
+        <label for="b-tg">Terminal growth <span class="hint">%</span></label>
+        <input id="b-tg" type="number" value="2.5" step="0.1">
+      </div>
+      <div class="field">
+        <label for="b-margin">EBIT margin <span class="hint">%</span></label>
+        <input id="b-margin" type="number" value="30" step="0.5">
+      </div>
+      <div class="field">
+        <label for="b-tax">Tax rate <span class="hint">% — optional, default 21</span></label>
+        <input id="b-tax" type="number" value="21" step="0.5" min="0">
+      </div>
+      <div class="field">
+        <label for="b-years">Projection years <span class="hint">3–15</span></label>
+        <input id="b-years" type="number" value="5" step="1" min="3" max="15">
+      </div>
+    </div>
+
+    <fieldset>
+      <legend>Revenue growth (% per year)</legend>
+      <div class="seg" role="group" aria-label="Revenue growth mode">
+        <button type="button" id="mode-single" aria-pressed="true">Same every year</button>
+        <button type="button" id="mode-peryear" aria-pressed="false">Per-year values</button>
+      </div>
+      <div class="growth-years" id="growth-inputs"></div>
+    </fieldset>
+
+    <div class="builder-errors" id="b-errors" role="alert" aria-live="polite"></div>
+
+    <div class="urlout" id="urlbox">
+      <div class="label-row">
+        <span class="lbl">Your endpoint</span>
+        <button class="copy" type="button" id="copy-url">Copy URL</button>
+      </div>
+      <output id="b-url" for="b-ticker"></output>
+    </div>
+    <div class="urlout" id="curlbox">
+      <div class="label-row">
+        <span class="lbl">As curl</span>
+        <button class="copy" type="button" id="copy-curl">Copy curl</button>
+      </div>
+      <output id="b-curl"></output>
+    </div>
+  </div>
+</section>
+
+<section id="valuations">
+  <h2>Get a valuation</h2>
+  <div class="endpoint">
+    <span class="method">GET</span>
+    <code>/v1/valuations/{ticker}</code>
+  </div>
+  <p>Runs a DCF for one ticker using the supplied assumptions and the company's most recent
+  annual financials. The ticker is case-insensitive.</p>
+
+  <h3 id="parameters">Query parameters</h3>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Parameter</th><th>Type</th><th></th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>wacc</code></td><td>decimal</td><td class="req">required</td>
+        <td>Discount rate. <code>0.09</code> = 9%. Must be positive and greater than
+        <code>terminal_growth</code>.</td></tr>
+      <tr><td><code>terminal_growth</code></td><td>decimal</td><td class="req">required</td>
+        <td>Perpetual growth rate for the Gordon-growth terminal value.</td></tr>
+      <tr><td><code>ebit_margin</code></td><td>decimal</td><td class="req">required</td>
+        <td>Operating margin applied to every projected year. <code>0.30</code> = 30%.</td></tr>
+      <tr><td><code>revenue_growth</code></td><td>decimal | list</td><td class="req">required</td>
+        <td>Single value applied to all years (<code>0.05</code>) or comma-separated per-year
+        values (<code>0.08,0.07,0.06,0.05,0.04</code>). A list must have exactly
+        <code>projection_years</code> entries. Each value within ±50%.</td></tr>
+      <tr><td><code>tax_rate</code></td><td>decimal</td><td class="opt">default 0.21</td>
+        <td>Effective tax rate applied to EBIT. Must not be negative.</td></tr>
+      <tr><td><code>projection_years</code></td><td>integer</td><td class="opt">default 5</td>
+        <td>Explicit forecast horizon. 3–15.</td></tr>
+      <tr><td><code>sensitivity</code></td><td>boolean</td><td class="opt">default true</td>
+        <td>Include a 3×3 sensitivity grid around your assumptions
+        (WACC ±1% × terminal growth ±0.5%). Pass <code>false</code> to omit it.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <h3 id="response">Response schema</h3>
+  <p>Every number the engine used or produced is returned, so the valuation can be rebuilt in a
+  spreadsheet line by line. Monetary values are raw US dollars.</p>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Field</th><th>Description</th></tr></thead>
+    <tbody>
+      <tr><td><code>model_version</code></td><td>Version of the valuation engine that produced this
+        result. Pin this when comparing valuations over time.</td></tr>
+      <tr><td><code>base_financials</code></td><td>The normalized inputs: revenue, EBIT, D&amp;A,
+        capex, ΔNWC, net debt, diluted shares, current price — with
+        <code>source_period</code> identifying the fiscal period they came from.</td></tr>
+      <tr><td><code>assumptions</code></td><td>Your assumptions, fully resolved: a scalar
+        <code>revenue_growth</code> is echoed back expanded to one value per year, and defaults
+        you omitted are filled in. What you see is exactly what the engine used.</td></tr>
+      <tr><td><code>projections[]</code></td><td>Per year: <code>revenue</code>, <code>ebit</code>,
+        <code>fcf</code> (unlevered free cash flow), <code>discount_factor</code>, and
+        <code>pv_fcf</code>.</td></tr>
+      <tr><td><code>terminal_value</code> / <code>pv_terminal_value</code></td>
+        <td>Gordon-growth terminal value and its present value.</td></tr>
+      <tr><td><code>enterprise_value</code></td><td>Sum of all <code>pv_fcf</code> plus
+        <code>pv_terminal_value</code>.</td></tr>
+      <tr><td><code>equity_value</code></td><td>Enterprise value minus net debt.</td></tr>
+      <tr><td><code>intrinsic_value_per_share</code></td><td>Equity value divided by diluted
+        shares.</td></tr>
+      <tr><td><code>current_price</code> / <code>upside_pct</code></td><td>Latest market price and
+        the implied difference between it and intrinsic value, in percent.</td></tr>
+      <tr><td><code>sensitivity</code></td><td>Per-share value across a 3×3 grid: rows are
+        <code>wacc_values</code> (your WACC ±1%), columns are
+        <code>terminal_growth_values</code> (±0.5%). The center cell equals
+        <code>intrinsic_value_per_share</code>. Cells where the math is undefined
+        (growth ≥ WACC) are <code>null</code>. Omitted when
+        <code>sensitivity=false</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+
+  <div class="panel-label">200 OK — abridged example</div>
+  <pre><code>{
+  <span class="k">"model_version"</span>: <span class="s">"0.1.0"</span>,
+  <span class="k">"ticker"</span>: <span class="s">"AAPL"</span>,
+  <span class="k">"base_financials"</span>: {
+    <span class="k">"source_period"</span>: <span class="s">"FY2025 (2025-09-27)"</span>,
+    <span class="k">"revenue"</span>: <span class="n">391035000000.0</span>,
+    <span class="k">"ebit"</span>: <span class="n">123216000000.0</span>,
+    <span class="k">"da"</span>: <span class="n">11445000000.0</span>,
+    <span class="k">"capex"</span>: <span class="n">9447000000.0</span>,
+    <span class="k">"delta_nwc"</span>: <span class="n">-3651000000.0</span>,
+    <span class="k">"net_debt"</span>: <span class="n">76686000000.0</span>,
+    <span class="k">"diluted_shares"</span>: <span class="n">15408095000.0</span>,
+    <span class="k">"current_price"</span>: <span class="n">245.5</span>
+  },
+  <span class="k">"assumptions"</span>: {
+    <span class="k">"wacc"</span>: <span class="n">0.09</span>,
+    <span class="k">"terminal_growth"</span>: <span class="n">0.025</span>,
+    <span class="k">"tax_rate"</span>: <span class="n">0.21</span>,
+    <span class="k">"ebit_margin"</span>: <span class="n">0.3</span>,
+    <span class="k">"projection_years"</span>: <span class="n">5</span>,
+    <span class="k">"revenue_growth"</span>: [<span class="n">0.08</span>, <span class="n">0.07</span>, <span class="n">0.06</span>, <span class="n">0.05</span>, <span class="n">0.04</span>]
+  },
+  <span class="k">"projections"</span>: [
+    {
+      <span class="k">"year"</span>: <span class="n">1</span>,
+      <span class="k">"revenue"</span>: <span class="n">422317800000.0</span>,
+      <span class="k">"ebit"</span>: <span class="n">126695340000.0</span>,
+      <span class="k">"fcf"</span>: <span class="n">106190238600.0</span>,
+      <span class="k">"discount_factor"</span>: <span class="n">0.9174</span>,
+      <span class="k">"pv_fcf"</span>: <span class="n">97422237247.71</span>
+    },
+    <span class="c">… years 2–4 …</span>
+    {
+      <span class="k">"year"</span>: <span class="n">5</span>,
+      <span class="k">"revenue"</span>: <span class="n">523060190845.92</span>,
+      <span class="k">"ebit"</span>: <span class="n">156918057253.78</span>,
+      <span class="k">"fcf"</span>: <span class="n">131521537733.17</span>,
+      <span class="k">"discount_factor"</span>: <span class="n">0.6499</span>,
+      <span class="k">"pv_fcf"</span>: <span class="n">85479975347.01</span>
+    }
+  ],
+  <span class="k">"terminal_value"</span>: <span class="n">2073993479638.47</span>,
+  <span class="k">"pv_terminal_value"</span>: <span class="n">1347953457395.16</span>,
+  <span class="k">"enterprise_value"</span>: <span class="n">1809082459088.78</span>,
+  <span class="k">"equity_value"</span>: <span class="n">1732396459088.78</span>,
+  <span class="k">"intrinsic_value_per_share"</span>: <span class="n">112.4342</span>,
+  <span class="k">"current_price"</span>: <span class="n">245.5</span>,
+  <span class="k">"upside_pct"</span>: <span class="n">-54.202</span>,
+  <span class="k">"sensitivity"</span>: {
+    <span class="k">"wacc_values"</span>: [<span class="n">0.08</span>, <span class="n">0.09</span>, <span class="n">0.1</span>],
+    <span class="k">"terminal_growth_values"</span>: [<span class="n">0.02</span>, <span class="n">0.025</span>, <span class="n">0.03</span>],
+    <span class="k">"intrinsic_value_per_share"</span>: [
+      [<span class="n">124.53</span>, <span class="n">134.04</span>, <span class="n">145.45</span>],
+      [<span class="n">105.79</span>, <span class="n">112.43</span>, <span class="n">120.19</span>],
+      [<span class="n">91.74</span>, <span class="n">96.6</span>, <span class="n">102.15</span>]
+    ]
+  }
+}</code></pre>
+</section>
+
+<section id="errors">
+  <h2>Validation &amp; errors</h2>
+  <p>Assumption errors return <code>422</code> with the offending field named, so they can be
+  surfaced directly against the right input in your UI:</p>
+
+  <div class="panel-label">422 Unprocessable Entity</div>
+  <pre><code>{
+  <span class="k">"detail"</span>: [
+    { <span class="k">"field"</span>: <span class="s">"terminal_growth"</span>, <span class="k">"message"</span>: <span class="s">"must be less than wacc (Gordon growth formula)"</span> }
+  ]
+}</code></pre>
+
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>Status</th><th>When</th></tr></thead>
+    <tbody>
+      <tr><td class="status ok">200</td><td>Valuation computed.</td></tr>
+      <tr><td class="status err">404</td><td>No valuation available for this ticker — either the
+        symbol doesn't exist, or it falls outside the supported universe (non-financial US large
+        caps). Retrying won't change the result.</td></tr>
+      <tr><td class="status err">422</td><td>Invalid assumptions (<code>terminal_growth ≥ wacc</code>,
+        <code>projection_years</code> outside 3–15, growth beyond ±50%, negative tax rate,
+        malformed or wrong-length <code>revenue_growth</code>) — or a financial-sector ticker,
+        which this model doesn't support.</td></tr>
+      <tr><td class="status err">502</td><td>Provider data for this ticker couldn't be normalized.
+        Not retryable; contact support.</td></tr>
+      <tr><td class="status err">503</td><td>Upstream data provider unavailable. Retry with
+        backoff.</td></tr>
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="health">
+  <h2>Health check</h2>
+  <div class="endpoint">
+    <span class="method">GET</span>
+    <code>/health</code>
+  </div>
+  <p>Returns <code>200</code> with the service status and current <code>model_version</code>.
+  Unauthenticated; suitable for load-balancer probes.</p>
+</section>
+
+<section id="methodology">
+  <h2>Methodology</h2>
+  <p>The engine projects unlevered free cash flow over the forecast horizon:</p>
+  <pre><code>FCF = EBIT × (1 − tax_rate) + D&amp;A − capex − ΔNWC</code></pre>
+  <p>Revenue grows by your per-year rates; EBIT applies your margin to each year's revenue;
+  D&amp;A, capex, and ΔNWC scale with revenue at the base year's observed ratios. Cash flows are
+  discounted at your WACC with end-of-year timing. Terminal value uses Gordon growth off the
+  final projected year:</p>
+  <pre><code>TV = FCF_final × (1 + terminal_growth) / (wacc − terminal_growth)</code></pre>
+  <p>Equity value is the present value of the projected cash flows plus the present value of
+  terminal value, minus net debt; per-share value divides by diluted shares outstanding.</p>
+  <p>DCF outputs are highly sensitive to <code>wacc</code> and <code>terminal_growth</code> — small
+  changes move the result a lot. That's why every response includes the
+  <a href="#response">sensitivity grid</a> by default: read the range it spans, not just the
+  point estimate. In the example above, ±1% of WACC moves the per-share value from
+  $96.60 to $134.04.</p>
+</section>
+
+<section id="disclaimer">
+  <h2>Disclaimer</h2>
+  <p>Valuations returned by this API are model outputs computed from your assumptions and
+  third-party financial data. They are estimates for analysis, not investment advice,
+  recommendations, or offers to buy or sell any security. Verify important figures against
+  primary sources before relying on them.</p>
+</section>
+
+<footer>
+  DCF Valuation API · v1 · model_version 0.1.0 · Figures in examples are computed by the
+  current engine from the documented inputs.
+</footer>
+
+</div>
+</main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var $ = function (id) { return document.getElementById(id); };
+  var mode = "single";
+
+  function growthCount() {
+    if (mode === "single") return 1;
+    var y = parseInt($("b-years").value, 10);
+    return isNaN(y) ? 5 : Math.min(15, Math.max(3, y));
+  }
+
+  function renderGrowthInputs() {
+    var box = $("growth-inputs");
+    var prev = [];
+    box.querySelectorAll("input").forEach(function (i) { prev.push(i.value); });
+    box.innerHTML = "";
+    var n = growthCount();
+    for (var i = 0; i < n; i++) {
+      var wrap = document.createElement("div");
+      wrap.className = "yr";
+      var lab = document.createElement("label");
+      lab.textContent = mode === "single" ? "all years" : "year " + (i + 1);
+      lab.setAttribute("for", "g-" + i);
+      var inp = document.createElement("input");
+      inp.type = "number";
+      inp.step = "0.5";
+      inp.id = "g-" + i;
+      inp.value = prev[i] !== undefined ? prev[i] : (prev.length ? prev[prev.length - 1] : "5");
+      inp.addEventListener("input", update);
+      wrap.appendChild(lab);
+      wrap.appendChild(inp);
+      box.appendChild(wrap);
+    }
+  }
+
+  function pct(id) {
+    var v = parseFloat($(id).value);
+    return isNaN(v) ? null : v / 100;
+  }
+
+  function fmtDec(x) {
+    // avoid float join artifacts like 0.060000000000000005
+    return parseFloat(x.toFixed(6)).toString();
+  }
+
+  function update() {
+    var errors = [];
+    var ticker = $("b-ticker").value.trim().toUpperCase();
+    var base = $("b-base").value.trim().replace(/\/+$/, "");
+    var wacc = pct("b-wacc");
+    var tg = pct("b-tg");
+    var margin = pct("b-margin");
+    var tax = pct("b-tax");
+    var years = parseInt($("b-years").value, 10);
+
+    if (!ticker || !/^[A-Z][A-Z.\-]*$/.test(ticker)) errors.push("ticker: letters, dots, dashes only");
+    if (wacc === null || wacc <= 0) errors.push("wacc: must be positive");
+    if (tg === null) errors.push("terminal_growth: required");
+    if (margin === null) errors.push("ebit_margin: required");
+    if (wacc !== null && tg !== null && tg >= wacc) errors.push("terminal_growth: must be less than wacc");
+    if (tax !== null && tax < 0) errors.push("tax_rate: must not be negative");
+    if (isNaN(years) || years < 3 || years > 15) errors.push("projection_years: must be 3–15");
+
+    var growths = [];
+    document.querySelectorAll("#growth-inputs input").forEach(function (inp) {
+      var g = parseFloat(inp.value);
+      growths.push(isNaN(g) ? null : g / 100);
+    });
+    if (growths.some(function (g) { return g === null; })) {
+      errors.push("revenue_growth: every year needs a value");
+    } else if (growths.some(function (g) { return Math.abs(g) > 0.5; })) {
+      errors.push("revenue_growth: each value must be within ±50%");
+    }
+
+    var errBox = $("b-errors");
+    errBox.innerHTML = "";
+    errors.forEach(function (e) {
+      var d = document.createElement("div");
+      d.textContent = "✗ " + e;
+      errBox.appendChild(d);
+    });
+
+    var urlBox = $("urlbox"), curlBox = $("curlbox");
+    if (errors.length) {
+      urlBox.classList.add("invalid");
+      curlBox.classList.add("invalid");
+      $("b-url").textContent = "Fix the fields above to generate your endpoint.";
+      $("b-curl").textContent = "—";
+      return;
+    }
+    urlBox.classList.remove("invalid");
+    curlBox.classList.remove("invalid");
+
+    // canonical (alphabetical) parameter order — cache-friendly
+    var growthStr = growths.map(fmtDec).join(",");
+    var params = [
+      ["ebit_margin", fmtDec(margin)],
+      ["projection_years", String(years)],
+      ["revenue_growth", growthStr],
+      ["tax_rate", fmtDec(tax === null ? 0.21 : tax)],
+      ["terminal_growth", fmtDec(tg)],
+      ["wacc", fmtDec(wacc)]
+    ];
+    var qs = params.map(function (p) { return p[0] + "=" + encodeURIComponent(p[1]); }).join("&");
+    var url = base + "/v1/valuations/" + ticker + "?" + qs;
+
+    $("b-url").textContent = url;
+    $("b-curl").textContent = 'curl -H "X-API-Key: YOUR_KEY" "' + url + '"';
+  }
+
+  function setMode(next) {
+    mode = next;
+    $("mode-single").setAttribute("aria-pressed", String(mode === "single"));
+    $("mode-peryear").setAttribute("aria-pressed", String(mode === "peryear"));
+    renderGrowthInputs();
+    update();
+  }
+
+  $("mode-single").addEventListener("click", function () { setMode("single"); });
+  $("mode-peryear").addEventListener("click", function () { setMode("peryear"); });
+
+  ["b-base", "b-ticker", "b-wacc", "b-tg", "b-margin", "b-tax", "b-years"].forEach(function (id) {
+    $(id).addEventListener("input", function () {
+      if (id === "b-years" && mode === "peryear") renderGrowthInputs();
+      update();
+    });
+  });
+
+  function wireCopy(btnId, outId) {
+    $(btnId).addEventListener("click", function () {
+      var text = $(outId).textContent;
+      navigator.clipboard.writeText(text).then(function () {
+        var b = $(btnId);
+        var orig = b.textContent;
+        b.textContent = "Copied";
+        setTimeout(function () { b.textContent = orig; }, 1400);
+      });
+    });
+  }
+  wireCopy("copy-url", "b-url");
+  wireCopy("copy-curl", "b-curl");
+
+  // sidebar active-section highlight
+  var links = Array.prototype.slice.call(document.querySelectorAll("nav a"));
+  var sections = links.map(function (a) { return document.querySelector(a.getAttribute("href")); });
+  if ("IntersectionObserver" in window) {
+    var active = null;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (en) {
+        if (en.isIntersecting) {
+          if (active) active.classList.remove("active");
+          var idx = sections.indexOf(en.target);
+          if (idx >= 0) { active = links[idx]; active.classList.add("active"); }
+        }
+      });
+    }, { rootMargin: "-10% 0px -70% 0px" });
+    sections.forEach(function (s) { if (s) io.observe(s); });
+  }
+
+  renderGrowthInputs();
+  update();
+})();
+</script>

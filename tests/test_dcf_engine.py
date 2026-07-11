@@ -2,7 +2,11 @@ import pytest
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
-from app.dcf_engine import DCFValidationError, compute_dcf
+from app.dcf_engine import (
+    DCFValidationError,
+    compute_dcf,
+    compute_sensitivity_grid,
+)
 from app.models import Assumptions, BaseFinancials
 from tests.conftest import make_base_financials
 
@@ -195,6 +199,69 @@ def test_revenue_growth_list_length_mismatch_rejected(base_financials: BaseFinan
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
     assert exc.value.field == "revenue_growth"
+
+
+# ---------------------------------------------------------------------------
+# Sensitivity grid
+# ---------------------------------------------------------------------------
+
+
+def _grid_assumptions(wacc=0.10, terminal_growth=0.02) -> Assumptions:
+    return Assumptions(
+        wacc=wacc, terminal_growth=terminal_growth, tax_rate=0.25,
+        ebit_margin=0.25, projection_years=5, revenue_growth=0.05,
+    )
+
+
+def test_grid_axes_are_clean_offsets_around_inputs(base_financials: BaseFinancials):
+    grid = compute_sensitivity_grid(base_financials, _grid_assumptions())
+    assert grid.wacc_values == (0.09, 0.10, 0.11)
+    assert grid.terminal_growth_values == (0.015, 0.02, 0.025)
+
+
+def test_grid_center_cell_equals_point_estimate(base_financials: BaseFinancials):
+    assumptions = _grid_assumptions()
+    grid = compute_sensitivity_grid(base_financials, assumptions)
+    point = compute_dcf(base_financials, assumptions)
+    assert grid.per_share_values[1][1] == pytest.approx(
+        point.intrinsic_value_per_share
+    )
+
+
+def test_grid_cells_match_independent_recomputation(base_financials: BaseFinancials):
+    grid = compute_sensitivity_grid(base_financials, _grid_assumptions())
+    corner = compute_dcf(
+        base_financials, _grid_assumptions(wacc=0.09, terminal_growth=0.025)
+    )
+    assert grid.per_share_values[0][2] == pytest.approx(
+        corner.intrinsic_value_per_share
+    )
+
+
+def test_grid_is_monotonic_in_both_axes(base_financials: BaseFinancials):
+    grid = compute_sensitivity_grid(base_financials, _grid_assumptions())
+    for row in grid.per_share_values:  # fixed WACC: value rises with growth
+        assert row[0] < row[1] < row[2]
+    for col in range(3):  # fixed growth: value falls as WACC rises
+        assert (
+            grid.per_share_values[0][col]
+            > grid.per_share_values[1][col]
+            > grid.per_share_values[2][col]
+        )
+
+
+def test_grid_marks_gordon_breaking_cells_none_instead_of_erroring(
+    base_financials: BaseFinancials,
+):
+    # wacc=0.03, g=0.024 is valid, but the wacc-1% row (0.02) collides with
+    # g=0.024 and g=0.029; the point estimate must still come back
+    grid = compute_sensitivity_grid(
+        base_financials, _grid_assumptions(wacc=0.03, terminal_growth=0.024)
+    )
+    low_wacc_row = grid.per_share_values[0]
+    assert low_wacc_row[1] is None and low_wacc_row[2] is None
+    assert low_wacc_row[0] is not None  # g=0.019 < 0.02 still computes
+    assert grid.per_share_values[1][1] is not None  # center always present
 
 
 # ---------------------------------------------------------------------------

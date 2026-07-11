@@ -1,8 +1,39 @@
+# --- Secrets: never commit API keys or credentials ---
+# The FMP API key is read only from the FMP_API_KEY environment variable
+# (see app/providers/fmp.py) and must never be written to a tracked file.
+.env
+.env.*
+*.env
+!.env.example
+secrets.*
+*.secret
+*.secrets
+credentials.json
+credentials.*
+*.pem
+*.key
+*.p12
+*.pfx
+.netrc
+
+# --- Cached provider data (may embed request context) ---
+data/
+
+# --- Python ---
 .venv/
+venv/
+env/
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 .pytest_cache/
 .hypothesis/
-data/
-*.egg-info/
+.mypy_cache/
+.ruff_cache/
+
+# --- Local notes / editor ---
 PROGRESS.md
+.vscode/
+.idea/
+.DS_Store

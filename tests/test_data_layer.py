@@ -17,6 +17,7 @@ from app.exceptions import (
     NormalizationError,
     ProviderAuthError,
     ProviderError,
+    TickerNotCoveredError,
     TickerNotFoundError,
     UnsupportedSectorError,
 )
@@ -149,6 +150,43 @@ def test_unknown_ticker_raises_ticker_not_found():
     assert exc.value.ticker == "ZZZZZZ"
 
 
+def test_provider_402_raises_ticker_not_covered():
+    # Live behavior (verified 2026-07-11): FMP's free tier returns
+    # 402 Payment Required for symbols outside plan coverage (and for
+    # symbols that don't exist). It is a distinct "not covered" condition,
+    # not a plain not-found, and must never surface as a 500.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(402, text="Premium Query Parameter: ...")
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            await client.fetch_fundamentals("ZZZQQQ")
+
+    with pytest.raises(TickerNotCoveredError) as exc:
+        asyncio.run(scenario())
+    assert exc.value.ticker == "ZZZQQQ"
+
+
+def test_provider_402_is_not_retried():
+    # Retrying a 402 can't change the answer and wastes the daily call
+    # budget — the first endpoint must fail immediately.
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(402, text="not available under your current subscription")
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), max_retries=3
+        ) as client:
+            await client.fetch_fundamentals("ZZZQQQ")
+
+    with pytest.raises(TickerNotCoveredError):
+        asyncio.run(scenario())
+    assert len(attempts) == 1
+
+
 def test_missing_api_key_fails_fast(monkeypatch):
     monkeypatch.delenv("FMP_API_KEY", raising=False)
     with pytest.raises(ProviderAuthError):
@@ -274,3 +312,101 @@ def test_cache_expires_after_ttl():
     calls_before_expiry = asyncio.run(scenario())
     assert calls_before_expiry == 5
     assert len(call_log) == 10
+
+
+# ---------------------------------------------------------------------------
+# FundamentalsService negative caching (protects the daily provider budget)
+# ---------------------------------------------------------------------------
+
+
+def _always_402_transport(call_log: list) -> httpx.MockTransport:
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(402, text="not available under your current subscription")
+
+    return httpx.MockTransport(handler)
+
+
+def test_not_covered_ticker_is_negative_cached():
+    call_log: list = []
+
+    async def scenario():
+        async with make_client(transport=_always_402_transport(call_log)) as client:
+            service = FundamentalsService(client)
+            for _ in range(3):
+                with pytest.raises(TickerNotCoveredError):
+                    await service.get_base_financials("ZZZQQQ")
+
+    asyncio.run(scenario())
+    # Three requests, but only the first reached the provider (one endpoint,
+    # which 402s immediately); the rest are served from the negative cache.
+    assert len(call_log) == 1
+
+
+def test_unsupported_sector_is_negative_cached():
+    call_log: list = []
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            service = FundamentalsService(client)
+            with pytest.raises(UnsupportedSectorError):
+                await service.get_base_financials("JPM")
+            calls_after_first = len(call_log)
+            with pytest.raises(UnsupportedSectorError):
+                await service.get_base_financials("JPM")
+            return calls_after_first
+
+    calls_after_first = asyncio.run(scenario())
+    assert calls_after_first == 5
+    # A bank fetched once then rejected on sector: the repeat costs 0 calls
+    # instead of another 5.
+    assert len(call_log) == 5
+
+
+def test_transient_error_is_not_negative_cached():
+    call_log: list = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        call_log.append(1)
+        return httpx.Response(503)
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), sleep=no_sleep, max_retries=0
+        ) as client:
+            service = FundamentalsService(client)
+            with pytest.raises(ProviderError):
+                await service.get_base_financials("AAPL")
+            with pytest.raises(ProviderError):
+                await service.get_base_financials("AAPL")
+
+    asyncio.run(scenario())
+    # Both requests hit the provider — a 503 might clear up, so it must stay
+    # retryable and must not be cached.
+    assert len(call_log) == 2
+
+
+def test_negative_cache_expires_after_ttl():
+    call_log: list = []
+    clock = {"t": 0.0}
+
+    async def scenario():
+        async with make_client(transport=_always_402_transport(call_log)) as client:
+            service = FundamentalsService(client, ttl_seconds=3600, now=lambda: clock["t"])
+            with pytest.raises(TickerNotCoveredError):
+                await service.get_base_financials("ZZZQQQ")
+            clock["t"] = 3599.0
+            with pytest.raises(TickerNotCoveredError):
+                await service.get_base_financials("ZZZQQQ")  # still cached
+            calls_before_expiry = len(call_log)
+            clock["t"] = 3601.0
+            with pytest.raises(TickerNotCoveredError):
+                await service.get_base_financials("ZZZQQQ")  # re-checked
+            return calls_before_expiry
+
+    calls_before_expiry = asyncio.run(scenario())
+    assert calls_before_expiry == 1
+    assert len(call_log) == 2
