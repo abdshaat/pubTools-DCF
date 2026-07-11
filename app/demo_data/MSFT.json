@@ -1,0 +1,17 @@
+{
+  "ticker": "MSFT",
+  "name": "Microsoft Corporation",
+  "captured_at": "2026-07-11",
+  "base_financials": {
+    "ticker": "MSFT",
+    "source_period": "FY2025 (2025-06-30)",
+    "revenue": 281724000000.0,
+    "ebit": 128528000000.0,
+    "da": 34153000000.0,
+    "capex": 64551000000.0,
+    "delta_nwc": 5350000000.0,
+    "net_debt": 81942000000.0,
+    "diluted_shares": 7465000000.0,
+    "current_price": 385.1
+  }
+}

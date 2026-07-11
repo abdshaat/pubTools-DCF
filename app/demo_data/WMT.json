@@ -1,0 +1,17 @@
+{
+  "ticker": "WMT",
+  "name": "Walmart Inc.",
+  "captured_at": "2026-07-11",
+  "base_financials": {
+    "ticker": "WMT",
+    "source_period": "FY2026 (2026-01-31)",
+    "revenue": 713163000000.0,
+    "ebit": 29825000000.0,
+    "da": 14203000000.0,
+    "capex": 26642000000.0,
+    "delta_nwc": -752000000.0,
+    "net_debt": 56368000000.0,
+    "diluted_shares": 8022000000.0,
+    "current_price": 113.9
+  }
+}

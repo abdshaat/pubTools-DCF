@@ -38,6 +38,17 @@ from .models import Assumptions
 from .providers.fmp import FileRawSink, FMPClient
 from .schemas import ValuationResponse, build_valuation_response
 
+# Load a local .env (gitignored) so `uvicorn app.api:app` picks up FMP_API_KEY
+# without the developer having to export it every shell. No-op if python-dotenv
+# isn't installed or no .env exists; never overrides a var already in the
+# environment.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
 
 def _parse_revenue_growth(raw: str) -> list[float]:
     """'0.05' -> [0.05]; '0.08,0.07,0.06' -> [0.08, 0.07, 0.06]."""

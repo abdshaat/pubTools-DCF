@@ -1,0 +1,17 @@
+{
+  "ticker": "NVDA",
+  "name": "NVIDIA Corporation",
+  "captured_at": "2026-07-11",
+  "base_financials": {
+    "ticker": "NVDA",
+    "source_period": "FY2026 (2026-01-25)",
+    "revenue": 215938000000.0,
+    "ebit": 130387000000.0,
+    "da": 2843000000.0,
+    "capex": 6042000000.0,
+    "delta_nwc": 15949000000.0,
+    "net_debt": 807000000.0,
+    "diluted_shares": 24514000000.0,
+    "current_price": 210.96
+  }
+}

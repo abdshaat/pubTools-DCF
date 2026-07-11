@@ -80,7 +80,8 @@ class FMPClient:
         self._api_key = api_key or os.environ.get("FMP_API_KEY")
         if not self._api_key:
             raise ProviderAuthError(
-                "no FMP API key: pass api_key= or set the FMP_API_KEY env var"
+                "no FMP API key: set FMP_API_KEY in the environment or in a local "
+                ".env file (copy .env.example), or pass api_key= directly"
             )
         self._max_retries = max_retries
         self._sleep = sleep

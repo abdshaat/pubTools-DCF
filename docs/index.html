@@ -1,14 +1,15 @@
 <title>DCF Valuation API — Documentation</title>
 <style>
   :root {
-    --paper: #fafaf7;
-    --ink: #1c2320;
-    --muted: #5b6862;
-    --faint: #8a948f;
-    --line: #e2e6e1;
+    --paper: #faf9f5;
+    --ink: #17211c;
+    --muted: #55605a;
+    --faint: #8a938c;
+    --line: #e3e6df;
     --accent: #0b7a55;
     --accent-ink: #ffffff;
-    --panel: #f1f3ef;
+    --gold: #a9781f;
+    --panel: #f0f2ec;
     --code-bg: #1b2226;
     --code-ink: #d7e0da;
     --code-accent: #3ecf9a;
@@ -22,17 +23,21 @@
     --sidebar-ink: #aeb8b2;
     --sidebar-active: #3ecf9a;
     --method-bg: #0b7a55;
+    --font-display: "Palatino Linotype", "Book Antiqua", "Iowan Old Style", Palatino, Georgia, serif;
+    --font-body: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+    --font-mono: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
     color-scheme: light dark;
   }
   @media (prefers-color-scheme: dark) {
     :root {
-      --paper: #101413;
+      --paper: #0e1312;
       --ink: #dde4df;
       --muted: #93a09a;
       --faint: #6b7772;
       --line: #263029;
       --accent: #3ecf9a;
       --accent-ink: #08130e;
+      --gold: #d6a24a;
       --panel: #171d1a;
       --code-bg: #161c1f;
       --code-ink: #cfd9d3;
@@ -45,13 +50,14 @@
     }
   }
   :root[data-theme="dark"] {
-    --paper: #101413;
+    --paper: #0e1312;
     --ink: #dde4df;
     --muted: #93a09a;
     --faint: #6b7772;
     --line: #263029;
     --accent: #3ecf9a;
     --accent-ink: #08130e;
+    --gold: #d6a24a;
     --panel: #171d1a;
     --code-bg: #161c1f;
     --code-ink: #cfd9d3;
@@ -63,14 +69,15 @@
     --method-bg: #0f8f65;
   }
   :root[data-theme="light"] {
-    --paper: #fafaf7;
-    --ink: #1c2320;
-    --muted: #5b6862;
-    --faint: #8a948f;
-    --line: #e2e6e1;
+    --paper: #faf9f5;
+    --ink: #17211c;
+    --muted: #55605a;
+    --faint: #8a938c;
+    --line: #e3e6df;
     --accent: #0b7a55;
     --accent-ink: #ffffff;
-    --panel: #f1f3ef;
+    --gold: #a9781f;
+    --panel: #f0f2ec;
     --code-bg: #1b2226;
     --code-ink: #d7e0da;
     --warn: #b45309;
@@ -88,17 +95,15 @@
     margin: 0;
     background: var(--paper);
     color: var(--ink);
-    font: 16px/1.65 -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+    font: 16px/1.65 var(--font-body);
   }
-  code, pre, .mono {
-    font-family: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
-  }
+  code, pre, .mono { font-family: var(--font-mono); }
 
   .layout { display: flex; min-height: 100vh; }
 
   /* ---------- sidebar ---------- */
   nav {
-    width: 248px;
+    width: 256px;
     flex-shrink: 0;
     background: var(--sidebar-bg);
     color: var(--sidebar-ink);
@@ -111,18 +116,20 @@
   nav .brand {
     padding: 0 24px 20px;
     border-bottom: 1px solid rgba(255,255,255,0.08);
-    margin-bottom: 16px;
+    margin-bottom: 8px;
   }
   nav .brand .name {
     color: #fff;
-    font-weight: 650;
-    font-size: 15px;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 18px;
     letter-spacing: 0.01em;
   }
   nav .brand .ver {
     font-size: 12px;
     color: var(--sidebar-active);
-    font-family: Consolas, monospace;
+    font-family: var(--font-mono);
+    margin-top: 2px;
   }
   nav .group {
     font-size: 11px;
@@ -144,173 +151,243 @@
   nav a.active { color: var(--sidebar-active); border-left-color: var(--sidebar-active); }
 
   /* ---------- main ---------- */
-  main { flex: 1; min-width: 0; padding: 48px 56px 120px; }
+  main { flex: 1; min-width: 0; padding: 52px 56px 120px; }
   .content { max-width: 780px; }
 
+  h1, h2, h3 { font-family: var(--font-display); }
   h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; letter-spacing: -0.01em; text-wrap: balance; }
   h2 {
-    font-size: 21px;
+    font-size: 24px;
+    font-weight: 600;
     margin: 0 0 14px;
-    padding-top: 56px;
+    padding-top: 58px;
     letter-spacing: -0.005em;
     text-wrap: balance;
   }
-  h3 { font-size: 16px; margin: 28px 0 10px; }
+  h3 { font-size: 17px; margin: 30px 0 10px; }
+  h4 { font-family: var(--font-body); }
   p { max-width: 68ch; margin: 0 0 14px; }
-  .lede { font-size: 17.5px; color: var(--muted); max-width: 62ch; }
-  section { border-bottom: 1px solid var(--line); padding-bottom: 40px; }
+  .lede { font-size: 18px; line-height: 1.6; color: var(--muted); max-width: 60ch; }
+  section { border-bottom: 1px solid var(--line); padding-bottom: 44px; }
   section:last-child { border-bottom: none; }
   a { color: var(--accent); }
+  b, strong { font-weight: 640; color: var(--ink); }
 
   .eyebrow {
-    font-family: Consolas, monospace;
+    font-family: var(--font-mono);
     font-size: 11.5px;
     text-transform: uppercase;
-    letter-spacing: 0.14em;
+    letter-spacing: 0.16em;
     color: var(--accent);
-    margin: 0 0 6px;
+    margin: 0 0 12px;
   }
+
+  /* ---------- hero + signature discounting diagram ---------- */
+  .hero-title {
+    font-family: var(--font-display);
+    font-size: 38px;
+    line-height: 1.12;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    margin: 0 0 16px;
+    max-width: 17ch;
+    text-wrap: balance;
+  }
+  .hero-title em { font-style: italic; color: var(--accent); }
+
+  .dcf-figure {
+    margin: 26px 0 10px;
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 24px 26px 18px;
+    background: linear-gradient(180deg, var(--panel), transparent 120%);
+  }
+  .dcf-chart { display: flex; align-items: flex-end; gap: 10px; height: 150px; }
+  .dcf-col { flex: 1; display: flex; justify-content: center; align-items: flex-end; height: 100%; }
+  .dcf-bar {
+    position: relative;
+    width: 100%;
+    max-width: 44px;
+    height: var(--h);
+    background: color-mix(in srgb, var(--accent) 13%, transparent);
+    border-radius: 5px 5px 0 0;
+  }
+  .dcf-pv {
+    position: absolute;
+    left: 0; bottom: 0;
+    width: 100%;
+    height: calc(var(--pv) * 100%);
+    background: linear-gradient(180deg, var(--accent), color-mix(in srgb, var(--accent) 72%, transparent));
+    border-radius: 5px 5px 0 0;
+    transform-origin: bottom;
+    animation: pvGrow 0.7s cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  }
+  .dcf-col.tv .dcf-pv {
+    background: linear-gradient(180deg, var(--gold), color-mix(in srgb, var(--gold) 74%, transparent));
+  }
+  .dcf-col:nth-child(1) .dcf-pv { animation-delay: 0.05s; }
+  .dcf-col:nth-child(2) .dcf-pv { animation-delay: 0.11s; }
+  .dcf-col:nth-child(3) .dcf-pv { animation-delay: 0.17s; }
+  .dcf-col:nth-child(4) .dcf-pv { animation-delay: 0.23s; }
+  .dcf-col:nth-child(5) .dcf-pv { animation-delay: 0.29s; }
+  .dcf-col:nth-child(6) .dcf-pv { animation-delay: 0.35s; }
+  @keyframes pvGrow { from { transform: scaleY(0); } to { transform: scaleY(1); } }
+  @media (prefers-reduced-motion: reduce) { .dcf-pv { animation: none; } }
+  .dcf-ticks { display: flex; gap: 10px; margin-top: 9px; }
+  .dcf-ticks span {
+    flex: 1; text-align: center;
+    font-family: var(--font-mono); font-size: 11px; color: var(--faint);
+  }
+  .dcf-legend {
+    display: flex; flex-wrap: wrap; gap: 8px 18px;
+    margin-top: 16px; font-size: 12.5px; color: var(--muted);
+  }
+  .dcf-legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .dcf-legend i { width: 12px; height: 12px; border-radius: 3px; }
+  .sw-future { background: color-mix(in srgb, var(--accent) 13%, transparent); border: 1px solid var(--line); }
+  .sw-pv { background: var(--accent); }
+  .sw-tv { background: var(--gold); }
+  .dcf-cap { font-size: 13.5px; color: var(--muted); margin: 14px 0 0; max-width: 66ch; }
+
+  /* ---------- numbered build steps (a real sequence) ---------- */
+  .steps { list-style: none; counter-reset: step; padding: 0; margin: 20px 0 6px; }
+  .steps li {
+    position: relative; padding: 14px 0 14px 54px;
+    border-top: 1px solid var(--line);
+  }
+  .steps li:first-child { border-top: none; }
+  .steps li::before {
+    counter-increment: step; content: counter(step);
+    position: absolute; left: 0; top: 14px;
+    width: 34px; height: 34px; border-radius: 50%;
+    background: var(--accent); color: var(--accent-ink);
+    font-family: var(--font-mono); font-weight: 700; font-size: 14px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .steps h4 { margin: 3px 0 3px; font-size: 15px; }
+  .steps p { margin: 0; font-size: 14px; color: var(--muted); }
+
+  /* ---------- assumption guidance cards ---------- */
+  .guide { display: grid; gap: 14px; margin: 20px 0 8px; }
+  .guide-card {
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 16px 18px; background: var(--panel);
+  }
+  .guide-card h4 {
+    font-size: 15px; margin: 0 0 6px;
+    display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  }
+  .guide-card h4 code { font-size: 13px; }
+  .range {
+    font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
+    color: var(--accent); background: var(--ok-bg);
+    border-radius: 20px; padding: 2px 11px; white-space: nowrap;
+  }
+  .guide-card p { margin: 6px 0 0; font-size: 14.5px; }
+  .guide-card .watch { color: var(--muted); font-size: 13.5px; }
+  .guide-card .watch b { color: var(--warn); }
 
   /* endpoint signature chip */
   .endpoint {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 10px 14px;
-    margin: 14px 0 20px;
-    overflow-x: auto;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 14px; margin: 14px 0 20px; overflow-x: auto;
   }
   .endpoint .method {
-    background: var(--method-bg);
-    color: var(--accent-ink);
-    font-family: Consolas, monospace;
-    font-size: 12px;
-    font-weight: 700;
-    padding: 3px 9px;
-    border-radius: 4px;
-    letter-spacing: 0.04em;
+    background: var(--method-bg); color: var(--accent-ink);
+    font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+    padding: 3px 9px; border-radius: 4px; letter-spacing: 0.04em;
   }
   .endpoint code { font-size: 14px; white-space: nowrap; }
 
   /* code panels */
   pre {
-    background: var(--code-bg);
-    color: var(--code-ink);
-    border-radius: 8px;
-    padding: 16px 18px;
-    font-size: 13px;
-    line-height: 1.6;
-    overflow-x: auto;
-    margin: 14px 0 20px;
+    background: var(--code-bg); color: var(--code-ink);
+    border-radius: 8px; padding: 16px 18px;
+    font-size: 13px; line-height: 1.6; overflow-x: auto; margin: 14px 0 20px;
   }
   pre .k { color: var(--code-accent); }
   pre .s { color: var(--code-str); }
   pre .n { color: var(--code-num); }
   pre .c { color: #7d8a84; }
   code {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 4px;
-    padding: 1px 5px;
-    font-size: 0.86em;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px; font-size: 0.86em;
   }
   pre code { background: none; border: none; padding: 0; font-size: inherit; }
 
   .panel-label {
-    font-family: Consolas, monospace;
-    font-size: 11px;
-    letter-spacing: 0.1em;
-    text-transform: uppercase;
-    color: var(--faint);
+    font-family: var(--font-mono); font-size: 11px;
+    letter-spacing: 0.1em; text-transform: uppercase; color: var(--faint);
     margin: 18px 0 -8px;
   }
+
+  /* typeset equations (native MathML) */
+  .math {
+    overflow-x: auto; overflow-y: hidden;
+    margin: 16px 0; padding: 10px 16px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 8px; color: var(--ink);
+  }
+  .math math { font-size: 20px; }
+  .math + .math { margin-top: -6px; }
+  .sym { color: var(--muted); font-size: 13.5px; }
 
   /* tables */
   .tablewrap { overflow-x: auto; margin: 14px 0 20px; }
   table { border-collapse: collapse; width: 100%; font-size: 14px; }
   th {
-    text-align: left;
-    font-size: 11.5px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-    color: var(--faint);
-    font-weight: 600;
-    padding: 8px 14px 8px 0;
-    border-bottom: 1px solid var(--line);
+    text-align: left; font-size: 11.5px; text-transform: uppercase;
+    letter-spacing: 0.08em; color: var(--faint); font-weight: 600;
+    padding: 8px 14px 8px 0; border-bottom: 1px solid var(--line);
   }
-  td {
-    padding: 10px 14px 10px 0;
-    border-bottom: 1px solid var(--line);
-    vertical-align: top;
-  }
+  td { padding: 10px 14px 10px 0; border-bottom: 1px solid var(--line); vertical-align: top; }
   td:first-child code { white-space: nowrap; }
   .req { color: var(--err); font-size: 12px; font-weight: 600; }
   .opt { color: var(--faint); font-size: 12px; }
-  .status { font-family: Consolas, monospace; font-weight: 700; white-space: nowrap; }
+  .status { font-family: var(--font-mono); font-weight: 700; white-space: nowrap; }
   .status.ok { color: var(--accent); }
   .status.err { color: var(--err); }
 
   .note {
-    background: var(--warn-bg);
-    border-left: 3px solid var(--warn);
-    border-radius: 0 6px 6px 0;
-    padding: 12px 16px;
-    margin: 16px 0;
-    font-size: 14.5px;
-    max-width: 68ch;
+    background: var(--warn-bg); border-left: 3px solid var(--warn);
+    border-radius: 0 6px 6px 0; padding: 12px 16px; margin: 16px 0;
+    font-size: 14.5px; max-width: 68ch;
   }
   .note strong { color: var(--warn); }
+  .note.tip { background: var(--ok-bg); border-left-color: var(--accent); }
+  .note.tip strong { color: var(--accent); }
 
   /* ---------- endpoint builder ---------- */
   .builder {
-    background: var(--panel);
-    border: 1px solid var(--line);
-    border-radius: 10px;
-    padding: 24px;
-    margin-top: 18px;
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 24px; margin-top: 18px;
   }
   .builder h3 { margin-top: 0; }
   .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 16px 20px;
-    margin-bottom: 4px;
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 16px 20px; margin-bottom: 4px;
   }
-  .field label {
-    display: block;
-    font-size: 12.5px;
-    font-weight: 600;
-    margin-bottom: 5px;
-  }
+  .field label { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 5px; }
   .field .hint { color: var(--faint); font-weight: 400; }
   .field input, .field select {
-    width: 100%;
-    padding: 8px 10px;
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    background: var(--paper);
-    color: var(--ink);
-    font-family: Consolas, monospace;
-    font-size: 14px;
+    width: 100%; padding: 8px 10px; border: 1px solid var(--line);
+    border-radius: 6px; background: var(--paper); color: var(--ink);
+    font-family: var(--font-mono); font-size: 14px;
   }
   .field input:focus-visible, .field select:focus-visible, .growth-years input:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-    border-color: var(--accent);
+    outline: 2px solid var(--accent); outline-offset: 1px; border-color: var(--accent);
   }
   .growth-years { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
   .growth-years .yr { width: 92px; }
   .growth-years .yr label {
     display: block; font-size: 11px; color: var(--faint); margin-bottom: 3px;
-    font-family: Consolas, monospace;
+    font-family: var(--font-mono);
   }
   .growth-years input {
     width: 100%; padding: 7px 8px; border: 1px solid var(--line);
     border-radius: 6px; background: var(--paper); color: var(--ink);
-    font-family: Consolas, monospace; font-size: 13.5px;
+    font-family: var(--font-mono); font-size: 13.5px;
   }
   fieldset { border: none; padding: 0; margin: 16px 0 0; }
   legend { font-size: 12.5px; font-weight: 600; padding: 0; margin-bottom: 6px; }
@@ -323,39 +400,21 @@
   .seg button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 
   .builder-errors { margin: 14px 0 0; }
-  .builder-errors div {
-    color: var(--err); font-size: 13.5px; padding: 2px 0;
-    font-family: Consolas, monospace;
-  }
-  .urlout {
-    margin-top: 18px;
-    background: var(--code-bg);
-    border-radius: 8px;
-    padding: 14px 16px;
-  }
+  .builder-errors div { color: var(--err); font-size: 13.5px; padding: 2px 0; font-family: var(--font-mono); }
+  .urlout { margin-top: 18px; background: var(--code-bg); border-radius: 8px; padding: 14px 16px; }
   .urlout .label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
   .urlout .lbl {
-    font-family: Consolas, monospace; font-size: 11px; letter-spacing: 0.1em;
+    font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.1em;
     text-transform: uppercase; color: #7d8a84;
   }
   .urlout output {
-    display: block;
-    font-family: Consolas, monospace;
-    font-size: 13px;
-    line-height: 1.6;
-    color: var(--code-accent);
-    word-break: break-all;
+    display: block; font-family: var(--font-mono); font-size: 13px;
+    line-height: 1.6; color: var(--code-accent); word-break: break-all;
   }
   .urlout.invalid output { color: #7d8a84; }
   .copy {
-    background: transparent;
-    border: 1px solid #3a4742;
-    color: var(--code-ink);
-    border-radius: 5px;
-    padding: 4px 12px;
-    font-size: 12.5px;
-    font-family: inherit;
-    cursor: pointer;
+    background: transparent; border: 1px solid #3a4742; color: var(--code-ink);
+    border-radius: 5px; padding: 4px 12px; font-size: 12.5px; font-family: inherit; cursor: pointer;
   }
   .copy:hover { border-color: var(--code-accent); color: var(--code-accent); }
   .copy:focus-visible { outline: 2px solid var(--code-accent); outline-offset: 1px; }
@@ -368,6 +427,7 @@
   @media (max-width: 860px) {
     nav { display: none; }
     main { padding: 32px 20px 80px; }
+    .hero-title { font-size: 30px; }
   }
 </style>
 
@@ -375,10 +435,14 @@
 <nav aria-label="Documentation">
   <div class="brand">
     <div class="name">DCF Valuation API</div>
-    <div class="ver">v1 &middot; model 0.1.0</div>
+    <div class="ver">v1 · model 0.1.0</div>
   </div>
-  <div class="group">Getting started</div>
+  <div class="group">Understand DCF</div>
   <a href="#overview">Overview</a>
+  <a href="#what-is-dcf">What is a DCF?</a>
+  <a href="#how-built">How a valuation is built</a>
+  <a href="#assumptions">Making good assumptions</a>
+  <div class="group">Get started</div>
   <a href="#quickstart">Quickstart</a>
   <a href="#authentication">Authentication</a>
   <div class="group">Tools</div>
@@ -398,17 +462,33 @@
 <div class="content">
 
 <section id="overview">
-  <p class="eyebrow">API Documentation</p>
-  <h1>DCF Valuation API</h1>
-  <p class="lede">Request a discounted cash flow valuation for any supported US stock with your own
-  assumptions in a single GET request. The response includes every intermediate number —
-  base financials, year-by-year projections, discount factors, terminal value — so you can
-  audit the math down to the dollar.</p>
+  <p class="eyebrow">Discounted Cash Flow · Valuation API</p>
+  <h1 class="hero-title">A company is worth the cash it will earn — in <em>today's</em> money.</h1>
+  <p class="lede">This API turns that idea into a number. Give it a ticker and your assumptions;
+  it fetches the company's financials, runs a discounted cash flow model, and returns an intrinsic
+  value per share with every intermediate figure, auditable to the dollar.</p>
 
-  <div class="endpoint">
-    <span class="method">GET</span>
-    <code>/v1/valuations/{ticker}</code>
-  </div>
+  <figure class="dcf-figure">
+    <div class="dcf-chart" aria-hidden="true">
+      <div class="dcf-col" style="--h:70%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.92"></div></div></div>
+      <div class="dcf-col" style="--h:75%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.84"></div></div></div>
+      <div class="dcf-col" style="--h:80%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.77"></div></div></div>
+      <div class="dcf-col" style="--h:85%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.71"></div></div></div>
+      <div class="dcf-col" style="--h:90%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.65"></div></div></div>
+      <div class="dcf-col tv" style="--h:100%"><div class="dcf-bar"><div class="dcf-pv" style="--pv:0.65"></div></div></div>
+    </div>
+    <div class="dcf-ticks">
+      <span>Year 1</span><span>Year 2</span><span>Year 3</span><span>Year 4</span><span>Year 5</span><span>Terminal</span>
+    </div>
+    <div class="dcf-legend">
+      <span><i class="sw-future"></i> Future cash flow</span>
+      <span><i class="sw-pv"></i> Present value today</span>
+      <span><i class="sw-tv"></i> Terminal value</span>
+    </div>
+    <figcaption class="dcf-cap">The faint bar is the cash a company throws off in each future year.
+    The solid bar is what that cash is worth <em>today</em> once discounted — and the further out it
+    lands, the more it shrinks. Sum the solid bars and you have the valuation.</figcaption>
+  </figure>
 
   <p>You supply the assumptions; we supply the financials. Company fundamentals (revenue, EBIT,
   D&amp;A, capex, working capital, debt, share count) are fetched from our data provider,
@@ -416,17 +496,192 @@
   valuation engine. Identical requests return identical results for a given
   <code>model_version</code> and source period.</p>
 
+  <div class="endpoint">
+    <span class="method">GET</span>
+    <code>/v1/valuations/{ticker}</code>
+  </div>
+
   <p><strong>v1 scope:</strong> non-financial US large caps. Banks and insurers are rejected with
-  <code>422</code> — a standard free-cash-flow DCF doesn't apply to financial balance sheets.</p>
+  <code>422</code> — a standard free-cash-flow DCF doesn't apply to financial balance sheets.
+  New to DCF? Start with <a href="#what-is-dcf">What is a DCF?</a> Already fluent? Jump to the
+  <a href="#quickstart">Quickstart</a>.</p>
+</section>
+
+<section id="what-is-dcf">
+  <h2>What is a DCF?</h2>
+  <p>A <strong>discounted cash flow</strong> model answers one question: what is a business worth
+  today, based on the cash it will generate in the future? It rests on two ideas most people
+  already believe.</p>
+
+  <p><strong>A company is worth the cash it returns to its owners.</strong> Not its share price,
+  not its headlines — the actual money left over each year after running the business and
+  reinvesting in it. That leftover is <em>free cash flow</em>.</p>
+
+  <p><strong>A dollar later is worth less than a dollar now.</strong> Money in hand today can be
+  invested and grow, and the future is uncertain — so a dollar arriving in five years is worth
+  less to you than one today. To compare future cash against today's, you <em>discount</em> it:
+  shrink it by a rate that reflects how far away and how risky it is. That rate is the
+  <strong>WACC</strong> (weighted average cost of capital).</p>
+
+  <p>Put those together: forecast a company's free cash flow for several years, estimate a
+  <em>terminal value</em> for everything after that, discount it all back to today, add it up,
+  subtract debt, and divide by shares. The result is an <strong>intrinsic value per share</strong> —
+  what the business is worth on fundamentals, independent of the market's current mood.</p>
+
+  <h3>How it's used</h3>
+  <p>Investors compare intrinsic value to the market price. Trading well below your estimate, a
+  stock may be undervalued; well above, it may be overvalued. But a DCF is a structured way to
+  reason about value, not a crystal ball — the output is only ever as good as the assumptions you
+  feed it. Its real power is showing how much the answer moves when your view of growth, margins,
+  or risk changes. That's why this API returns a full <a href="#response">sensitivity grid</a>
+  alongside every valuation, not just a single number.</p>
+</section>
+
+<section id="how-built">
+  <h2>How a valuation is built</h2>
+  <p>Every request runs the same five steps. The response exposes the output of each one, so you
+  can follow the money from this year's revenue all the way to a per-share value.</p>
+
+  <ol class="steps">
+    <li>
+      <h4>Project revenue</h4>
+      <p>Grow the most recent reported revenue forward using your <code>revenue_growth</code> rates,
+      year by year.</p>
+    </li>
+    <li>
+      <h4>Turn revenue into free cash flow</h4>
+      <p>Apply your <code>ebit_margin</code> and <code>tax_rate</code>, then add back D&amp;A and
+      subtract capex and the change in working capital — what's left is unlevered free cash flow.</p>
+    </li>
+    <li>
+      <h4>Discount each year back to today</h4>
+      <p>Divide each year's cash flow by <code>(1 + wacc)</code> raised to that year. A dollar in
+      year five counts for less than a dollar in year one.</p>
+    </li>
+    <li>
+      <h4>Add a terminal value</h4>
+      <p>Capture all the cash beyond the forecast horizon with the Gordon-growth formula using
+      <code>terminal_growth</code>, then discount that back too. This is often the largest single
+      piece of the answer.</p>
+    </li>
+    <li>
+      <h4>Go from enterprise value to per share</h4>
+      <p>Sum the present values, subtract net debt to get equity value, and divide by diluted
+      shares for the intrinsic value per share.</p>
+    </li>
+  </ol>
+</section>
+
+<section id="assumptions">
+  <h2>Making good assumptions</h2>
+  <p>The financials are ours; the assumptions are yours — and they drive the result far more than
+  the underlying data does. Here's how to choose each one well. Two habits matter most:
+  <strong>change one variable at a time</strong> so you can see its effect, and
+  <strong>read the range, not a single point</strong> — the sensitivity grid does this for you.</p>
+
+  <div class="guide">
+    <div class="guide-card">
+      <h4><code>revenue_growth</code> <span class="range">history → GDP</span></h4>
+      <p>How fast revenue grows each year. Anchor to the company's own recent growth and its
+      industry, not to hope.</p>
+      <p class="watch"><b>Avoid the hockey stick.</b> No company compounds 20% a year forever. Fade
+      high early rates toward long-run GDP (~2–4%) using per-year values, e.g.
+      <code>0.12,0.10,0.08,0.06,0.04</code>.</p>
+    </div>
+    <div class="guide-card">
+      <h4><code>ebit_margin</code> <span class="range">recent actuals</span></h4>
+      <p>Operating profit as a share of revenue. Start from the last reported margin and the
+      direction it's been heading.</p>
+      <p class="watch"><b>Don't assume expansion for free.</b> Margin gains need a reason — scale,
+      pricing power, or mix shift. Flat is often the honest default.</p>
+    </div>
+    <div class="guide-card">
+      <h4><code>wacc</code> <span class="range">~7–10%</span></h4>
+      <p>The discount rate: the annual return investors require to hold this risk. Higher for
+      volatile, cyclical, or heavily indebted businesses; lower for stable ones.</p>
+      <p class="watch"><b>The single biggest lever.</b> A one-point change can move the valuation
+      15–25%. When you're unsure, don't guess a point — test a range and read the grid.</p>
+    </div>
+    <div class="guide-card">
+      <h4><code>terminal_growth</code> <span class="range">≤ 2–3%</span></h4>
+      <p>The perpetual growth rate applied after your explicit forecast ends, forever.</p>
+      <p class="watch"><b>Keep it below long-run GDP, and never near WACC.</b> Terminal value is
+      often most of the total, so a high rate quietly inflates everything. Values at or above WACC
+      break the math and are rejected with a <code>422</code>.</p>
+    </div>
+    <div class="guide-card">
+      <h4><code>tax_rate</code> <span class="range">~21%</span></h4>
+      <p>The effective tax rate applied to operating profit. Use what the company actually pays;
+      the 21% US federal rate is a reasonable starting default.</p>
+    </div>
+    <div class="guide-card">
+      <h4><code>projection_years</code> <span class="range">5</span></h4>
+      <p>How many years you forecast explicitly before the terminal value takes over.</p>
+      <p class="watch"><b>Longer isn't more accurate.</b> Only extend the horizon if you can
+      credibly forecast that far — most businesses can't be called reliably beyond about 5–7 years.</p>
+    </div>
+  </div>
+
+  <div class="note tip"><strong>Rule of thumb:</strong> because WACC and terminal growth dominate
+  the result, treat any single valuation as one point in a range. Leave <code>sensitivity</code> on
+  (it's the default) and read the spread of the grid before you trust the headline number.</div>
 </section>
 
 <section id="quickstart">
   <h2>Quickstart</h2>
+  <p>Run the API on your own machine in five steps, then make your first request. You'll need
+  <strong>Python 3.11 or newer</strong> and a free
+  <a href="https://site.financialmodelingprep.com/developer/docs">Financial Modeling Prep</a>
+  API key for the company financials.</p>
+
+  <h3>Run it locally</h3>
+  <ol class="steps">
+    <li>
+      <h4>Clone the repository</h4>
+      <pre><code>git clone https://github.com/abdshaat/pubTools-DCF.git
+cd pubTools-DCF</code></pre>
+    </li>
+    <li>
+      <h4>Create and activate a virtual environment</h4>
+      <pre><code>python -m venv .venv
+<span class="c"># Windows (PowerShell):</span>
+.venv\Scripts\Activate.ps1
+<span class="c"># macOS / Linux:</span>
+source .venv/bin/activate</code></pre>
+    </li>
+    <li>
+      <h4>Install dependencies</h4>
+      <p>Installs the app plus its test tools (pytest, hypothesis).</p>
+      <pre><code>pip install -e ".[dev]"</code></pre>
+    </li>
+    <li>
+      <h4>Add your data-provider key</h4>
+      <p>Copy the template to a local <code>.env</code> (it's gitignored) and paste your FMP key in.</p>
+      <pre><code><span class="c"># macOS / Linux:</span>
+cp .env.example .env
+<span class="c"># Windows (PowerShell):</span>
+copy .env.example .env
+
+<span class="c"># then edit .env:</span>
+FMP_API_KEY=your-key-here</code></pre>
+    </li>
+    <li>
+      <h4>Start the server</h4>
+      <p>The app loads <code>.env</code> automatically on startup.</p>
+      <pre><code>uvicorn app.api:app --reload</code></pre>
+    </li>
+  </ol>
+
+  <p>The API is now live at <code>http://127.0.0.1:8000</code> — interactive OpenAPI docs at
+  <code>/docs</code>, and a health probe at <code>/health</code>. Want to check the engine without
+  a key first? Run the test suite, which uses recorded fixtures: <code>pytest -q</code>.</p>
+
+  <h3>Make your first request</h3>
   <p>Value Apple with a 9% discount rate, 2.5% perpetual growth, 30% EBIT margin, and a
   five-year growth ramp from 8% down to 4%:</p>
 
   <div class="panel-label">Request</div>
-  <pre><code>curl "<span class="s">https://api.example.com/v1/valuations/AAPL</span>?\
+  <pre><code>curl "<span class="s">http://127.0.0.1:8000/v1/valuations/AAPL</span>?\
 <span class="k">wacc</span>=<span class="n">0.09</span>&amp;\
 <span class="k">terminal_growth</span>=<span class="n">0.025</span>&amp;\
 <span class="k">ebit_margin</span>=<span class="n">0.30</span>&amp;\
@@ -434,8 +689,11 @@
 <span class="k">projection_years</span>=<span class="n">5</span>"</code></pre>
 
   <p>All rates are decimals: <code>0.09</code> means 9%. <code>revenue_growth</code> takes a single
-  value applied to every year, or one comma-separated value per projection year. Prefer not to
-  hand-write URLs? Use the <a href="#builder">endpoint builder</a> below.</p>
+  value applied to every year, or one comma-separated value per projection year. Not sure what to
+  put? See <a href="#assumptions">Making good assumptions</a>, or let the
+  <a href="#builder">endpoint builder</a> assemble the URL for you. Against a hosted deployment,
+  swap the base URL and add the <code>X-API-Key</code> header from
+  <a href="#authentication">Authentication</a>.</p>
 </section>
 
 <section id="authentication">
@@ -459,7 +717,7 @@
     <div class="grid">
       <div class="field">
         <label for="b-base">Base URL</label>
-        <input id="b-base" type="text" value="https://api.example.com" spellcheck="false">
+        <input id="b-base" type="text" value="http://127.0.0.1:8000" spellcheck="false">
       </div>
       <div class="field">
         <label for="b-ticker">Ticker</label>
@@ -695,15 +953,82 @@
 
 <section id="methodology">
   <h2>Methodology</h2>
-  <p>The engine projects unlevered free cash flow over the forecast horizon:</p>
-  <pre><code>FCF = EBIT × (1 − tax_rate) + D&amp;A − capex − ΔNWC</code></pre>
+  <p>For each projected year <math><mi>t</mi></math>, the engine computes unlevered free cash
+  flow:</p>
+
+  <div class="math">
+    <math display="block">
+      <mrow>
+        <msub><mtext>FCF</mtext><mi>t</mi></msub><mo>=</mo>
+        <msub><mtext>EBIT</mtext><mi>t</mi></msub>
+        <mo>×</mo>
+        <mo>(</mo><mn>1</mn><mo>−</mo><mtext>tax</mtext><mo>)</mo>
+        <mo>+</mo><msub><mtext>D&amp;A</mtext><mi>t</mi></msub>
+        <mo>−</mo><msub><mtext>capex</mtext><mi>t</mi></msub>
+        <mo>−</mo><msub><mtext>ΔNWC</mtext><mi>t</mi></msub>
+      </mrow>
+    </math>
+  </div>
+
   <p>Revenue grows by your per-year rates; EBIT applies your margin to each year's revenue;
-  D&amp;A, capex, and ΔNWC scale with revenue at the base year's observed ratios. Cash flows are
-  discounted at your WACC with end-of-year timing. Terminal value uses Gordon growth off the
-  final projected year:</p>
-  <pre><code>TV = FCF_final × (1 + terminal_growth) / (wacc − terminal_growth)</code></pre>
-  <p>Equity value is the present value of the projected cash flows plus the present value of
-  terminal value, minus net debt; per-share value divides by diluted shares outstanding.</p>
+  D&amp;A, capex, and ΔNWC scale with revenue at the base year's observed ratios. Each year's
+  cash flow is discounted at your WACC with end-of-year timing, then summed with the discounted
+  terminal value to give enterprise value:</p>
+
+  <div class="math">
+    <math display="block">
+      <mrow>
+        <mtext>EV</mtext><mo>=</mo>
+        <munderover>
+          <mo>∑</mo>
+          <mrow><mi>t</mi><mo>=</mo><mn>1</mn></mrow>
+          <mi>N</mi>
+        </munderover>
+        <mfrac>
+          <msub><mtext>FCF</mtext><mi>t</mi></msub>
+          <msup><mrow><mo>(</mo><mn>1</mn><mo>+</mo><mtext>WACC</mtext><mo>)</mo></mrow><mi>t</mi></msup>
+        </mfrac>
+        <mo>+</mo>
+        <mfrac>
+          <mtext>TV</mtext>
+          <msup><mrow><mo>(</mo><mn>1</mn><mo>+</mo><mtext>WACC</mtext><mo>)</mo></mrow><mi>N</mi></msup>
+        </mfrac>
+      </mrow>
+    </math>
+  </div>
+
+  <p>The terminal value captures all cash beyond the forecast using Gordon growth off the final
+  projected year:</p>
+
+  <div class="math">
+    <math display="block">
+      <mrow>
+        <mtext>TV</mtext><mo>=</mo>
+        <mfrac>
+          <mrow><msub><mtext>FCF</mtext><mi>N</mi></msub><mo>×</mo><mo>(</mo><mn>1</mn><mo>+</mo><mi>g</mi><mo>)</mo></mrow>
+          <mrow><mtext>WACC</mtext><mo>−</mo><mi>g</mi></mrow>
+        </mfrac>
+      </mrow>
+    </math>
+  </div>
+
+  <p>From enterprise value, subtract net debt for equity value, then divide by diluted shares
+  outstanding:</p>
+
+  <div class="math">
+    <math display="block">
+      <mrow>
+        <mtext>Equity value</mtext><mo>=</mo><mtext>EV</mtext><mo>−</mo><mtext>net debt</mtext>
+        <mspace width="2em"/>
+        <mtext>Value / share</mtext><mo>=</mo>
+        <mfrac><mtext>Equity value</mtext><mtext>diluted shares</mtext></mfrac>
+      </mrow>
+    </math>
+  </div>
+
+  <p class="sym">where <math><mi>g</mi></math> is your <code>terminal_growth</code> and
+  <math><mi>N</mi></math> is <code>projection_years</code>.</p>
+
   <p>DCF outputs are highly sensitive to <code>wacc</code> and <code>terminal_growth</code> — small
   changes move the result a lot. That's why every response includes the
   <a href="#response">sensitivity grid</a> by default: read the range it spans, not just the
