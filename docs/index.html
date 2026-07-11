@@ -788,18 +788,18 @@ FMP_API_KEY=your-key-here</code></pre>
     <thead><tr><th>Parameter</th><th>Type</th><th></th><th>Description</th></tr></thead>
     <tbody>
       <tr><td><code>wacc</code></td><td>decimal</td><td class="req">required</td>
-        <td>Discount rate. <code>0.09</code> = 9%. Must be positive and greater than
+        <td>Discount rate. <code>0.09</code> = 9%. Must be finite, 0.001–0.50, and greater than
         <code>terminal_growth</code>.</td></tr>
       <tr><td><code>terminal_growth</code></td><td>decimal</td><td class="req">required</td>
-        <td>Perpetual growth rate for the Gordon-growth terminal value.</td></tr>
+        <td>Finite perpetual growth rate from -0.10 to 0.10 and below WACC.</td></tr>
       <tr><td><code>ebit_margin</code></td><td>decimal</td><td class="req">required</td>
-        <td>Operating margin applied to every projected year. <code>0.30</code> = 30%.</td></tr>
+        <td>Finite operating margin from -1.0 to 1.0. <code>0.30</code> = 30%.</td></tr>
       <tr><td><code>revenue_growth</code></td><td>decimal | list</td><td class="req">required</td>
         <td>Single value applied to all years (<code>0.05</code>) or comma-separated per-year
         values (<code>0.08,0.07,0.06,0.05,0.04</code>). A list must have exactly
         <code>projection_years</code> entries. Each value within ±50%.</td></tr>
       <tr><td><code>tax_rate</code></td><td>decimal</td><td class="opt">default 0.21</td>
-        <td>Effective tax rate applied to EBIT. Must not be negative.</td></tr>
+        <td>Finite effective tax rate applied to EBIT. Must be from 0.0 to 1.0.</td></tr>
       <tr><td><code>projection_years</code></td><td>integer</td><td class="opt">default 5</td>
         <td>Explicit forecast horizon. 3–15.</td></tr>
       <tr><td><code>sensitivity</code></td><td>boolean</td><td class="opt">default true</td>
@@ -811,7 +811,13 @@ FMP_API_KEY=your-key-here</code></pre>
 
   <h3 id="response">Response schema</h3>
   <p>Every number the engine used or produced is returned, so the valuation can be rebuilt in a
-  spreadsheet line by line. Monetary values are raw US dollars.</p>
+  spreadsheet line by line. Monetary values are raw units of the returned <code>currency</code>.</p>
+  <p>The statement selector fetches multiple annual candidates and uses the newest complete set
+  whose income, balance-sheet, and cash-flow records share an FY period and exact statement date.
+  It validates available fiscal-year and currency metadata, prefers the latest accepted filing for
+  duplicate periods, and never mixes a newer incomplete period into an older complete set. The
+  response exposes the selection and any fallback through provenance fields and
+  <code>warnings</code>. Quotes refresh independently every 60 seconds by default.</p>
 
   <div class="tablewrap">
   <table>
@@ -825,9 +831,8 @@ FMP_API_KEY=your-key-here</code></pre>
       <tr><td><code>assumptions</code></td><td>Your assumptions, fully resolved: a scalar
         <code>revenue_growth</code> is echoed back expanded to one value per year, and defaults
         you omitted are filled in. What you see is exactly what the engine used.</td></tr>
-      <tr><td><code>projections[]</code></td><td>Per year: <code>revenue</code>, <code>ebit</code>,
-        <code>fcf</code> (unlevered free cash flow), <code>discount_factor</code>, and
-        <code>pv_fcf</code>.</td></tr>
+      <tr><td><code>projections[]</code></td><td>Per year: growth, revenue, EBIT margin, EBIT,
+        cash taxes, NOPAT, D&amp;A, capex, ΔNWC, FCF, discount period/factor, and PV of FCF.</td></tr>
       <tr><td><code>terminal_value</code> / <code>pv_terminal_value</code></td>
         <td>Gordon-growth terminal value and its present value.</td></tr>
       <tr><td><code>enterprise_value</code></td><td>Sum of all <code>pv_fcf</code> plus
@@ -849,7 +854,22 @@ FMP_API_KEY=your-key-here</code></pre>
 
   <div class="panel-label">200 OK — abridged example</div>
   <pre><code>{
+  <span class="k">"request_id"</span>: <span class="s">"8bd53754-b11d-4d6f-9634-a47480f6b97d"</span>,
+  <span class="k">"computed_at"</span>: <span class="s">"2026-07-11T18:30:00Z"</span>,
   <span class="k">"model_version"</span>: <span class="s">"0.1.0"</span>,
+  <span class="k">"data_version"</span>: <span class="s">"sha256:…"</span>,
+  <span class="k">"data_provider"</span>: <span class="s">"financialmodelingprep"</span>,
+  <span class="k">"currency"</span>: <span class="s">"USD"</span>,
+  <span class="k">"monetary_unit"</span>: <span class="s">"raw_currency_units"</span>,
+  <span class="k">"fundamentals_as_of"</span>: <span class="s">"2025-09-27"</span>,
+  <span class="k">"price_as_of"</span>: <span class="n">null</span>,
+  <span class="k">"price_fetched_at"</span>: <span class="s">"2026-07-11T18:29:59Z"</span>,
+  <span class="k">"fiscal_year"</span>: <span class="s">"2025"</span>,
+  <span class="k">"statement_period"</span>: <span class="s">"FY"</span>,
+  <span class="k">"filing_date"</span>: <span class="n">null</span>,
+  <span class="k">"accepted_at"</span>: <span class="n">null</span>,
+  <span class="k">"statement_selection"</span>: <span class="s">"latest_complete_annual"</span>,
+  <span class="k">"disclaimer"</span>: <span class="s">"Model estimate based on supplied assumptions; not investment advice."</span>,
   <span class="k">"ticker"</span>: <span class="s">"AAPL"</span>,
   <span class="k">"base_financials"</span>: {
     <span class="k">"source_period"</span>: <span class="s">"FY2025 (2025-09-27)"</span>,
@@ -873,9 +893,17 @@ FMP_API_KEY=your-key-here</code></pre>
   <span class="k">"projections"</span>: [
     {
       <span class="k">"year"</span>: <span class="n">1</span>,
+      <span class="k">"revenue_growth"</span>: <span class="n">0.08</span>,
       <span class="k">"revenue"</span>: <span class="n">422317800000.0</span>,
+      <span class="k">"ebit_margin"</span>: <span class="n">0.3</span>,
       <span class="k">"ebit"</span>: <span class="n">126695340000.0</span>,
+      <span class="k">"cash_taxes"</span>: <span class="n">26606021400.0</span>,
+      <span class="k">"nopat"</span>: <span class="n">100089318600.0</span>,
+      <span class="k">"da"</span>: <span class="n">12360600000.0</span>,
+      <span class="k">"capex"</span>: <span class="n">10202760000.0</span>,
+      <span class="k">"delta_nwc"</span>: <span class="n">-3943080000.0</span>,
       <span class="k">"fcf"</span>: <span class="n">106190238600.0</span>,
+      <span class="k">"discount_period"</span>: <span class="n">1.0</span>,
       <span class="k">"discount_factor"</span>: <span class="n">0.9174</span>,
       <span class="k">"pv_fcf"</span>: <span class="n">97422237247.71</span>
     },
@@ -896,6 +924,7 @@ FMP_API_KEY=your-key-here</code></pre>
   <span class="k">"intrinsic_value_per_share"</span>: <span class="n">112.4342</span>,
   <span class="k">"current_price"</span>: <span class="n">245.5</span>,
   <span class="k">"upside_pct"</span>: <span class="n">-54.202</span>,
+  <span class="k">"warnings"</span>: [],
   <span class="k">"sensitivity"</span>: {
     <span class="k">"wacc_values"</span>: [<span class="n">0.08</span>, <span class="n">0.09</span>, <span class="n">0.1</span>],
     <span class="k">"terminal_growth_values"</span>: [<span class="n">0.02</span>, <span class="n">0.025</span>, <span class="n">0.03</span>],
@@ -910,14 +939,24 @@ FMP_API_KEY=your-key-here</code></pre>
 
 <section id="errors">
   <h2>Validation &amp; errors</h2>
-  <p>Assumption errors return <code>422</code> with the offending field named, so they can be
-  surfaced directly against the right input in your UI:</p>
+  <p>Assumption errors return <code>422</code> with the offending field named. Existing clients
+  can keep reading <code>detail</code>; new clients should use the versioned <code>error</code>
+  envelope and retain the <code>request_id</code> when contacting support:</p>
 
   <div class="panel-label">422 Unprocessable Entity</div>
   <pre><code>{
   <span class="k">"detail"</span>: [
     { <span class="k">"field"</span>: <span class="s">"terminal_growth"</span>, <span class="k">"message"</span>: <span class="s">"must be less than wacc (Gordon growth formula)"</span> }
-  ]
+  ],
+  <span class="k">"error"</span>: {
+    <span class="k">"version"</span>: <span class="s">"1"</span>,
+    <span class="k">"code"</span>: <span class="s">"invalid_assumptions"</span>,
+    <span class="k">"message"</span>: <span class="s">"DCF assumptions are invalid."</span>,
+    <span class="k">"request_id"</span>: <span class="s">"8bd53754-b11d-4d6f-9634-a47480f6b97d"</span>,
+    <span class="k">"fields"</span>: [
+      { <span class="k">"field"</span>: <span class="s">"terminal_growth"</span>, <span class="k">"code"</span>: <span class="s">"invalid_value"</span>, <span class="k">"message"</span>: <span class="s">"must be less than wacc (Gordon growth formula)"</span> }
+    ]
+  }
 }</code></pre>
 
   <div class="tablewrap">
@@ -929,7 +968,8 @@ FMP_API_KEY=your-key-here</code></pre>
         symbol doesn't exist, or it falls outside the supported universe (non-financial US large
         caps). Retrying won't change the result.</td></tr>
       <tr><td class="status err">422</td><td>Invalid assumptions (<code>terminal_growth ≥ wacc</code>,
-        <code>projection_years</code> outside 3–15, growth beyond ±50%, negative tax rate,
+        non-finite or out-of-range rates, <code>projection_years</code> outside 3–15,
+        growth beyond ±50%,
         malformed or wrong-length <code>revenue_growth</code>) — or a financial-sector ticker,
         which this model doesn't support.</td></tr>
       <tr><td class="status err">502</td><td>Provider data for this ticker couldn't be normalized.
@@ -1111,11 +1151,11 @@ FMP_API_KEY=your-key-here</code></pre>
     var years = parseInt($("b-years").value, 10);
 
     if (!ticker || !/^[A-Z][A-Z.\-]*$/.test(ticker)) errors.push("ticker: letters, dots, dashes only");
-    if (wacc === null || wacc <= 0) errors.push("wacc: must be positive");
-    if (tg === null) errors.push("terminal_growth: required");
-    if (margin === null) errors.push("ebit_margin: required");
+    if (wacc === null || wacc < 0.001 || wacc > 0.50) errors.push("wacc: must be 0.1–50%");
+    if (tg === null || tg < -0.10 || tg > 0.10) errors.push("terminal_growth: must be -10–10%");
+    if (margin === null || margin < -1 || margin > 1) errors.push("ebit_margin: must be -100–100%");
     if (wacc !== null && tg !== null && tg >= wacc) errors.push("terminal_growth: must be less than wacc");
-    if (tax !== null && tax < 0) errors.push("tax_rate: must not be negative");
+    if (tax !== null && (tax < 0 || tax > 1)) errors.push("tax_rate: must be 0–100%");
     if (isNaN(years) || years < 3 || years > 15) errors.push("projection_years: must be 3–15");
 
     var growths = [];

@@ -23,6 +23,10 @@ def make_base_financials() -> BaseFinancials:
         net_debt=200_000.0,
         diluted_shares=100_000.0,
         current_price=20.0,
+        currency="USD",
+        fundamentals_as_of="2025-12-31",
+        fiscal_year="2025",
+        statement_period="FY",
     )
 
 

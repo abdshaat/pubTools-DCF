@@ -25,22 +25,55 @@ data/
 .venv-store-broken/
 venv/
 env/
+ENV/
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
 *.egg-info/
+.eggs/
+pip-wheel-metadata/
+__pypackages__/
 build/
 dist/
+wheels/
+site/
 .pytest_cache/
 .coverage
 .coverage.*
 coverage.xml
+coverage.json
 htmlcov/
+junit*.xml
+test-results/
 .tox/
 .nox/
 .hypothesis/
 .mypy_cache/
+.dmypy.json
+dmypy.json
 .ruff_cache/
+.pyright/
+.pyre/
+.pytype/
+.ipynb_checkpoints/
+
+# --- Node / Vercel local tooling ---
+.vercel/
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Logs, temporary files, and local backups ---
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+*.swo
+*~
 
 # --- Local notes / editor ---
 # Ignore Markdown planning/instruction files. Keep the public repository README.
@@ -49,8 +82,9 @@ htmlcov/
 !README.md
 !README.MD
 .claude/
-.vercel/
 .vscode/
 .idea/
+.vs/
 .DS_Store
 Thumbs.db
+Desktop.ini

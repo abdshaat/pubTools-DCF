@@ -6,6 +6,7 @@ unit-convention rule in CLAUDE.md.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 
 
@@ -25,6 +26,17 @@ class BaseFinancials:
     net_debt: float
     diluted_shares: float
     current_price: float
+    currency: str | None = None
+    fundamentals_as_of: str | None = None
+    price_as_of: datetime | None = None
+    price_fetched_at: datetime | None = None
+    data_provider: str = "financialmodelingprep"
+    fiscal_year: str | None = None
+    statement_period: str | None = None
+    filing_date: str | None = None
+    accepted_at: str | None = None
+    statement_selection: str = "latest_complete_annual"
+    data_quality_warnings: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -58,9 +70,17 @@ class Assumptions:
 @dataclass(frozen=True)
 class YearProjection:
     year: int
+    revenue_growth: float
     revenue: float
+    ebit_margin: float
     ebit: float
+    cash_taxes: float
+    nopat: float
+    da: float
+    capex: float
+    delta_nwc: float
     fcf: float
+    discount_period: float
     discount_factor: float
     pv_fcf: float
 
@@ -87,3 +107,4 @@ class Valuation:
     intrinsic_value_per_share: float
     current_price: float
     upside_pct: float
+    warnings: tuple[str, ...] = ()

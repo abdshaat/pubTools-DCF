@@ -55,9 +55,9 @@ class UnsupportedSectorError(Exception):
 
 
 class NormalizationError(Exception):
-    """Provider payload is missing fields the canonical schema requires."""
+    """Provider payload has missing or unusable canonical fields."""
 
     def __init__(self, ticker: str, missing: list[str]):
         self.ticker = ticker
         self.missing = missing
-        super().__init__(f"cannot normalize {ticker}: missing fields {missing}")
+        super().__init__(f"cannot normalize {ticker}: missing or invalid fields {missing}")

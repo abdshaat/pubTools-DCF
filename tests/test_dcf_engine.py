@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pytest
 from hypothesis import assume, given, settings
 from hypothesis import strategies as st
@@ -37,8 +39,16 @@ def test_matches_hand_computed_3_year_flat_growth(base_financials: BaseFinancial
     #   df    = 1 / 1.10^1 = 0.909090909...
     #   pv_fcf = 175,875 * 0.909090909... = 159,886.36...
     y1 = result.projections[0]
+    assert y1.revenue_growth == pytest.approx(0.05)
     assert y1.revenue == pytest.approx(1_050_000.0)
+    assert y1.ebit_margin == pytest.approx(0.25)
+    assert y1.cash_taxes == pytest.approx(65_625.0)
+    assert y1.nopat == pytest.approx(196_875.0)
+    assert y1.da == pytest.approx(52_500.0)
+    assert y1.capex == pytest.approx(63_000.0)
+    assert y1.delta_nwc == pytest.approx(10_500.0)
     assert y1.fcf == pytest.approx(175_875.0)
+    assert y1.discount_period == 1.0
     assert y1.pv_fcf == pytest.approx(159_886.3636, rel=1e-6)
 
     # Year 2: revenue = 1,050,000 * 1.05 = 1,102,500
@@ -120,6 +130,108 @@ def test_per_year_revenue_growth_list_is_used_positionally(base_financials: Base
 # ---------------------------------------------------------------------------
 # Validation rules (CLAUDE.md: return per-field errors, 422 at the API layer)
 # ---------------------------------------------------------------------------
+
+
+def _valid_assumptions(**overrides) -> Assumptions:
+    values = {
+        "wacc": 0.10,
+        "terminal_growth": 0.02,
+        "tax_rate": 0.25,
+        "ebit_margin": 0.25,
+        "projection_years": 5,
+        "revenue_growth": 0.05,
+    }
+    values.update(overrides)
+    return Assumptions(**values)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wacc", float("nan")),
+        ("wacc", float("inf")),
+        ("terminal_growth", float("-inf")),
+        ("tax_rate", float("nan")),
+        ("ebit_margin", float("inf")),
+    ],
+)
+def test_non_finite_assumptions_rejected(base_financials: BaseFinancials, field: str, value: float):
+    with pytest.raises(DCFValidationError) as exc:
+        compute_dcf(base_financials, _valid_assumptions(**{field: value}))
+    assert exc.value.field == field
+    assert "finite" in exc.value.message
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_revenue_growth_rejected(base_financials: BaseFinancials, value: float):
+    with pytest.raises(DCFValidationError) as exc:
+        compute_dcf(base_financials, _valid_assumptions(revenue_growth=value))
+    assert exc.value.field == "revenue_growth"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("wacc", 0.0),
+        ("wacc", 0.501),
+        ("terminal_growth", -0.101),
+        ("terminal_growth", 0.101),
+        ("tax_rate", -0.001),
+        ("tax_rate", 1.001),
+        ("ebit_margin", -1.001),
+        ("ebit_margin", 1.001),
+    ],
+)
+def test_assumption_bounds_rejected(base_financials: BaseFinancials, field: str, value: float):
+    with pytest.raises(DCFValidationError) as exc:
+        compute_dcf(base_financials, _valid_assumptions(**{field: value}))
+    assert exc.value.field == field
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("revenue", float("nan")),
+        ("ebit", float("inf")),
+        ("da", -1.0),
+        ("capex", -1.0),
+        ("delta_nwc", float("-inf")),
+        ("net_debt", float("nan")),
+        ("diluted_shares", 0.0),
+        ("current_price", 0.0),
+    ],
+)
+def test_invalid_base_financials_rejected(
+    base_financials: BaseFinancials, field: str, value: float
+):
+    with pytest.raises(DCFValidationError) as exc:
+        compute_dcf(replace(base_financials, **{field: value}), _valid_assumptions())
+    assert exc.value.field == field
+
+
+def test_non_finite_calculation_result_rejected(base_financials: BaseFinancials):
+    huge_base = replace(
+        base_financials,
+        revenue=1e308,
+        ebit=1e307,
+        da=1e306,
+        capex=1e306,
+        delta_nwc=1e306,
+    )
+    with pytest.raises(DCFValidationError) as exc:
+        compute_dcf(huge_base, _valid_assumptions(revenue_growth=0.5))
+    assert exc.value.field == "calculation"
+
+
+def test_negative_valuation_is_returned_unclipped_with_warnings(
+    base_financials: BaseFinancials,
+):
+    result = compute_dcf(base_financials, _valid_assumptions(ebit_margin=-1.0))
+    assert result.enterprise_value < 0
+    assert result.equity_value < 0
+    assert result.intrinsic_value_per_share < 0
+    assert len(result.warnings) == 2
+    assert all("without clipping" in warning for warning in result.warnings)
 
 
 def test_terminal_growth_equal_to_wacc_rejected(base_financials: BaseFinancials):

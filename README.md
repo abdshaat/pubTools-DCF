@@ -22,10 +22,23 @@ GET /v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30
   `TV = FCF_final × (1 + g) / (WACC − g)`
 - Equity value = PV(FCFs) + PV(TV) − net debt; per-share = equity / diluted shares
 - `revenue_growth` takes a single value or one value per projection year
+- Safety bounds: WACC 0.1–50%, terminal growth -10–10% and below WACC,
+  EBIT margin -100–100%, tax rate 0–100%, and annual revenue growth ±50%.
+  NaN and infinity are rejected for every caller- and provider-derived number.
+- Negative enterprise, equity, or per-share estimates are valid model outcomes:
+  the API returns them without clipping and includes explanatory warnings.
+- Calculations use finite IEEE-754 double-precision values without intermediate
+  rounding. API numbers are raw calculation values; clients should round only
+  for display. Billing amounts will use integer minor units or decimal arithmetic,
+  separately from the valuation engine.
 - Every response includes a 3×3 **sensitivity grid** (WACC ±1% × terminal
   growth ±0.5%) by default — DCF outputs swing hard on those two inputs, so
   the range matters more than the point estimate. Opt out with
   `sensitivity=false`.
+- Every projected year includes the complete FCF bridge (growth, margin, taxes,
+  NOPAT, D&A, capex, NWC, discount period/factor, FCF, and PV). Responses also
+  include request/computation IDs, currency/units, provider and data versions,
+  statement/quote dates, model version, warnings, and a disclaimer.
 
 **v1 scope:** non-financial US large caps. Banks and insurers are rejected
 with a 422 (standard FCF DCF doesn't apply). Tickers that don't exist or fall
@@ -35,6 +48,24 @@ math (e.g. `terminal_growth >= wacc`) return 422 with per-field messages.
 The fundamentals service also **negative-caches** these definitive rejections,
 so a client repeatedly requesting a bad or uncovered ticker doesn't spend an
 upstream provider call each time — the FMP free tier allows only ~250/day.
+
+### Statement freshness
+
+The API fetches up to eight annual candidates from each financial-statement
+endpoint. It joins income, balance-sheet, and cash-flow records by annual period
+and exact statement date, verifies fiscal-year and currency compatibility, then
+selects the newest complete filing set. Duplicate periods prefer the newest
+accepted/filing date. A newer incomplete period is never mixed into an older
+complete set; it produces a data-quality warning instead. If no compatible set
+exists, the API fails with a controlled normalization error rather than valuing
+inconsistent data.
+
+Statements/profile data use a long cache lifetime, while quotes use a separate
+60-second default TTL. A failed quote refresh may use a cached quote for at most
+15 minutes and reports that fallback in `warnings`; older prices fail rather than
+silently appearing current. `fundamentals_as_of`, `fiscal_year`,
+`statement_period`, filing metadata, `price_as_of`, and `price_fetched_at` make
+the selected data auditable.
 
 ## Architecture
 

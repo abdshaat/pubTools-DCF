@@ -7,6 +7,8 @@ backed data layer) while exercising the real milestone-4 client code.
 
 import asyncio
 import json
+from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -23,7 +25,7 @@ from app.exceptions import (
 )
 from app.fundamentals import FundamentalsService
 from app.models import Assumptions
-from app.normalization import normalize_fmp_fundamentals
+from app.normalization import normalize_fmp_fundamentals, normalize_fmp_quote
 from app.providers.fmp import FMPClient, FMPFundamentals
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fmp"
@@ -70,7 +72,14 @@ def make_fundamentals(ticker: str = "AAPL", **overrides) -> FMPFundamentals:
     }
     for name, patch in overrides.items():
         sections[name] = {**sections[name], **patch}
-    return FMPFundamentals(ticker=ticker, **sections)
+    return FMPFundamentals(
+        ticker=ticker,
+        income=(sections["income"],),
+        balance=(sections["balance"],),
+        cash_flow=(sections["cash_flow"],),
+        profile=sections["profile"],
+        quote=sections["quote"],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +103,10 @@ def test_normalize_maps_fmp_fields_to_canonical_schema():
     assert base.net_debt == 106_629_000_000.0 - 29_943_000_000.0
     assert base.diluted_shares == 15_408_095_000.0
     assert base.current_price == 245.5
+    assert base.currency == "USD"
+    assert base.fundamentals_as_of == "2025-09-27"
+    assert base.price_as_of is None
+    assert base.data_provider == "financialmodelingprep"
 
 
 def test_normalize_rejects_financial_sector():
@@ -111,6 +124,160 @@ def test_normalize_reports_all_missing_fields_by_name():
     with pytest.raises(NormalizationError) as exc:
         normalize_fmp_fundamentals(broken)
     assert exc.value.missing == ["capex", "revenue"]
+
+
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), "not-a-number"])
+def test_normalize_rejects_non_finite_or_non_numeric_fields(value):
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(make_fundamentals(income={"revenue": value}))
+    assert exc.value.missing == ["revenue"]
+
+
+@pytest.mark.parametrize(
+    ("section", "patch", "field"),
+    [
+        ("income", {"revenue": 0}, "revenue"),
+        ("income", {"weightedAverageShsOutDil": 0}, "diluted_shares"),
+        ("cash_flow", {"depreciationAndAmortization": -1}, "da"),
+        ("quote", {"price": 0}, "current_price"),
+    ],
+)
+def test_normalize_rejects_invalid_positive_domain_fields(section, patch, field):
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(make_fundamentals(**{section: patch}))
+    assert exc.value.missing == [field]
+
+
+def test_normalize_maps_optional_quote_timestamp():
+    base = normalize_fmp_fundamentals(make_fundamentals(quote={"timestamp": 1_700_000_000}))
+    assert base.price_as_of == datetime.fromtimestamp(1_700_000_000, tz=UTC)
+
+
+def test_normalize_rejects_invalid_quote_timestamp():
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(make_fundamentals(quote={"timestamp": "invalid"}))
+    assert exc.value.missing == ["price_as_of"]
+
+
+def test_normalize_requires_currency():
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(make_fundamentals(profile={"currency": None}))
+    assert exc.value.missing == ["currency"]
+
+
+def test_selects_newest_complete_annual_statement_set():
+    base = make_fundamentals()
+    newer_income = {**base.income[0], "date": "2026-09-26", "fiscalYear": 2026, "revenue": 999}
+    newer_balance = {**base.balance[0], "date": "2026-09-26", "fiscalYear": 2026}
+    newer_cash_flow = {**base.cash_flow[0], "date": "2026-09-26", "fiscalYear": 2026}
+    fundamentals = replace(
+        base,
+        income=(base.income[0], newer_income),
+        balance=(base.balance[0], newer_balance),
+        cash_flow=(base.cash_flow[0], newer_cash_flow),
+    )
+
+    selected = normalize_fmp_fundamentals(fundamentals)
+    assert selected.revenue == 999
+    assert selected.fundamentals_as_of == "2026-09-26"
+    assert selected.fiscal_year == "2026"
+
+
+def test_newer_incomplete_period_is_not_mixed_into_older_complete_set():
+    base = make_fundamentals()
+    newer_income = {**base.income[0], "date": "2026-09-26", "fiscalYear": 2026, "revenue": 999}
+    selected = normalize_fmp_fundamentals(replace(base, income=(newer_income, base.income[0])))
+
+    assert selected.revenue == 391_035_000_000.0
+    assert selected.fundamentals_as_of == "2025-09-27"
+    assert any(
+        "newer annual period was incomplete" in warning.lower()
+        for warning in selected.data_quality_warnings
+    )
+
+
+def test_rejects_when_statement_dates_have_no_complete_intersection():
+    base = make_fundamentals()
+    mismatched = replace(
+        base,
+        balance=({**base.balance[0], "date": "2025-09-26"},),
+        cash_flow=({**base.cash_flow[0], "date": "2025-09-25"},),
+    )
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(mismatched)
+    assert exc.value.missing == ["statement_alignment"]
+
+
+def test_rejects_conflicting_fiscal_years_for_same_statement_date():
+    base = make_fundamentals()
+    mismatched = replace(base, balance=({**base.balance[0], "fiscalYear": 2024},))
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(mismatched)
+    assert exc.value.missing == ["statement_alignment"]
+
+
+def test_rejects_statement_currency_mismatch():
+    base = make_fundamentals()
+    mismatched = replace(base, cash_flow=({**base.cash_flow[0], "reportedCurrency": "EUR"},))
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(mismatched)
+    assert exc.value.missing == ["statement_alignment", "currency"]
+
+
+def test_selects_latest_accepted_restatement_for_same_period():
+    base = make_fundamentals()
+    original = {**base.income[0], "acceptedDate": "2025-10-30T10:00:00Z", "revenue": 100}
+    restated = {**base.income[0], "acceptedDate": "2025-11-05T10:00:00Z", "revenue": 200}
+    selected = normalize_fmp_fundamentals(replace(base, income=(original, restated)))
+
+    assert selected.revenue == 200
+    assert selected.accepted_at == "2025-11-05T10:00:00Z"
+    assert any("restatement" in w.lower() for w in selected.data_quality_warnings)
+
+
+def test_fiscal_year_offset_is_retained_from_income_statement():
+    base = make_fundamentals()
+    offset = replace(base, income=({**base.income[0], "fiscalYear": 2026},))
+    selected = normalize_fmp_fundamentals(offset)
+    assert selected.fiscal_year == "2026"
+    assert selected.fundamentals_as_of == "2025-09-27"
+
+
+def test_calendar_year_fallback_handles_provider_naming_drift():
+    base = make_fundamentals()
+    drifted = replace(
+        base,
+        income=({**base.income[0], "fiscalYear": None, "calendarYear": 2025},),
+    )
+    assert normalize_fmp_fundamentals(drifted).fiscal_year == "2025"
+
+
+def test_diluted_share_class_field_is_used_instead_of_basic_shares():
+    base = make_fundamentals()
+    shares = replace(
+        base,
+        income=(
+            {
+                **base.income[0],
+                "weightedAverageShsOut": 99,
+                "weightedAverageShsOutDil": 123,
+            },
+        ),
+    )
+    assert normalize_fmp_fundamentals(shares).diluted_shares == 123
+
+
+def test_missing_statement_dates_fail_safely():
+    base = make_fundamentals()
+    missing_dates = replace(
+        base,
+        income=({**base.income[0], "date": None},),
+        balance=({**base.balance[0], "date": None},),
+        cash_flow=({**base.cash_flow[0], "date": None},),
+    )
+    with pytest.raises(NormalizationError) as exc:
+        normalize_fmp_fundamentals(missing_dates)
+    assert exc.value.missing == ["statement_alignment"]
 
 
 def test_normalized_output_feeds_straight_into_dcf_engine():
@@ -140,8 +307,74 @@ def test_fetch_fundamentals_returns_all_five_sections():
 
     result = asyncio.run(scenario())
     assert result.ticker == "AAPL"
-    assert result.income["revenue"] == 391_035_000_000
+    assert result.income[0]["revenue"] == 391_035_000_000
     assert result.quote["price"] == 245.5
+
+
+def test_statement_fetch_requests_multiple_candidate_periods():
+    observed_limits = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint in {
+            "income-statement",
+            "balance-sheet-statement",
+            "cash-flow-statement",
+        }:
+            observed_limits.append(request.url.params.get("limit"))
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    asyncio.run(scenario())
+    assert observed_limits == ["8", "8", "8"]
+
+
+def test_provider_rejects_malformed_statement_record_list():
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        payload = [123] if endpoint == "income-statement" else load_fixture("AAPL")[endpoint]
+        return httpx.Response(200, json=payload)
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    with pytest.raises(ProviderError, match="malformed income-statement records"):
+        asyncio.run(scenario())
+
+
+def test_provider_accepts_single_statement_and_profile_objects():
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        payload = load_fixture("AAPL")[endpoint]
+        if endpoint != "quote":
+            payload = payload[0]
+        return httpx.Response(200, json=payload)
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            return await client.fetch_fundamentals("AAPL")
+
+    result = asyncio.run(scenario())
+    assert len(result.income) == 1
+    assert result.profile["currency"] == "USD"
+
+
+@pytest.mark.parametrize("payload", [[], "malformed"])
+def test_independent_quote_fetch_rejects_empty_or_malformed_payload(payload):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=payload)
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            await client.fetch_quote("AAPL")
+
+    expected = TickerNotFoundError if payload == [] else ProviderError
+    with pytest.raises(expected):
+        asyncio.run(scenario())
 
 
 def test_unknown_ticker_raises_ticker_not_found():
@@ -231,7 +464,7 @@ def test_retries_on_429_with_backoff_then_succeeds():
             return await client.fetch_fundamentals("AAPL")
 
     result = asyncio.run(scenario())
-    assert result.income["revenue"] == 391_035_000_000
+    assert result.income[0]["revenue"] == 391_035_000_000
     assert sleeps == [7.0, 7.0]  # honored Retry-After on both 429s
 
 
@@ -296,7 +529,12 @@ def test_cache_expires_after_ttl():
 
     async def scenario():
         async with make_client(transport=fixture_transport(call_log)) as client:
-            service = FundamentalsService(client, ttl_seconds=3600, now=lambda: clock["t"])
+            service = FundamentalsService(
+                client,
+                ttl_seconds=3600,
+                quote_ttl_seconds=3600,
+                now=lambda: clock["t"],
+            )
             await service.get_base_financials("AAPL")
             clock["t"] = 3599.0
             await service.get_base_financials("AAPL")  # still cached
@@ -307,7 +545,151 @@ def test_cache_expires_after_ttl():
 
     calls_before_expiry = asyncio.run(scenario())
     assert calls_before_expiry == 5
-    assert len(call_log) == 10
+    # Statement refresh reuses the independently fresh profile, then refreshes
+    # the quote: 3 statement calls + 1 quote call instead of another full 5.
+    assert len(call_log) == 9
+
+
+def test_profile_refreshes_independently_without_refetching_statements():
+    call_log = []
+    clock = {"t": 0.0}
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=3600,
+                profile_ttl_seconds=100,
+                quote_ttl_seconds=3600,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 101.0
+            return await service.get_base_financials("AAPL")
+
+    refreshed = asyncio.run(scenario())
+    assert refreshed.currency == "USD"
+    assert len(call_log) == 6
+    assert [endpoint for endpoint, _ in call_log].count("profile") == 2
+    assert [endpoint for endpoint, _ in call_log].count("income-statement") == 1
+
+
+def test_quote_refreshes_independently_without_refetching_statements():
+    call_log = []
+    clock = {"t": 0.0}
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=3600,
+                quote_ttl_seconds=60,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 61.0
+            return await service.get_base_financials("AAPL")
+
+    refreshed = asyncio.run(scenario())
+    assert refreshed.current_price == 245.5
+    assert len(call_log) == 6
+    assert [endpoint for endpoint, _ in call_log].count("quote") == 2
+    assert [endpoint for endpoint, _ in call_log].count("income-statement") == 1
+
+
+def test_quote_refresh_failure_uses_bounded_stale_quote_with_warning():
+    call_log = []
+    clock = {"t": 0.0}
+    fail_quote = {"value": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        call_log.append((endpoint, request.url.params.get("symbol", "")))
+        if endpoint == "quote" and fail_quote["value"]:
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
+        ) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=3600,
+                quote_ttl_seconds=60,
+                max_quote_staleness_seconds=900,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 61.0
+            fail_quote["value"] = True
+            return await service.get_base_financials("AAPL")
+
+    stale = asyncio.run(scenario())
+    assert stale.current_price == 245.5
+    assert any("bounded stale quote" in warning for warning in stale.data_quality_warnings)
+
+
+def test_quote_refresh_failure_beyond_staleness_limit_raises():
+    clock = {"t": 0.0}
+    fail_quote = {"value": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "quote" and fail_quote["value"]:
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
+        ) as client:
+            service = FundamentalsService(
+                client,
+                quote_ttl_seconds=60,
+                max_quote_staleness_seconds=900,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 901.0
+            fail_quote["value"] = True
+            await service.get_base_financials("AAPL")
+
+    with pytest.raises(ProviderError):
+        asyncio.run(scenario())
+
+
+def test_invalidate_clears_statement_quote_and_negative_caches():
+    service = FundamentalsService(make_client())
+    service._cache["AAPL"] = (0.0, normalize_fmp_fundamentals(make_fundamentals()))
+    service._quote_cache["AAPL"] = (
+        0.0,
+        normalize_fmp_quote("AAPL", {"price": 1}, datetime.now(UTC)),
+    )
+    raw = make_fundamentals()
+    service._raw_cache["AAPL"] = (0.0, raw)
+    service._profile_cache["AAPL"] = (0.0, raw.profile)
+    service._negative["BAD"] = (0.0, TickerNotFoundError("BAD"))
+
+    service.invalidate("aapl")
+    assert "AAPL" not in service._cache
+    assert "AAPL" not in service._quote_cache
+    assert "AAPL" not in service._raw_cache
+    assert "AAPL" not in service._profile_cache
+    assert "BAD" in service._negative
+
+    service.invalidate()
+    assert not service._cache
+    assert not service._quote_cache
+    assert not service._raw_cache
+    assert not service._profile_cache
+    assert not service._negative
 
 
 # ---------------------------------------------------------------------------
@@ -405,4 +787,26 @@ def test_negative_cache_expires_after_ttl():
 
     calls_before_expiry = asyncio.run(scenario())
     assert calls_before_expiry == 1
+    assert len(call_log) == 2
+
+
+def test_negative_cache_has_independent_ttl():
+    call_log: list = []
+    clock = {"t": 0.0}
+
+    async def scenario():
+        async with make_client(transport=_always_402_transport(call_log)) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=3600,
+                negative_ttl_seconds=10,
+                now=lambda: clock["t"],
+            )
+            with pytest.raises(TickerNotCoveredError):
+                await service.get_base_financials("ZZZQQQ")
+            clock["t"] = 11.0
+            with pytest.raises(TickerNotCoveredError):
+                await service.get_base_financials("ZZZQQQ")
+
+    asyncio.run(scenario())
     assert len(call_log) == 2

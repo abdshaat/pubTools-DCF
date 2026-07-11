@@ -47,7 +47,14 @@ def _latest(ticker: str, endpoint: str) -> dict:
 def build(ticker: str) -> None:
     ticker = ticker.upper()
     sections = {key: _latest(ticker, ep) for key, ep in _ENDPOINTS.items()}
-    fundamentals = FMPFundamentals(ticker=ticker, **sections)
+    fundamentals = FMPFundamentals(
+        ticker=ticker,
+        income=(sections["income"],),
+        balance=(sections["balance"],),
+        cash_flow=(sections["cash_flow"],),
+        profile=sections["profile"],
+        quote=sections["quote"],
+    )
     base = normalize_fmp_fundamentals(fundamentals)
 
     OUT.mkdir(parents=True, exist_ok=True)

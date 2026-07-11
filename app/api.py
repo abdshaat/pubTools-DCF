@@ -21,8 +21,11 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path as FilePath
 from typing import Any
+from uuid import uuid4
 
 from fastapi import FastAPI, Path, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from . import MODEL_VERSION
@@ -38,7 +41,7 @@ from .exceptions import (
 from .fundamentals import FundamentalsService
 from .models import Assumptions
 from .providers.fmp import FileRawSink, FMPClient
-from .schemas import ValuationResponse, build_valuation_response
+from .schemas import ErrorResponse, ValuationResponse, build_valuation_response
 
 # Load a local .env (gitignored) so `uvicorn app.api:app` picks up FMP_API_KEY
 # without the developer having to export it every shell. No-op if python-dotenv
@@ -80,12 +83,19 @@ def _parse_revenue_growth(raw: str) -> list[float]:
 def create_app(
     fmp_client: FMPClient | None = None,
     ttl_seconds: float = 4 * 3600,
+    profile_ttl_seconds: float = 24 * 3600,
+    quote_ttl_seconds: float = 60,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_client = fmp_client is None
         client = fmp_client or FMPClient(raw_sink=_default_raw_sink())
-        app.state.fundamentals = FundamentalsService(client, ttl_seconds=ttl_seconds)
+        app.state.fundamentals = FundamentalsService(
+            client,
+            ttl_seconds=ttl_seconds,
+            profile_ttl_seconds=profile_ttl_seconds,
+            quote_ttl_seconds=quote_ttl_seconds,
+        )
         try:
             yield
         finally:
@@ -102,22 +112,79 @@ def create_app(
         lifespan=lifespan,
     )
 
+    @app.middleware("http")
+    async def _request_id(request: Request, call_next: Any) -> JSONResponse:
+        request.state.request_id = str(uuid4())
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request.state.request_id
+        return response
+
     # --- error mapping (see app/exceptions.py for the rationale) ---
 
-    def _error(status: int, detail: Any) -> JSONResponse:
-        return JSONResponse(status_code=status, content={"detail": detail})
+    def _error(
+        request: Request,
+        status: int,
+        detail: Any,
+        code: str,
+        message: str,
+        fields: list[dict[str, str]] | None = None,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=status,
+            content={
+                "detail": jsonable_encoder(detail),
+                "error": {
+                    "version": "1",
+                    "code": code,
+                    "message": message,
+                    "request_id": request.state.request_id,
+                    "fields": fields or [],
+                },
+            },
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_error(
+        request: Request, exc: RequestValidationError
+    ) -> JSONResponse:
+        detail = exc.errors()
+        fields = [
+            {
+                "field": str(error["loc"][-1]),
+                "code": str(error["type"]),
+                "message": str(error["msg"]),
+            }
+            for error in detail
+        ]
+        return _error(
+            request,
+            422,
+            detail,
+            "request_validation_failed",
+            "Request parameters failed validation.",
+            fields,
+        )
 
     @app.exception_handler(DCFValidationError)
     async def _validation_error(request: Request, exc: DCFValidationError) -> JSONResponse:
-        return _error(422, [{"field": exc.field, "message": exc.message}])
+        detail = [{"field": exc.field, "message": exc.message}]
+        fields = [{"field": exc.field, "code": "invalid_value", "message": exc.message}]
+        return _error(
+            request, 422, detail, "invalid_assumptions", "DCF assumptions are invalid.", fields
+        )
 
     @app.exception_handler(UnsupportedSectorError)
     async def _sector_error(request: Request, exc: UnsupportedSectorError) -> JSONResponse:
-        return _error(422, [{"field": "ticker", "message": str(exc)}])
+        detail = [{"field": "ticker", "message": str(exc)}]
+        fields = [{"field": "ticker", "code": "unsupported_sector", "message": str(exc)}]
+        return _error(
+            request, 422, detail, "unsupported_sector", "Ticker sector is unsupported.", fields
+        )
 
     @app.exception_handler(TickerNotFoundError)
     async def _not_found(request: Request, exc: TickerNotFoundError) -> JSONResponse:
-        return _error(404, f"ticker not found: {exc.ticker}")
+        detail = f"ticker not found: {exc.ticker}"
+        return _error(request, 404, detail, "ticker_not_found", detail)
 
     @app.exception_handler(TickerNotCoveredError)
     async def _not_covered(request: Request, exc: TickerNotCoveredError) -> JSONResponse:
@@ -125,25 +192,39 @@ def create_app(
         # this ticker. The message explains the cause (may not exist, or may
         # be outside our data coverage) without leaking that it's our upstream
         # subscription — the customer can't act on that.
-        return _error(404, str(exc))
+        return _error(request, 404, str(exc), "ticker_unavailable", str(exc))
 
     @app.exception_handler(NormalizationError)
     async def _normalization_error(request: Request, exc: NormalizationError) -> JSONResponse:
-        return _error(502, f"provider data for {exc.ticker} could not be normalized")
+        detail = f"provider data for {exc.ticker} could not be normalized"
+        return _error(request, 502, detail, "normalization_failed", detail)
 
     @app.exception_handler(ProviderAuthError)
     async def _auth_error(request: Request, exc: ProviderAuthError) -> JSONResponse:
-        return _error(500, "data provider authentication is misconfigured")
+        detail = "data provider authentication is misconfigured"
+        return _error(request, 500, detail, "provider_auth_misconfigured", detail)
 
     @app.exception_handler(ProviderError)
     async def _provider_error(request: Request, exc: ProviderError) -> JSONResponse:
-        return _error(503, "data provider is unavailable, try again shortly")
+        detail = "data provider is unavailable, try again shortly"
+        return _error(request, 503, detail, "provider_unavailable", detail)
 
     # --- routes ---
 
     @app.get(
         "/v1/valuations/{ticker}",
         response_model=ValuationResponse,
+        responses={
+            400: {"model": ErrorResponse, "description": "Malformed request"},
+            401: {"model": ErrorResponse, "description": "Authentication required (reserved)"},
+            403: {"model": ErrorResponse, "description": "Insufficient scope (reserved)"},
+            404: {"model": ErrorResponse, "description": "Ticker unavailable"},
+            422: {"model": ErrorResponse, "description": "Invalid request or assumptions"},
+            429: {"model": ErrorResponse, "description": "Rate limit exceeded (reserved)"},
+            500: {"model": ErrorResponse, "description": "Server configuration error"},
+            502: {"model": ErrorResponse, "description": "Provider data normalization failed"},
+            503: {"model": ErrorResponse, "description": "Provider unavailable"},
+        },
         summary="DCF valuation for one ticker",
     )
     async def get_valuation(
@@ -155,13 +236,13 @@ def create_app(
             description="US stock ticker, e.g. AAPL",
         ),
         wacc: float = Query(
-            description="Discount rate as a decimal, e.g. 0.09 for 9%",
+            description="Discount rate as a decimal; finite and between 0.001 and 0.50",
         ),
         terminal_growth: float = Query(
-            description="Perpetual growth rate; must be below wacc",
+            description="Finite perpetual growth rate from -0.10 to 0.10; must be below wacc",
         ),
         ebit_margin: float = Query(
-            description="Projected EBIT margin applied to every year, e.g. 0.30",
+            description="Finite projected EBIT margin from -1.0 to 1.0",
         ),
         revenue_growth: str = Query(
             description=(
@@ -171,7 +252,7 @@ def create_app(
         ),
         tax_rate: float = Query(
             default=0.21,
-            description="Effective tax rate; defaults to 0.21",
+            description="Finite effective tax rate from 0.0 to 1.0; defaults to 0.21",
         ),
         projection_years: int = Query(
             default=5,
@@ -198,7 +279,13 @@ def create_app(
         base = await request.app.state.fundamentals.get_base_financials(ticker)
         valuation = compute_dcf(base, assumptions)
         grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
-        return build_valuation_response(base, assumptions, valuation, grid)
+        return build_valuation_response(
+            base,
+            assumptions,
+            valuation,
+            grid,
+            request_id=request.state.request_id,
+        )
 
     @app.get("/health", include_in_schema=False)
     async def health() -> dict[str, str]:

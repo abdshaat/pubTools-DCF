@@ -15,7 +15,8 @@ import json
 import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -30,6 +31,7 @@ from ..exceptions import (
 )
 
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/stable"
+STATEMENT_FETCH_LIMIT = 8
 
 # (endpoint path, needs limit param)
 _STATEMENT_ENDPOINTS = [
@@ -45,14 +47,15 @@ RawSink = Callable[[str, str, Any], None]
 
 @dataclass(frozen=True)
 class FMPFundamentals:
-    """One ticker's raw (unnormalized) payloads, most recent period each."""
+    """One ticker's raw payloads; normalization selects a compatible period."""
 
     ticker: str
-    income: dict
-    balance: dict
-    cash_flow: dict
-    profile: dict
-    quote: dict
+    income: tuple[dict[str, Any], ...]
+    balance: tuple[dict[str, Any], ...]
+    cash_flow: tuple[dict[str, Any], ...]
+    profile: dict[str, Any]
+    quote: dict[str, Any]
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
 class FileRawSink:
@@ -154,20 +157,47 @@ class FMPClient:
             f"({endpoint}/{ticker}): {last_error}"
         )
 
-    async def fetch_fundamentals(self, ticker: str) -> FMPFundamentals:
-        """Fetch the five payloads for `ticker`, most recent annual period."""
+    async def fetch_fundamentals(
+        self,
+        ticker: str,
+        *,
+        profile_override: dict[str, Any] | None = None,
+        quote_override: dict[str, Any] | None = None,
+        quote_fetched_at: datetime | None = None,
+    ) -> FMPFundamentals:
+        """Fetch candidate statements plus current profile/quote for `ticker`."""
         ticker = ticker.upper()
-        results: dict[str, dict] = {}
+        results: dict[str, Any] = {}
+        if profile_override is not None:
+            results["profile"] = profile_override
+        if quote_override is not None:
+            results["quote"] = quote_override
 
         for endpoint, needs_limit in _STATEMENT_ENDPOINTS:
-            params = {"limit": 1} if needs_limit else {}
+            if endpoint in results:
+                continue
+            params = {"limit": STATEMENT_FETCH_LIMIT} if needs_limit else {}
             payload = await self._get_json(endpoint, ticker, params)
             # FMP returns a JSON array (often empty for unknown tickers)
             if isinstance(payload, list):
                 if not payload:
                     raise TickerNotFoundError(ticker)
-                payload = payload[0]
-            results[endpoint] = payload
+                if needs_limit:
+                    if not all(isinstance(record, dict) for record in payload):
+                        raise ProviderError(
+                            f"FMP returned malformed {endpoint} records for {ticker}"
+                        )
+                    results[endpoint] = tuple(payload)
+                else:
+                    results[endpoint] = payload[0]
+            elif needs_limit:
+                if not isinstance(payload, dict):
+                    raise ProviderError(f"FMP returned malformed {endpoint} payload for {ticker}")
+                results[endpoint] = (payload,)
+            elif isinstance(payload, dict):
+                results[endpoint] = payload
+            else:
+                raise ProviderError(f"FMP returned malformed {endpoint} payload for {ticker}")
 
         return FMPFundamentals(
             ticker=ticker,
@@ -176,4 +206,29 @@ class FMPClient:
             cash_flow=results["cash-flow-statement"],
             profile=results["profile"],
             quote=results["quote"],
+            fetched_at=quote_fetched_at or datetime.now(UTC),
         )
+
+    async def fetch_profile(self, ticker: str) -> dict[str, Any]:
+        """Fetch company profile independently of statements and quote."""
+        ticker = ticker.upper()
+        payload = await self._get_json("profile", ticker, {})
+        if isinstance(payload, list):
+            if not payload:
+                raise TickerNotFoundError(ticker)
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            raise ProviderError(f"FMP returned malformed profile payload for {ticker}")
+        return payload
+
+    async def fetch_quote(self, ticker: str) -> tuple[dict[str, Any], datetime]:
+        """Fetch one current quote independently of slow-moving statements."""
+        ticker = ticker.upper()
+        payload = await self._get_json("quote", ticker, {})
+        if isinstance(payload, list):
+            if not payload:
+                raise TickerNotFoundError(ticker)
+            payload = payload[0]
+        if not isinstance(payload, dict):
+            raise ProviderError(f"FMP returned malformed quote payload for {ticker}")
+        return payload, datetime.now(UTC)
