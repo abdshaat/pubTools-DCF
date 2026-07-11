@@ -5,7 +5,7 @@ full stack (routing, validation, fetch, normalization, engine, response
 shaping, error mapping) is exercised without network or API key.
 """
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import httpx
@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient
 
 from app import MODEL_VERSION
 from app.api import _default_raw_sink, create_app
+from app.auth import APIKeyAuthenticator
 from app.providers.fmp import FileRawSink, FMPClient
 from tests.test_data_layer import fixture_transport, load_fixture
 
@@ -387,6 +388,126 @@ def test_sensitivity_grid_can_be_disabled(client: TestClient):
     response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}&sensitivity=false")
     assert response.status_code == 200
     assert response.json()["sensitivity"] is None
+
+
+def test_auth_is_not_required_until_configured():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+    assert response.status_code == 200
+
+
+def test_authenticated_valuation_request_succeeds():
+    key = "dcf_live_testsecret"
+    auth = APIKeyAuthenticator(
+        [APIKeyAuthenticator.record_from_secret(key_id="customer-1", prefix="live", secret=key)],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, authenticator=auth)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 200
+    assert response.json()["ticker"] == "AAPL"
+
+
+@pytest.mark.parametrize("header_value", [None, "", "not-a-key", "dcf_unknown_secret"])
+def test_missing_malformed_or_unknown_api_key_returns_401(header_value: str | None):
+    key = "dcf_live_testsecret"
+    auth = APIKeyAuthenticator(
+        [APIKeyAuthenticator.record_from_secret(key_id="customer-1", prefix="live", secret=key)],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    headers = {"X-API-Key": header_value} if header_value is not None else {}
+    with TestClient(
+        create_app(fmp_client=fmp, authenticator=auth, daily_rate_limit=1)
+    ) as test_client:
+        unauthorized = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers=headers,
+        )
+        authorized = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key},
+        )
+
+    assert unauthorized.status_code == 401
+    assert unauthorized.headers["WWW-Authenticate"] == "ApiKey"
+    assert unauthorized.json()["error"]["code"] == "invalid_api_key"
+    assert key not in unauthorized.text
+    assert authorized.status_code == 200
+    assert authorized.headers["X-RateLimit-Remaining"] == "0"
+
+
+@pytest.mark.parametrize(
+    "record_kwargs",
+    [
+        {"revoked": True},
+        {"expires_at": datetime.now(UTC) - timedelta(seconds=1)},
+    ],
+)
+def test_revoked_or_expired_api_key_returns_401(record_kwargs: dict):
+    key = "dcf_live_testsecret"
+    auth = APIKeyAuthenticator(
+        [
+            APIKeyAuthenticator.record_from_secret(
+                key_id="customer-1",
+                prefix="live",
+                secret=key,
+                **record_kwargs,
+            )
+        ],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, authenticator=auth)) as test_client:
+        response = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key},
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_api_key"
+    assert key not in response.text
+
+
+def test_insufficient_scope_returns_403():
+    key = "dcf_live_testsecret"
+    auth = APIKeyAuthenticator(
+        [
+            APIKeyAuthenticator.record_from_secret(
+                key_id="customer-1",
+                prefix="live",
+                secret=key,
+                scopes={"usage:read"},
+            )
+        ],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, authenticator=auth)) as test_client:
+        response = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key},
+        )
+
+    assert response.status_code == 403
+    assert response.json()["error"]["code"] == "insufficient_scope"
+    assert key not in response.text
+
+
+def test_public_endpoints_do_not_require_api_key_when_auth_is_enabled():
+    key = "dcf_live_testsecret"
+    auth = APIKeyAuthenticator(
+        [APIKeyAuthenticator.record_from_secret(key_id="customer-1", prefix="live", secret=key)],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, authenticator=auth)) as test_client:
+        assert test_client.get("/").status_code == 200
+        assert test_client.get("/health").status_code == 200
+        assert test_client.get("/openapi.json").status_code == 200
 
 
 def test_valuation_requests_are_limited_per_day():

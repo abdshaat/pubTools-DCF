@@ -29,6 +29,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 
 from . import MODEL_VERSION
+from .auth import VALUATION_SCOPE, APIKeyAuthenticator, AuthFailure, AuthFailureReason
 from .dcf_engine import DCFValidationError, compute_dcf, compute_sensitivity_grid
 from .exceptions import (
     NormalizationError,
@@ -114,6 +115,33 @@ def _rate_limit_headers(result: RateLimitResult) -> dict[str, str]:
     return headers
 
 
+def _auth_error_response(
+    request: Request,
+    *,
+    status_code: int,
+    code: str,
+    message: str,
+) -> JSONResponse:
+    headers = {"WWW-Authenticate": "ApiKey"} if status_code == 401 else None
+    response = JSONResponse(
+        status_code=status_code,
+        content={
+            "detail": message,
+            "error": {
+                "version": "1",
+                "code": code,
+                "message": message,
+                "request_id": request.state.request_id,
+                "fields": [],
+            },
+        },
+        headers=headers,
+    )
+    response.headers["X-Request-ID"] = request.state.request_id
+    response.headers.update(_SECURITY_HEADERS)
+    return response
+
+
 def create_app(
     fmp_client: FMPClient | None = None,
     ttl_seconds: float = 4 * 3600,
@@ -121,6 +149,7 @@ def create_app(
     quote_ttl_seconds: float = 60,
     daily_rate_limit: int = 100,
     rate_limiter: DailyRequestLimiter | None = None,
+    authenticator: APIKeyAuthenticator | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -148,12 +177,34 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.rate_limiter = rate_limiter or DailyRequestLimiter(daily_rate_limit)
+    app.state.authenticator = authenticator or APIKeyAuthenticator(required=False)
 
     @app.middleware("http")
     async def _request_id(request: Request, call_next: Any) -> JSONResponse:
         request.state.request_id = str(uuid4())
         rate_limit: RateLimitResult | None = None
         if request.method == "GET" and request.url.path.startswith("/v1/valuations/"):
+            try:
+                principal = request.app.state.authenticator.authenticate(
+                    request.headers.get("X-API-Key"),
+                    required_scope=VALUATION_SCOPE,
+                )
+            except AuthFailure as exc:
+                if exc.reason is AuthFailureReason.INSUFFICIENT_SCOPE:
+                    return _auth_error_response(
+                        request,
+                        status_code=403,
+                        code="insufficient_scope",
+                        message="API key does not have permission to access valuations.",
+                    )
+                return _auth_error_response(
+                    request,
+                    status_code=401,
+                    code="invalid_api_key",
+                    message="A valid API key is required to access valuations.",
+                )
+            request.state.auth = principal
+
             rate_limit = request.app.state.rate_limiter.check_and_increment()
             if not rate_limit.allowed:
                 response = JSONResponse(
