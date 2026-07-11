@@ -24,6 +24,7 @@ dev = [
 # refuses to build ("Multiple top-level packages discovered").
 [tool.setuptools.packages.find]
 include = ["app*"]
-entrypoint = "app.api:app"
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+[tool.vercel]
+entrypoint = "app.api:app"
