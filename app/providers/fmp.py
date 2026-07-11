@@ -13,6 +13,7 @@ app.normalization. It only moves bytes and classifies transport errors.
 import asyncio
 import json
 import os
+import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
@@ -84,7 +85,14 @@ class FMPClient:
         timeout: float = 10.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         raw_sink: RawSink | None = None,
+        provider_concurrency: int = 3,
+        max_retry_after_seconds: float = 5.0,
+        jitter: Callable[[], float] = random.random,
     ):
+        if provider_concurrency < 1:
+            raise ValueError("provider_concurrency must be at least 1")
+        if max_retry_after_seconds < 0:
+            raise ValueError("max_retry_after_seconds must be non-negative")
         self._api_key = api_key or os.environ.get("FMP_API_KEY")
         if not self._api_key:
             raise ProviderAuthError(
@@ -94,7 +102,20 @@ class FMPClient:
         self._max_retries = max_retries
         self._sleep = sleep
         self._raw_sink = raw_sink
+        self._semaphore = asyncio.Semaphore(provider_concurrency)
+        self._max_retry_after = max_retry_after_seconds
+        self._jitter = jitter
         self._client = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=timeout)
+
+    def _retry_delay(self, response: httpx.Response | None, attempt: int) -> float:
+        retry_after = response.headers.get("Retry-After") if response is not None else None
+        if retry_after is not None:
+            try:
+                return min(max(float(retry_after), 0.0), self._max_retry_after)
+            except ValueError:
+                pass
+        base = min(0.5 * (2**attempt), self._max_retry_after)
+        return min(base + self._jitter() * 0.1, self._max_retry_after)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -122,7 +143,8 @@ class FMPClient:
         for attempt in range(self._max_retries + 1):
             response: httpx.Response | None = None
             try:
-                response = await self._client.get(f"/{endpoint}", params=query)
+                async with self._semaphore:
+                    response = await self._client.get(f"/{endpoint}", params=query)
             except httpx.TransportError as exc:
                 last_error = f"transport error: {exc}"
             else:
@@ -143,17 +165,30 @@ class FMPClient:
                     raise TickerNotFoundError(ticker)
                 if response.status_code == 429 or response.status_code >= 500:
                     last_error = f"HTTP {response.status_code}"
+                elif response.status_code >= 400:
+                    raise ProviderError(
+                        f"FMP returned unsupported HTTP {response.status_code} "
+                        f"for {endpoint}/{ticker}"
+                    )
                 else:
                     response.raise_for_status()
-                    payload = response.json()
+                    try:
+                        payload = response.json()
+                    except json.JSONDecodeError as exc:
+                        raise ProviderError(
+                            f"FMP returned malformed JSON for {endpoint}/{ticker}"
+                        ) from exc
                     if self._raw_sink is not None:
-                        self._raw_sink(ticker, endpoint, payload)
+                        try:
+                            self._raw_sink(ticker, endpoint, payload)
+                        except OSError as exc:
+                            raise ProviderError(
+                                f"raw provider payload sink failed for {endpoint}/{ticker}"
+                            ) from exc
                     return payload
 
             if attempt < self._max_retries:
-                retry_after = response.headers.get("Retry-After") if response is not None else None
-                delay = float(retry_after) if retry_after else 0.5 * (2**attempt)
-                await self._sleep(delay)
+                await self._sleep(self._retry_delay(response, attempt))
 
         raise ProviderError(
             f"FMP request failed after {self._max_retries + 1} attempts "
@@ -176,11 +211,17 @@ class FMPClient:
         if quote_override is not None:
             results["quote"] = quote_override
 
-        for endpoint, needs_limit in _STATEMENT_ENDPOINTS:
-            if endpoint in results:
-                continue
+        async def fetch_endpoint(endpoint: str, needs_limit: bool) -> tuple[str, bool, Any]:
             params = {"limit": STATEMENT_FETCH_LIMIT} if needs_limit else {}
             payload = await self._get_json(endpoint, ticker, params)
+            return endpoint, needs_limit, payload
+
+        tasks = [
+            fetch_endpoint(endpoint, needs_limit)
+            for endpoint, needs_limit in _STATEMENT_ENDPOINTS
+            if endpoint not in results
+        ]
+        for endpoint, needs_limit, payload in await asyncio.gather(*tasks):
             # FMP returns a JSON array (often empty for unknown tickers)
             if isinstance(payload, list):
                 if not payload:

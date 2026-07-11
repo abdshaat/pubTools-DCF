@@ -17,6 +17,7 @@ free tier). Transient failures (network, 5xx, provider unavailable) are NOT
 cached, so they remain retryable.
 """
 
+import asyncio
 import time
 from collections.abc import Callable
 from dataclasses import replace
@@ -50,6 +51,7 @@ class FundamentalsService:
         profile_ttl_seconds: float = 24 * 3600,
         quote_ttl_seconds: float = 60,
         negative_ttl_seconds: float | None = None,
+        max_statement_staleness_seconds: float = 24 * 3600,
         max_quote_staleness_seconds: float = 15 * 60,
         now: Callable[[], float] = time.monotonic,
     ):
@@ -58,6 +60,7 @@ class FundamentalsService:
         self._profile_ttl = profile_ttl_seconds
         self._quote_ttl = quote_ttl_seconds
         self._negative_ttl = negative_ttl_seconds or ttl_seconds
+        self._max_statement_staleness = max_statement_staleness_seconds
         self._max_quote_staleness = max_quote_staleness_seconds
         self._now = now
         self._cache: dict[str, tuple[float, BaseFinancials]] = {}
@@ -65,6 +68,7 @@ class FundamentalsService:
         self._profile_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._quote_cache: dict[str, tuple[float, NormalizedQuote]] = {}
         self._negative: dict[str, tuple[float, Exception]] = {}
+        self._inflight: dict[str, asyncio.Task[BaseFinancials]] = {}
 
     @staticmethod
     def _apply_quote(
@@ -102,13 +106,24 @@ class FundamentalsService:
         self._quote_cache[ticker] = (self._now(), quote)
         return self._apply_quote(base, quote)
 
-    async def get_base_financials(self, ticker: str) -> BaseFinancials:
-        ticker = ticker.upper()
+    def _track_inflight(self, ticker: str, task: asyncio.Task[BaseFinancials]) -> None:
+        self._inflight[ticker] = task
 
+        def cleanup(done: asyncio.Task[BaseFinancials]) -> None:
+            if self._inflight.get(ticker) is done:
+                self._inflight.pop(ticker, None)
+
+        task.add_done_callback(cleanup)
+
+    async def _load_base_financials(self, ticker: str) -> BaseFinancials:
+        stale_base: BaseFinancials | None = None
+        stale_age: float | None = None
         cached = self._cache.get(ticker)
         if cached is not None:
             fetched_at, value = cached
-            if self._now() - fetched_at < self._statement_ttl:
+            stale_base = value
+            stale_age = self._now() - fetched_at
+            if stale_age < self._statement_ttl:
                 profile = self._profile_cache.get(ticker)
                 raw_cached = self._raw_cache.get(ticker)
                 if (
@@ -157,6 +172,21 @@ class FundamentalsService:
         except _CACHEABLE_REJECTIONS as exc:
             self._negative[ticker] = (self._now(), exc)
             raise
+        except (ProviderError, NormalizationError):
+            if (
+                stale_base is not None
+                and stale_age is not None
+                and stale_age <= self._max_statement_staleness
+            ):
+                stale_with_warning = replace(
+                    stale_base,
+                    data_quality_warnings=(
+                        *stale_base.data_quality_warnings,
+                        "Fundamentals refresh failed; a bounded stale statement snapshot was used.",
+                    ),
+                )
+                return await self._get_quote(ticker, stale_with_warning)
+            raise
 
         self._cache[ticker] = (self._now(), normalized)
         self._raw_cache[ticker] = (self._now(), raw)
@@ -172,6 +202,15 @@ class FundamentalsService:
             )
         return await self._get_quote(ticker, normalized)
 
+    async def get_base_financials(self, ticker: str) -> BaseFinancials:
+        ticker = ticker.upper()
+
+        task = self._inflight.get(ticker)
+        if task is None:
+            task = asyncio.create_task(self._load_base_financials(ticker))
+            self._track_inflight(ticker, task)
+        return await asyncio.shield(task)
+
     def invalidate(self, ticker: str | None = None) -> None:
         if ticker is None:
             self._cache.clear()
@@ -179,6 +218,7 @@ class FundamentalsService:
             self._profile_cache.clear()
             self._quote_cache.clear()
             self._negative.clear()
+            self._inflight.clear()
         else:
             key = ticker.upper()
             self._cache.pop(key, None)
@@ -186,3 +226,4 @@ class FundamentalsService:
             self._profile_cache.pop(key, None)
             self._quote_cache.pop(key, None)
             self._negative.pop(key, None)
+            self._inflight.pop(key, None)

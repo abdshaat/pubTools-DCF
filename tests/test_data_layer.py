@@ -419,7 +419,7 @@ def test_provider_402_is_not_retried():
 
     with pytest.raises(TickerNotCoveredError):
         asyncio.run(scenario())
-    assert len(attempts) == 1
+    assert len(attempts) == 5
 
 
 def test_missing_api_key_fails_fast(monkeypatch):
@@ -441,7 +441,7 @@ def test_rejected_api_key_raises_auth_error_without_retry():
 
     with pytest.raises(ProviderAuthError):
         asyncio.run(scenario())
-    assert len(attempts) == 1  # auth errors must not be retried
+    assert len(attempts) == 5  # concurrent endpoints fail once each, without retry
 
 
 def test_retries_on_429_with_backoff_then_succeeds():
@@ -465,7 +465,90 @@ def test_retries_on_429_with_backoff_then_succeeds():
 
     result = asyncio.run(scenario())
     assert result.income[0]["revenue"] == 391_035_000_000
-    assert sleeps == [7.0, 7.0]  # honored Retry-After on both 429s
+    assert sleeps == [5.0, 5.0]  # capped Retry-After on both 429s
+
+
+def test_invalid_retry_after_uses_bounded_jittered_backoff():
+    sleeps = []
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.path)
+        if len(attempts) == 1:
+            return httpx.Response(429, headers={"Retry-After": "eventually"})
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            jitter=lambda: 0.5,
+        ) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    asyncio.run(scenario())
+    assert sleeps == [0.55]
+
+
+def test_provider_classifies_malformed_json():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"{not-json")
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    with pytest.raises(ProviderError, match="malformed JSON"):
+        asyncio.run(scenario())
+
+
+def test_raw_sink_failure_is_classified_as_provider_error():
+    def sink(ticker: str, endpoint: str, payload: object) -> None:
+        raise OSError("disk is full")
+
+    async def scenario():
+        async with make_client(raw_sink=sink) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    with pytest.raises(ProviderError, match="raw provider payload sink failed"):
+        asyncio.run(scenario())
+
+
+def test_fetch_fundamentals_runs_endpoint_calls_concurrently_with_limit():
+    active = 0
+    max_active = 0
+    call_log = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal active, max_active
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        call_log.append(endpoint)
+        active += 1
+        max_active = max(max_active, active)
+        await asyncio.sleep(0.01)
+        active -= 1
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler),
+            provider_concurrency=2,
+        ) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    asyncio.run(scenario())
+    assert set(call_log) == {
+        "income-statement",
+        "balance-sheet-statement",
+        "cash-flow-statement",
+        "profile",
+        "quote",
+    }
+    assert max_active == 2
 
 
 def test_exhausted_retries_raise_provider_error():
@@ -483,6 +566,45 @@ def test_exhausted_retries_raise_provider_error():
 
     with pytest.raises(ProviderError, match="HTTP 503"):
         asyncio.run(scenario())
+
+
+def test_transport_timeout_is_retried_then_classified():
+    sleeps = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow provider", request=request)
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler),
+            sleep=fake_sleep,
+            max_retries=1,
+            jitter=lambda: 0,
+        ) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    with pytest.raises(ProviderError, match="transport error"):
+        asyncio.run(scenario())
+    assert sleeps == [0.5] * 5
+
+
+def test_unsupported_http_status_is_classified_without_retry():
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(1)
+        return httpx.Response(418)
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler), max_retries=3) as client:
+            await client.fetch_fundamentals("AAPL")
+
+    with pytest.raises(ProviderError, match="unsupported HTTP 418"):
+        asyncio.run(scenario())
+    assert len(attempts) == 5
 
 
 def test_raw_sink_receives_every_payload():
@@ -521,6 +643,55 @@ def test_cache_serves_second_request_without_provider_call():
     assert first == second
     assert calls_after_first == 5
     assert len(call_log) == 5  # no additional provider traffic
+
+
+def test_same_ticker_cold_burst_uses_one_provider_load():
+    call_log = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        call_log.append(endpoint)
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            service = FundamentalsService(client)
+            return await asyncio.gather(
+                *(service.get_base_financials("AAPL") for _ in range(10))
+            )
+
+    results = asyncio.run(scenario())
+    assert {result.ticker for result in results} == {"AAPL"}
+    assert len(call_log) == 5
+
+
+def test_waiter_cancellation_does_not_cancel_shared_provider_load():
+    call_log = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        call_log.append(endpoint)
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            service = FundamentalsService(client)
+            first = asyncio.create_task(service.get_base_financials("AAPL"))
+            await asyncio.sleep(0)
+            second = asyncio.create_task(service.get_base_financials("AAPL"))
+            first.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await first
+            result = await second
+            await asyncio.sleep(0)
+            return result, service
+
+    result, service = asyncio.run(scenario())
+    assert result.ticker == "AAPL"
+    assert len(call_log) == 5
+    assert service._inflight == {}
 
 
 def test_cache_expires_after_ttl():
@@ -665,6 +836,72 @@ def test_quote_refresh_failure_beyond_staleness_limit_raises():
         asyncio.run(scenario())
 
 
+def test_statement_refresh_failure_uses_bounded_stale_fundamentals_with_warning():
+    clock = {"t": 0.0}
+    fail_statements = {"value": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "income-statement" and fail_statements["value"]:
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
+        ) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=60,
+                quote_ttl_seconds=3600,
+                max_statement_staleness_seconds=3600,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 61.0
+            fail_statements["value"] = True
+            return await service.get_base_financials("AAPL")
+
+    stale = asyncio.run(scenario())
+    assert stale.ticker == "AAPL"
+    assert any("stale statement snapshot" in warning for warning in stale.data_quality_warnings)
+
+
+def test_statement_refresh_failure_beyond_staleness_limit_raises():
+    clock = {"t": 0.0}
+    fail_statements = {"value": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "income-statement" and fail_statements["value"]:
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        async with make_client(
+            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
+        ) as client:
+            service = FundamentalsService(
+                client,
+                ttl_seconds=60,
+                max_statement_staleness_seconds=3600,
+                now=lambda: clock["t"],
+            )
+            await service.get_base_financials("AAPL")
+            clock["t"] = 3601.0
+            fail_statements["value"] = True
+            await service.get_base_financials("AAPL")
+
+    with pytest.raises(ProviderError):
+        asyncio.run(scenario())
+
+
 def test_invalidate_clears_statement_quote_and_negative_caches():
     service = FundamentalsService(make_client())
     service._cache["AAPL"] = (0.0, normalize_fmp_fundamentals(make_fundamentals()))
@@ -717,8 +954,8 @@ def test_not_covered_ticker_is_negative_cached():
 
     asyncio.run(scenario())
     # Three requests, but only the first reached the provider (one endpoint,
-    # which 402s immediately); the rest are served from the negative cache.
-    assert len(call_log) == 1
+    # one logical load); the rest are served from the negative cache.
+    assert len(call_log) == 5
 
 
 def test_unsupported_sector_is_negative_cached():
@@ -762,9 +999,9 @@ def test_transient_error_is_not_negative_cached():
                 await service.get_base_financials("AAPL")
 
     asyncio.run(scenario())
-    # Both requests hit the provider — a 503 might clear up, so it must stay
+    # Both logical loads hit the provider — a 503 might clear up, so it must stay
     # retryable and must not be cached.
-    assert len(call_log) == 2
+    assert len(call_log) == 10
 
 
 def test_negative_cache_expires_after_ttl():
@@ -786,8 +1023,8 @@ def test_negative_cache_expires_after_ttl():
             return calls_before_expiry
 
     calls_before_expiry = asyncio.run(scenario())
-    assert calls_before_expiry == 1
-    assert len(call_log) == 2
+    assert calls_before_expiry == 5
+    assert len(call_log) == 10
 
 
 def test_negative_cache_has_independent_ttl():
@@ -809,4 +1046,4 @@ def test_negative_cache_has_independent_ttl():
                 await service.get_base_financials("ZZZQQQ")
 
     asyncio.run(scenario())
-    assert len(call_log) == 2
+    assert len(call_log) == 10
