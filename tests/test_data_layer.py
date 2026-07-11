@@ -657,9 +657,7 @@ def test_same_ticker_cold_burst_uses_one_provider_load():
     async def scenario():
         async with make_client(transport=httpx.MockTransport(handler)) as client:
             service = FundamentalsService(client)
-            return await asyncio.gather(
-                *(service.get_base_financials("AAPL") for _ in range(10))
-            )
+            return await asyncio.gather(*(service.get_base_financials("AAPL") for _ in range(10)))
 
     results = asyncio.run(scenario())
     assert {result.ticker for result in results} == {"AAPL"}
