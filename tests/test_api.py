@@ -389,6 +389,50 @@ def test_sensitivity_grid_can_be_disabled(client: TestClient):
     assert response.json()["sensitivity"] is None
 
 
+def test_valuation_requests_are_limited_per_day():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, daily_rate_limit=2)) as test_client:
+        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        second = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert first.status_code == 200
+    assert first.headers["X-RateLimit-Limit"] == "2"
+    assert first.headers["X-RateLimit-Remaining"] == "1"
+    assert second.status_code == 200
+    assert second.headers["X-RateLimit-Remaining"] == "0"
+    assert blocked.status_code == 429
+    assert blocked.headers["X-RateLimit-Limit"] == "2"
+    assert blocked.headers["X-RateLimit-Remaining"] == "0"
+    assert int(blocked.headers["Retry-After"]) > 0
+    assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
+    assert blocked.json()["error"]["request_id"] == blocked.headers["X-Request-ID"]
+
+
+def test_website_and_health_do_not_consume_valuation_limit():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, daily_rate_limit=1)) as test_client:
+        assert test_client.get("/").status_code == 200
+        assert test_client.get("/health").status_code == 200
+        allowed = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert allowed.status_code == 200
+    assert allowed.headers["X-RateLimit-Remaining"] == "0"
+    assert blocked.status_code == 429
+
+
+def test_invalid_valuation_requests_count_against_daily_limit():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, daily_rate_limit=1)) as test_client:
+        invalid = test_client.get("/v1/valuations/AAPL?wacc=0.09")
+        blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert invalid.status_code == 422
+    assert invalid.headers["X-RateLimit-Remaining"] == "0"
+    assert blocked.status_code == 429
+
+
 def test_health_endpoint():
     fmp = FMPClient(api_key="test-key", transport=fixture_transport())
     with TestClient(create_app(fmp_client=fmp)) as test_client:

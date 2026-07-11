@@ -41,6 +41,7 @@ from .exceptions import (
 from .fundamentals import FundamentalsService
 from .models import Assumptions
 from .providers.fmp import FileRawSink, FMPClient
+from .rate_limit import DailyRequestLimiter, RateLimitResult
 from .schemas import ErrorResponse, ValuationResponse, build_valuation_response
 
 # Load a local .env (gitignored) so `uvicorn app.api:app` picks up FMP_API_KEY
@@ -102,11 +103,24 @@ _LANDING_PAGE_CSP = "; ".join(
 )
 
 
+def _rate_limit_headers(result: RateLimitResult) -> dict[str, str]:
+    headers = {
+        "X-RateLimit-Limit": str(result.limit),
+        "X-RateLimit-Remaining": str(result.remaining),
+        "X-RateLimit-Reset": str(result.reset_epoch),
+    }
+    if not result.allowed:
+        headers["Retry-After"] = str(result.retry_after)
+    return headers
+
+
 def create_app(
     fmp_client: FMPClient | None = None,
     ttl_seconds: float = 4 * 3600,
     profile_ttl_seconds: float = 24 * 3600,
     quote_ttl_seconds: float = 60,
+    daily_rate_limit: int = 100,
+    rate_limiter: DailyRequestLimiter | None = None,
 ) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -133,13 +147,38 @@ def create_app(
         ),
         lifespan=lifespan,
     )
+    app.state.rate_limiter = rate_limiter or DailyRequestLimiter(daily_rate_limit)
 
     @app.middleware("http")
     async def _request_id(request: Request, call_next: Any) -> JSONResponse:
         request.state.request_id = str(uuid4())
+        rate_limit: RateLimitResult | None = None
+        if request.method == "GET" and request.url.path.startswith("/v1/valuations/"):
+            rate_limit = request.app.state.rate_limiter.check_and_increment()
+            if not rate_limit.allowed:
+                response = JSONResponse(
+                    status_code=429,
+                    content={
+                        "detail": "daily valuation request limit exceeded",
+                        "error": {
+                            "version": "1",
+                            "code": "rate_limit_exceeded",
+                            "message": "Daily valuation request limit exceeded.",
+                            "request_id": request.state.request_id,
+                            "fields": [],
+                        },
+                    },
+                    headers=_rate_limit_headers(rate_limit),
+                )
+                response.headers["X-Request-ID"] = request.state.request_id
+                response.headers.update(_SECURITY_HEADERS)
+                return response
+
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers.update(_SECURITY_HEADERS)
+        if rate_limit is not None:
+            response.headers.update(_rate_limit_headers(rate_limit))
         return response
 
     # --- error mapping (see app/exceptions.py for the rationale) ---
@@ -250,7 +289,7 @@ def create_app(
             403: {"model": ErrorResponse, "description": "Insufficient scope (reserved)"},
             404: {"model": ErrorResponse, "description": "Ticker unavailable"},
             422: {"model": ErrorResponse, "description": "Invalid request or assumptions"},
-            429: {"model": ErrorResponse, "description": "Rate limit exceeded (reserved)"},
+            429: {"model": ErrorResponse, "description": "Daily rate limit exceeded"},
             500: {"model": ErrorResponse, "description": "Server configuration error"},
             502: {"model": ErrorResponse, "description": "Provider data normalization failed"},
             503: {"model": ErrorResponse, "description": "Provider unavailable"},

@@ -739,6 +739,10 @@ FMP_API_KEY=your-key-here</code></pre>
   <div class="note"><strong>Preview:</strong> per-customer API keys and usage metering are not yet
   enforced in the current release. The header is accepted and will become mandatory before
   general availability — include it now so your integration doesn't break later.</div>
+  <div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per UTC
+  day. Calls made from this website use the same API endpoint and count toward the same limit.
+  Responses include <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
+  <code>X-RateLimit-Reset</code>, and, after exhaustion, <code>Retry-After</code>.</div>
 </section>
 
 <section id="builder">
@@ -1022,6 +1026,8 @@ FMP_API_KEY=your-key-here</code></pre>
         growth beyond ±50%,
         malformed or wrong-length <code>revenue_growth</code>) — or a financial-sector ticker,
         which this model doesn't support.</td></tr>
+      <tr><td class="status err">429</td><td>Daily valuation request limit exceeded. Wait until
+        the reset time from <code>X-RateLimit-Reset</code> or follow <code>Retry-After</code>.</td></tr>
       <tr><td class="status err">502</td><td>Provider data for this ticker couldn't be normalized.
         Not retryable; contact support.</td></tr>
       <tr><td class="status err">503</td><td>Upstream data provider unavailable. Retry with

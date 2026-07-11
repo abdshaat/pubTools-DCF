@@ -45,6 +45,18 @@ with a 422 (standard FCF DCF doesn't apply). Tickers that don't exist or fall
 outside the data provider's coverage return 404. Assumptions that break the
 math (e.g. `terminal_growth >= wacc`) return 422 with per-field messages.
 
+### Rate limit
+
+Valuation requests are capped at **100 per UTC day**. Calls made through the
+website use the same `/v1/valuations/{ticker}` endpoint and count toward the
+same limit. Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
+`X-RateLimit-Reset`; exhausted callers receive `429` with `Retry-After`.
+
+This first guard is intentionally in-process for the current Vercel deployment,
+so it is reliable per warm function instance. A strict global customer quota
+will move to Redis/Postgres with API keys and metering in the planned storage
+phase.
+
 The fundamentals service also **negative-caches** these definitive rejections,
 so a client repeatedly requesting a bad or uncovered ticker doesn't spend an
 upstream provider call each time — the FMP free tier allows only ~250/day.
