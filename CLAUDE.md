@@ -1,5 +1,12 @@
 # DCF Valuation API — Project Context
 
+## Session workflow (required)
+- **At the start of a session:** read `PROGRESS.md` for the current state of
+  the build — what exists, what's next, and decisions made in past sessions.
+- **At the end of any session that changes the project:** add a dated entry to
+  the top of `PROGRESS.md`'s log (what changed, decisions made, known issues,
+  next step) and refresh its "Current state (TL;DR)" section.
+
 ## What this project is
 An API that computes a discounted cash flow (DCF) valuation for a single stock ticker
 using customer-supplied assumptions. The customer sends a ticker plus assumptions in
