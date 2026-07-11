@@ -14,9 +14,11 @@ import asyncio
 import json
 import os
 import time
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Optional
+from types import TracebackType
+from typing import Any
 
 import httpx
 
@@ -69,13 +71,13 @@ class FileRawSink:
 class FMPClient:
     def __init__(
         self,
-        api_key: Optional[str] = None,
+        api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
-        transport: Optional[httpx.AsyncBaseTransport] = None,
+        transport: httpx.AsyncBaseTransport | None = None,
         max_retries: int = 3,
         timeout: float = 10.0,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-        raw_sink: Optional[RawSink] = None,
+        raw_sink: RawSink | None = None,
     ):
         self._api_key = api_key or os.environ.get("FMP_API_KEY")
         if not self._api_key:
@@ -86,9 +88,7 @@ class FMPClient:
         self._max_retries = max_retries
         self._sleep = sleep
         self._raw_sink = raw_sink
-        self._client = httpx.AsyncClient(
-            base_url=base_url, transport=transport, timeout=timeout
-        )
+        self._client = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=timeout)
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -96,15 +96,25 @@ class FMPClient:
     async def __aenter__(self) -> "FMPClient":
         return self
 
-    async def __aexit__(self, *exc) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         await self.aclose()
 
-    async def _get_json(self, endpoint: str, ticker: str, params: dict) -> Any:
+    async def _get_json(
+        self,
+        endpoint: str,
+        ticker: str,
+        params: Mapping[str, str | int | float | bool | None],
+    ) -> Any:
         query = {"symbol": ticker, "apikey": self._api_key, **params}
-        last_error: Optional[str] = None
+        last_error: str | None = None
 
         for attempt in range(self._max_retries + 1):
-            response: Optional[httpx.Response] = None
+            response: httpx.Response | None = None
             try:
                 response = await self._client.get(f"/{endpoint}", params=query)
             except httpx.TransportError as exc:
@@ -135,10 +145,8 @@ class FMPClient:
                     return payload
 
             if attempt < self._max_retries:
-                retry_after = (
-                    response.headers.get("Retry-After") if response is not None else None
-                )
-                delay = float(retry_after) if retry_after else 0.5 * (2 ** attempt)
+                retry_after = response.headers.get("Retry-After") if response is not None else None
+                delay = float(retry_after) if retry_after else 0.5 * (2**attempt)
                 await self._sleep(delay)
 
         raise ProviderError(

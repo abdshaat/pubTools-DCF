@@ -27,14 +27,25 @@ async def main(ticker: str) -> None:
         base = await service.get_base_financials(ticker)
 
     print(f"--- {base.ticker} base financials ({base.source_period}) ---")
-    for field in ("revenue", "ebit", "da", "capex", "delta_nwc",
-                  "net_debt", "diluted_shares", "current_price"):
+    for field in (
+        "revenue",
+        "ebit",
+        "da",
+        "capex",
+        "delta_nwc",
+        "net_debt",
+        "diluted_shares",
+        "current_price",
+    ):
         print(f"  {field:>16}: {getattr(base, field):,.0f}")
 
     assumptions = Assumptions(
-        wacc=0.09, terminal_growth=0.025, tax_rate=0.21,
+        wacc=0.09,
+        terminal_growth=0.025,
+        tax_rate=0.21,
         ebit_margin=base.ebit / base.revenue,  # hold base-year margin
-        projection_years=5, revenue_growth=0.05,
+        projection_years=5,
+        revenue_growth=0.05,
     )
     valuation = compute_dcf(base, assumptions)
 

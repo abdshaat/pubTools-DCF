@@ -68,13 +68,27 @@ python -m venv .venv
 .venv/bin/python -m pip install -e ".[dev]"
 ```
 
+If a Windows Store-created `.venv` becomes locked or its base interpreter is
+removed, install the standard python.org distribution and create a replacement
+under a new name without deleting the locked directory:
+
+```powershell
+$python = "$env:LOCALAPPDATA\Programs\Python\Python313\python.exe"
+& $python -m venv .venv313
+.\.venv313\Scripts\python.exe -m pip install -e ".[dev]"
+```
+
+Use `.venv313` in place of `.venv` in the commands below. Vercel currently
+supports Python 3.13, and the project declares its supported range in
+`pyproject.toml`.
+
 ### Run the tests (no API key needed)
 
 ```bash
 python -m pytest -q
 ```
 
-All 54 tests — engine, data layer, and API — run against recorded fixture
+All 63 tests — engine, data layer, and API — run against recorded fixture
 payloads (`tests/fixtures/fmp/`) via a mock transport. No network required.
 
 ### Run the API server

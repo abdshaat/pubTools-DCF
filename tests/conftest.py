@@ -17,8 +17,8 @@ def make_base_financials() -> BaseFinancials:
         source_period="FY2025",
         revenue=1_000_000.0,
         ebit=250_000.0,
-        da=50_000.0,       # 5% of revenue
-        capex=60_000.0,    # 6% of revenue
+        da=50_000.0,  # 5% of revenue
+        capex=60_000.0,  # 6% of revenue
         delta_nwc=10_000.0,  # 1% of revenue
         net_debt=200_000.0,
         diluted_shares=100_000.0,

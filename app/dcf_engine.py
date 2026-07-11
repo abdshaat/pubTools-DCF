@@ -15,7 +15,6 @@ discussion, per CLAUDE.md):
 """
 
 from dataclasses import replace
-from typing import Optional
 
 from .models import (
     Assumptions,
@@ -42,7 +41,7 @@ def _validate(base: BaseFinancials, assumptions: Assumptions) -> None:
     if not (3 <= assumptions.projection_years <= 15):
         raise DCFValidationError("projection_years", "must be between 3 and 15")
 
-    if len(assumptions.revenue_growth) != assumptions.projection_years:
+    if len(assumptions.resolved_revenue_growth) != assumptions.projection_years:
         raise DCFValidationError(
             "revenue_growth",
             "must be a single value or one value per projection year",
@@ -59,7 +58,7 @@ def _validate(base: BaseFinancials, assumptions: Assumptions) -> None:
     if assumptions.tax_rate < 0:
         raise DCFValidationError("tax_rate", "must not be negative")
 
-    for g in assumptions.revenue_growth:
+    for g in assumptions.resolved_revenue_growth:
         if abs(g) > 0.5:
             raise DCFValidationError("revenue_growth", "each value must be within +/-50%")
 
@@ -83,7 +82,7 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
     last_fcf = 0.0
     last_discount_factor = 1.0
 
-    for year, growth in enumerate(assumptions.revenue_growth, start=1):
+    for year, growth in enumerate(assumptions.resolved_revenue_growth, start=1):
         revenue = prev_revenue * (1 + growth)
         ebit = revenue * assumptions.ebit_margin
         da = revenue * da_ratio
@@ -111,7 +110,8 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
         last_discount_factor = discount_factor
 
     terminal_value = (
-        last_fcf * (1 + assumptions.terminal_growth)
+        last_fcf
+        * (1 + assumptions.terminal_growth)
         / (assumptions.wacc - assumptions.terminal_growth)
     )
     pv_terminal_value = terminal_value * last_discount_factor
@@ -142,9 +142,7 @@ WACC_OFFSETS = (-0.01, 0.0, 0.01)
 TERMINAL_GROWTH_OFFSETS = (-0.005, 0.0, 0.005)
 
 
-def compute_sensitivity_grid(
-    base: BaseFinancials, assumptions: Assumptions
-) -> SensitivityGrid:
+def compute_sensitivity_grid(base: BaseFinancials, assumptions: Assumptions) -> SensitivityGrid:
     """3x3 grid of intrinsic value per share around the caller's WACC and
     terminal growth. Pure like compute_dcf. The center cell always equals
     the point estimate; combinations that would break the Gordon formula
@@ -158,9 +156,9 @@ def compute_sensitivity_grid(
         round(assumptions.terminal_growth + o, 10) for o in TERMINAL_GROWTH_OFFSETS
     )
 
-    rows: list[tuple[Optional[float], ...]] = []
+    rows: list[tuple[float | None, ...]] = []
     for wacc in wacc_values:
-        row: list[Optional[float]] = []
+        row: list[float | None] = []
         for growth in growth_values:
             if wacc <= 0 or growth >= wacc:
                 row.append(None)

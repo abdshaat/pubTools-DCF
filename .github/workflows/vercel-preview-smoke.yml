@@ -1,0 +1,62 @@
+name: Vercel deployment smoke test
+
+on:
+  deployment_status:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Verify ready Vercel deployment
+    if: >-
+      github.event.deployment_status.state == 'success' &&
+      (github.event.deployment_status.environment_url != '' ||
+       github.event.deployment_status.target_url != '')
+    runs-on: ubuntu-latest
+    env:
+      DEPLOYMENT_URL: >-
+        ${{ github.event.deployment_status.environment_url ||
+            github.event.deployment_status.target_url }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.deployment.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install development dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -e ".[dev]"
+      - name: Run local API contract tests
+        run: python -m pytest -q tests/test_api.py
+      - name: Wait for deployment health
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${DEPLOYMENT_URL%/}"
+          curl --fail --silent --show-error \
+            --retry 8 --retry-all-errors --retry-delay 5 \
+            "$base/health" > health.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          payload = json.loads(Path("health.json").read_text(encoding="utf-8"))
+          assert payload["status"] == "ok", payload
+          assert payload.get("model_version"), payload
+          PY
+      - name: Verify OpenAPI contract is served
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${DEPLOYMENT_URL%/}"
+          curl --fail --silent --show-error "$base/openapi.json" > openapi.json
+          python - <<'PY'
+          import json
+          from pathlib import Path
+
+          schema = json.loads(Path("openapi.json").read_text(encoding="utf-8"))
+          assert "/health" not in schema["paths"]
+          assert "/v1/valuations/{ticker}" in schema["paths"]
+          PY

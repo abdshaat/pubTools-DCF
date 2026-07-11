@@ -5,8 +5,6 @@ dataclasses in app.models; converting at the boundary keeps the engine
 free of FastAPI/pydantic dependencies.
 """
 
-from typing import Optional
-
 from pydantic import BaseModel
 
 from . import MODEL_VERSION
@@ -55,7 +53,7 @@ class SensitivityOut(BaseModel):
 
     wacc_values: list[float]
     terminal_growth_values: list[float]
-    intrinsic_value_per_share: list[list[Optional[float]]]
+    intrinsic_value_per_share: list[list[float | None]]
 
 
 class ValuationResponse(BaseModel):
@@ -71,7 +69,7 @@ class ValuationResponse(BaseModel):
     intrinsic_value_per_share: float
     current_price: float
     upside_pct: float
-    sensitivity: Optional[SensitivityOut] = None
+    sensitivity: SensitivityOut | None = None
 
 
 class FieldError(BaseModel):
@@ -83,16 +81,14 @@ def build_valuation_response(
     base: BaseFinancials,
     assumptions: Assumptions,
     valuation: Valuation,
-    sensitivity: Optional[SensitivityGrid] = None,
+    sensitivity: SensitivityGrid | None = None,
 ) -> ValuationResponse:
     return ValuationResponse(
         sensitivity=(
             SensitivityOut(
                 wacc_values=list(sensitivity.wacc_values),
                 terminal_growth_values=list(sensitivity.terminal_growth_values),
-                intrinsic_value_per_share=[
-                    list(row) for row in sensitivity.per_share_values
-                ],
+                intrinsic_value_per_share=[list(row) for row in sensitivity.per_share_values],
             )
             if sensitivity is not None
             else None
@@ -117,7 +113,7 @@ def build_valuation_response(
             tax_rate=assumptions.tax_rate,
             ebit_margin=assumptions.ebit_margin,
             projection_years=assumptions.projection_years,
-            revenue_growth=list(assumptions.revenue_growth),
+            revenue_growth=list(assumptions.resolved_revenue_growth),
         ),
         projections=[
             YearProjectionOut(

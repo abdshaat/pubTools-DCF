@@ -116,8 +116,12 @@ def test_normalize_reports_all_missing_fields_by_name():
 def test_normalized_output_feeds_straight_into_dcf_engine():
     base = normalize_fmp_fundamentals(make_fundamentals())
     assumptions = Assumptions(
-        wacc=0.09, terminal_growth=0.025, tax_rate=0.16,
-        ebit_margin=0.30, projection_years=5, revenue_growth=0.05,
+        wacc=0.09,
+        terminal_growth=0.025,
+        tax_rate=0.16,
+        ebit_margin=0.30,
+        projection_years=5,
+        revenue_growth=0.05,
     )
     valuation = compute_dcf(base, assumptions)
     assert valuation.intrinsic_value_per_share > 0
@@ -177,9 +181,7 @@ def test_provider_402_is_not_retried():
         return httpx.Response(402, text="not available under your current subscription")
 
     async def scenario():
-        async with make_client(
-            transport=httpx.MockTransport(handler), max_retries=3
-        ) as client:
+        async with make_client(transport=httpx.MockTransport(handler), max_retries=3) as client:
             await client.fetch_fundamentals("ZZZQQQ")
 
     with pytest.raises(TickerNotCoveredError):
@@ -225,9 +227,7 @@ def test_retries_on_429_with_backoff_then_succeeds():
         sleeps.append(seconds)
 
     async def scenario():
-        async with make_client(
-            transport=httpx.MockTransport(handler), sleep=fake_sleep
-        ) as client:
+        async with make_client(transport=httpx.MockTransport(handler), sleep=fake_sleep) as client:
             return await client.fetch_fundamentals("AAPL")
 
     result = asyncio.run(scenario())
@@ -258,9 +258,7 @@ def test_raw_sink_receives_every_payload():
     async def scenario():
         client = make_client(
             transport=fixture_transport(),
-            raw_sink=lambda ticker, endpoint, payload: stored.append(
-                (ticker, endpoint)
-            ),
+            raw_sink=lambda ticker, endpoint, payload: stored.append((ticker, endpoint)),
         )
         async with client:
             await client.fetch_fundamentals("AAPL")
@@ -298,9 +296,7 @@ def test_cache_expires_after_ttl():
 
     async def scenario():
         async with make_client(transport=fixture_transport(call_log)) as client:
-            service = FundamentalsService(
-                client, ttl_seconds=3600, now=lambda: clock["t"]
-            )
+            service = FundamentalsService(client, ttl_seconds=3600, now=lambda: clock["t"])
             await service.get_base_financials("AAPL")
             clock["t"] = 3599.0
             await service.get_base_financials("AAPL")  # still cached

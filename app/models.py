@@ -4,8 +4,9 @@ All monetary fields are raw dollars (not thousands/millions) per the
 unit-convention rule in CLAUDE.md.
 """
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Optional, Sequence, Union
+from typing import cast
 
 
 @dataclass(frozen=True)
@@ -39,7 +40,7 @@ class Assumptions:
     tax_rate: float
     ebit_margin: float
     projection_years: int
-    revenue_growth: Union[float, Sequence[float]]
+    revenue_growth: float | Sequence[float]
 
     def __post_init__(self) -> None:
         if isinstance(self.revenue_growth, (int, float)):
@@ -47,6 +48,11 @@ class Assumptions:
         else:
             resolved = tuple(float(g) for g in self.revenue_growth)
         object.__setattr__(self, "revenue_growth", resolved)
+
+    @property
+    def resolved_revenue_growth(self) -> tuple[float, ...]:
+        """Return the normalized per-year tuple established in `__post_init__`."""
+        return cast(tuple[float, ...], self.revenue_growth)
 
 
 @dataclass(frozen=True)
@@ -68,7 +74,7 @@ class SensitivityGrid:
 
     wacc_values: tuple[float, ...]
     terminal_growth_values: tuple[float, ...]
-    per_share_values: tuple[tuple[Optional[float], ...], ...]
+    per_share_values: tuple[tuple[float | None, ...], ...]
 
 
 @dataclass(frozen=True)

@@ -10,14 +10,23 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import MODEL_VERSION
-from app.api import create_app
-from app.providers.fmp import FMPClient
+from app.api import _default_raw_sink, create_app
+from app.providers.fmp import FileRawSink, FMPClient
 from tests.test_data_layer import fixture_transport
 
 VALID_QUERY = (
-    "wacc=0.09&terminal_growth=0.025&ebit_margin=0.30"
-    "&revenue_growth=0.05&projection_years=5"
+    "wacc=0.09&terminal_growth=0.025&ebit_margin=0.30&revenue_growth=0.05&projection_years=5"
 )
+
+
+def test_default_raw_sink_is_disabled_on_vercel(monkeypatch):
+    monkeypatch.setenv("VERCEL", "1")
+    assert _default_raw_sink() is None
+
+
+def test_default_raw_sink_is_available_for_local_development(monkeypatch):
+    monkeypatch.delenv("VERCEL", raising=False)
+    assert isinstance(_default_raw_sink(), FileRawSink)
 
 
 @pytest.fixture
@@ -62,7 +71,11 @@ def test_per_year_revenue_growth_list_accepted(client: TestClient):
     )
     assert response.status_code == 200
     assert response.json()["assumptions"]["revenue_growth"] == [
-        0.08, 0.07, 0.06, 0.05, 0.04,
+        0.08,
+        0.07,
+        0.06,
+        0.05,
+        0.04,
     ]
 
 
@@ -104,8 +117,7 @@ def test_financial_sector_returns_422_with_explanation(client: TestClient):
 
 def test_terminal_growth_at_or_above_wacc_returns_422(client: TestClient):
     response = client.get(
-        "/v1/valuations/AAPL?wacc=0.05&terminal_growth=0.05"
-        "&ebit_margin=0.30&revenue_growth=0.05"
+        "/v1/valuations/AAPL?wacc=0.05&terminal_growth=0.05&ebit_margin=0.30&revenue_growth=0.05"
     )
     assert response.status_code == 422
     detail = response.json()["detail"]
@@ -114,8 +126,7 @@ def test_terminal_growth_at_or_above_wacc_returns_422(client: TestClient):
 
 def test_malformed_revenue_growth_returns_422(client: TestClient):
     response = client.get(
-        "/v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025"
-        "&ebit_margin=0.30&revenue_growth=fast"
+        "/v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30&revenue_growth=fast"
     )
     assert response.status_code == 422
     assert response.json()["detail"][0]["field"] == "revenue_growth"

@@ -16,9 +16,11 @@ the format FastAPI uses for its own validation errors closely enough that
 callers handle one shape.
 """
 
+import os
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path as FilePath
-from typing import Optional
+from typing import Any
 
 from fastapi import FastAPI, Path, Query, Request
 from fastapi.responses import JSONResponse
@@ -50,6 +52,18 @@ except ImportError:
     pass
 
 
+def _default_raw_sink() -> FileRawSink | None:
+    """Persist provider payloads locally except on Vercel.
+
+    Vercel Functions are stateless and deployment files must not be treated as
+    durable storage. Production audit payloads will move to external object
+    storage; disabling this sink keeps requests independent of ephemeral files.
+    """
+    if os.environ.get("VERCEL"):
+        return None
+    return FileRawSink(FilePath(__file__).parent.parent / "data" / "raw")
+
+
 def _parse_revenue_growth(raw: str) -> list[float]:
     """'0.05' -> [0.05]; '0.08,0.07,0.06' -> [0.08, 0.07, 0.06]."""
     try:
@@ -57,22 +71,20 @@ def _parse_revenue_growth(raw: str) -> list[float]:
     except ValueError:
         raise DCFValidationError(
             "revenue_growth", "must be a number or comma-separated numbers"
-        )
+        ) from None
     if not values:
         raise DCFValidationError("revenue_growth", "must not be empty")
     return values
 
 
 def create_app(
-    fmp_client: Optional[FMPClient] = None,
+    fmp_client: FMPClient | None = None,
     ttl_seconds: float = 4 * 3600,
 ) -> FastAPI:
     @asynccontextmanager
-    async def lifespan(app: FastAPI):
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_client = fmp_client is None
-        client = fmp_client or FMPClient(
-            raw_sink=FileRawSink(FilePath(__file__).parent.parent / "data" / "raw")
-        )
+        client = fmp_client or FMPClient(raw_sink=_default_raw_sink())
         app.state.fundamentals = FundamentalsService(client, ttl_seconds=ttl_seconds)
         try:
             yield
@@ -92,23 +104,23 @@ def create_app(
 
     # --- error mapping (see app/exceptions.py for the rationale) ---
 
-    def _error(status: int, detail) -> JSONResponse:
+    def _error(status: int, detail: Any) -> JSONResponse:
         return JSONResponse(status_code=status, content={"detail": detail})
 
     @app.exception_handler(DCFValidationError)
-    async def _validation_error(request: Request, exc: DCFValidationError):
+    async def _validation_error(request: Request, exc: DCFValidationError) -> JSONResponse:
         return _error(422, [{"field": exc.field, "message": exc.message}])
 
     @app.exception_handler(UnsupportedSectorError)
-    async def _sector_error(request: Request, exc: UnsupportedSectorError):
+    async def _sector_error(request: Request, exc: UnsupportedSectorError) -> JSONResponse:
         return _error(422, [{"field": "ticker", "message": str(exc)}])
 
     @app.exception_handler(TickerNotFoundError)
-    async def _not_found(request: Request, exc: TickerNotFoundError):
+    async def _not_found(request: Request, exc: TickerNotFoundError) -> JSONResponse:
         return _error(404, f"ticker not found: {exc.ticker}")
 
     @app.exception_handler(TickerNotCoveredError)
-    async def _not_covered(request: Request, exc: TickerNotCoveredError):
+    async def _not_covered(request: Request, exc: TickerNotCoveredError) -> JSONResponse:
         # 404: from the customer's side there is no valuation to return for
         # this ticker. The message explains the cause (may not exist, or may
         # be outside our data coverage) without leaking that it's our upstream
@@ -116,15 +128,15 @@ def create_app(
         return _error(404, str(exc))
 
     @app.exception_handler(NormalizationError)
-    async def _normalization_error(request: Request, exc: NormalizationError):
+    async def _normalization_error(request: Request, exc: NormalizationError) -> JSONResponse:
         return _error(502, f"provider data for {exc.ticker} could not be normalized")
 
     @app.exception_handler(ProviderAuthError)
-    async def _auth_error(request: Request, exc: ProviderAuthError):
+    async def _auth_error(request: Request, exc: ProviderAuthError) -> JSONResponse:
         return _error(500, "data provider authentication is misconfigured")
 
     @app.exception_handler(ProviderError)
-    async def _provider_error(request: Request, exc: ProviderError):
+    async def _provider_error(request: Request, exc: ProviderError) -> JSONResponse:
         return _error(503, "data provider is unavailable, try again shortly")
 
     # --- routes ---
@@ -137,7 +149,9 @@ def create_app(
     async def get_valuation(
         request: Request,
         ticker: str = Path(
-            min_length=1, max_length=10, pattern=r"^[A-Za-z][A-Za-z.\-]*$",
+            min_length=1,
+            max_length=10,
+            pattern=r"^[A-Za-z][A-Za-z.\-]*$",
             description="US stock ticker, e.g. AAPL",
         ),
         wacc: float = Query(
@@ -156,10 +170,12 @@ def create_app(
             ),
         ),
         tax_rate: float = Query(
-            default=0.21, description="Effective tax rate; defaults to 0.21",
+            default=0.21,
+            description="Effective tax rate; defaults to 0.21",
         ),
         projection_years: int = Query(
-            default=5, description="Explicit forecast horizon, 3-15 years",
+            default=5,
+            description="Explicit forecast horizon, 3-15 years",
         ),
         sensitivity: bool = Query(
             default=True,
@@ -185,7 +201,7 @@ def create_app(
         return build_valuation_response(base, assumptions, valuation, grid)
 
     @app.get("/health", include_in_schema=False)
-    async def health():
+    async def health() -> dict[str, str]:
         return {"status": "ok", "model_version": MODEL_VERSION}
 
     return app

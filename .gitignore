@@ -21,19 +21,36 @@ data/
 
 # --- Python ---
 .venv/
+.venv313/
+.venv-store-broken/
 venv/
 env/
 __pycache__/
 *.pyc
 *.pyo
 *.egg-info/
+build/
+dist/
 .pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
 .hypothesis/
 .mypy_cache/
 .ruff_cache/
 
 # --- Local notes / editor ---
-PROGRESS.md
+# Ignore Markdown planning/instruction files. Keep the public repository README.
+*.md
+*.MD
+!README.md
+!README.MD
+.claude/
+.vercel/
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db

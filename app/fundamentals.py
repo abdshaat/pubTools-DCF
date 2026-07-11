@@ -2,7 +2,9 @@
 
 This is what the API layer calls. In-process TTL cache keyed per ticker
 (CLAUDE.md layer 3; Redis can replace this later behind the same
-interface). Fundamentals change quarterly so a long TTL is fine — but note
+interface). On Vercel this cache is only a warm-instance optimization: it is
+never relied on for correctness, metering, or cross-instance coordination.
+Fundamentals change quarterly so a long TTL is fine — but note
 the cached BaseFinancials includes `current_price`, which moves intraday;
 the default TTL is set to hours, not days, until price is fetched
 separately.
@@ -16,7 +18,7 @@ cached, so they remain retryable.
 """
 
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from .exceptions import (
     TickerNotCoveredError,
@@ -75,7 +77,7 @@ class FundamentalsService:
         self._cache[ticker] = (self._now(), normalized)
         return normalized
 
-    def invalidate(self, ticker: Optional[str] = None) -> None:
+    def invalidate(self, ticker: str | None = None) -> None:
         if ticker is None:
             self._cache.clear()
             self._negative.clear()

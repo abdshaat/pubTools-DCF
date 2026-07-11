@@ -10,7 +10,6 @@ from app.dcf_engine import (
 from app.models import Assumptions, BaseFinancials
 from tests.conftest import make_base_financials
 
-
 # ---------------------------------------------------------------------------
 # Hand-computed cases (the "validate vs a spreadsheet" milestone).
 # Each expected value below is computed independently of app/dcf_engine.py.
@@ -60,14 +59,10 @@ def test_matches_hand_computed_3_year_flat_growth(base_financials: BaseFinancial
     expected_tv = 193_902.1875 * 1.02 / 0.08
     assert result.terminal_value == pytest.approx(expected_tv)
 
-    expected_pv_tv = expected_tv / (1.10 ** 3)
+    expected_pv_tv = expected_tv / (1.10**3)
     assert result.pv_terminal_value == pytest.approx(expected_pv_tv)
 
-    expected_pv_fcf_sum = (
-        175_875.0 / 1.10
-        + 184_668.75 / 1.10 ** 2
-        + 193_902.1875 / 1.10 ** 3
-    )
+    expected_pv_fcf_sum = 175_875.0 / 1.10 + 184_668.75 / 1.10**2 + 193_902.1875 / 1.10**3
     expected_ev = expected_pv_fcf_sum + expected_pv_tv
     expected_equity = expected_ev - base_financials.net_debt
     expected_per_share = expected_equity / base_financials.diluted_shares
@@ -76,9 +71,7 @@ def test_matches_hand_computed_3_year_flat_growth(base_financials: BaseFinancial
     assert result.equity_value == pytest.approx(expected_equity)
     assert result.intrinsic_value_per_share == pytest.approx(expected_per_share)
     assert result.upside_pct == pytest.approx(
-        (expected_per_share - base_financials.current_price)
-        / base_financials.current_price
-        * 100
+        (expected_per_share - base_financials.current_price) / base_financials.current_price * 100
     )
 
 
@@ -131,8 +124,12 @@ def test_per_year_revenue_growth_list_is_used_positionally(base_financials: Base
 
 def test_terminal_growth_equal_to_wacc_rejected(base_financials: BaseFinancials):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.10, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=5, revenue_growth=0.05,
+        wacc=0.10,
+        terminal_growth=0.10,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=5,
+        revenue_growth=0.05,
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -141,8 +138,12 @@ def test_terminal_growth_equal_to_wacc_rejected(base_financials: BaseFinancials)
 
 def test_terminal_growth_above_wacc_rejected(base_financials: BaseFinancials):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.12, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=5, revenue_growth=0.05,
+        wacc=0.10,
+        terminal_growth=0.12,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=5,
+        revenue_growth=0.05,
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -152,8 +153,12 @@ def test_terminal_growth_above_wacc_rejected(base_financials: BaseFinancials):
 @pytest.mark.parametrize("years", [1, 2, 16, 30])
 def test_projection_years_out_of_range_rejected(base_financials: BaseFinancials, years: int):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.02, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=years, revenue_growth=0.05,
+        wacc=0.10,
+        terminal_growth=0.02,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=years,
+        revenue_growth=0.05,
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -163,8 +168,12 @@ def test_projection_years_out_of_range_rejected(base_financials: BaseFinancials,
 @pytest.mark.parametrize("years", [3, 5, 15])
 def test_projection_years_boundary_values_accepted(base_financials: BaseFinancials, years: int):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.02, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=years, revenue_growth=0.05,
+        wacc=0.10,
+        terminal_growth=0.02,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=years,
+        revenue_growth=0.05,
     )
     result = compute_dcf(base_financials, assumptions)
     assert len(result.projections) == years
@@ -173,8 +182,12 @@ def test_projection_years_boundary_values_accepted(base_financials: BaseFinancia
 @pytest.mark.parametrize("growth", [0.51, -0.51, 5.0])
 def test_revenue_growth_beyond_50pct_rejected(base_financials: BaseFinancials, growth: float):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.02, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=3, revenue_growth=growth,
+        wacc=0.10,
+        terminal_growth=0.02,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=3,
+        revenue_growth=growth,
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -183,8 +196,12 @@ def test_revenue_growth_beyond_50pct_rejected(base_financials: BaseFinancials, g
 
 def test_negative_tax_rate_rejected(base_financials: BaseFinancials):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.02, tax_rate=-0.01,
-        ebit_margin=0.25, projection_years=3, revenue_growth=0.05,
+        wacc=0.10,
+        terminal_growth=0.02,
+        tax_rate=-0.01,
+        ebit_margin=0.25,
+        projection_years=3,
+        revenue_growth=0.05,
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -193,8 +210,12 @@ def test_negative_tax_rate_rejected(base_financials: BaseFinancials):
 
 def test_revenue_growth_list_length_mismatch_rejected(base_financials: BaseFinancials):
     assumptions = Assumptions(
-        wacc=0.10, terminal_growth=0.02, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=5, revenue_growth=[0.05, 0.05],
+        wacc=0.10,
+        terminal_growth=0.02,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=5,
+        revenue_growth=[0.05, 0.05],
     )
     with pytest.raises(DCFValidationError) as exc:
         compute_dcf(base_financials, assumptions)
@@ -208,8 +229,12 @@ def test_revenue_growth_list_length_mismatch_rejected(base_financials: BaseFinan
 
 def _grid_assumptions(wacc=0.10, terminal_growth=0.02) -> Assumptions:
     return Assumptions(
-        wacc=wacc, terminal_growth=terminal_growth, tax_rate=0.25,
-        ebit_margin=0.25, projection_years=5, revenue_growth=0.05,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        tax_rate=0.25,
+        ebit_margin=0.25,
+        projection_years=5,
+        revenue_growth=0.05,
     )
 
 
@@ -223,19 +248,13 @@ def test_grid_center_cell_equals_point_estimate(base_financials: BaseFinancials)
     assumptions = _grid_assumptions()
     grid = compute_sensitivity_grid(base_financials, assumptions)
     point = compute_dcf(base_financials, assumptions)
-    assert grid.per_share_values[1][1] == pytest.approx(
-        point.intrinsic_value_per_share
-    )
+    assert grid.per_share_values[1][1] == pytest.approx(point.intrinsic_value_per_share)
 
 
 def test_grid_cells_match_independent_recomputation(base_financials: BaseFinancials):
     grid = compute_sensitivity_grid(base_financials, _grid_assumptions())
-    corner = compute_dcf(
-        base_financials, _grid_assumptions(wacc=0.09, terminal_growth=0.025)
-    )
-    assert grid.per_share_values[0][2] == pytest.approx(
-        corner.intrinsic_value_per_share
-    )
+    corner = compute_dcf(base_financials, _grid_assumptions(wacc=0.09, terminal_growth=0.025))
+    assert grid.per_share_values[0][2] == pytest.approx(corner.intrinsic_value_per_share)
 
 
 def test_grid_is_monotonic_in_both_axes(base_financials: BaseFinancials):
@@ -296,12 +315,20 @@ def test_higher_wacc_never_increases_equity_value(
     base_financials = make_base_financials()
 
     low = Assumptions(
-        wacc=wacc, terminal_growth=terminal_growth, tax_rate=tax_rate,
-        ebit_margin=ebit_margin, projection_years=years, revenue_growth=growth,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        tax_rate=tax_rate,
+        ebit_margin=ebit_margin,
+        projection_years=years,
+        revenue_growth=growth,
     )
     high = Assumptions(
-        wacc=wacc + wacc_bump, terminal_growth=terminal_growth, tax_rate=tax_rate,
-        ebit_margin=ebit_margin, projection_years=years, revenue_growth=growth,
+        wacc=wacc + wacc_bump,
+        terminal_growth=terminal_growth,
+        tax_rate=tax_rate,
+        ebit_margin=ebit_margin,
+        projection_years=years,
+        revenue_growth=growth,
     )
 
     result_low = compute_dcf(base_financials, low)
@@ -328,12 +355,20 @@ def test_higher_terminal_growth_never_decreases_equity_value(
     base_financials = make_base_financials()
 
     low = Assumptions(
-        wacc=wacc, terminal_growth=terminal_growth, tax_rate=tax_rate,
-        ebit_margin=ebit_margin, projection_years=years, revenue_growth=growth,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        tax_rate=tax_rate,
+        ebit_margin=ebit_margin,
+        projection_years=years,
+        revenue_growth=growth,
     )
     high = Assumptions(
-        wacc=wacc, terminal_growth=terminal_growth + growth_bump, tax_rate=tax_rate,
-        ebit_margin=ebit_margin, projection_years=years, revenue_growth=growth,
+        wacc=wacc,
+        terminal_growth=terminal_growth + growth_bump,
+        tax_rate=tax_rate,
+        ebit_margin=ebit_margin,
+        projection_years=years,
+        revenue_growth=growth,
     )
 
     result_low = compute_dcf(base_financials, low)
@@ -358,8 +393,12 @@ def test_enterprise_value_equals_sum_of_pv_fcf_plus_pv_terminal_value(
     base_financials = make_base_financials()
 
     assumptions = Assumptions(
-        wacc=wacc, terminal_growth=terminal_growth, tax_rate=tax_rate,
-        ebit_margin=ebit_margin, projection_years=years, revenue_growth=growth,
+        wacc=wacc,
+        terminal_growth=terminal_growth,
+        tax_rate=tax_rate,
+        ebit_margin=ebit_margin,
+        projection_years=years,
+        revenue_growth=growth,
     )
     result = compute_dcf(base_financials, assumptions)
 
