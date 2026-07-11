@@ -1,0 +1,46 @@
+{
+  "income-statement": [
+    {
+      "date": "2025-09-27",
+      "symbol": "AAPL",
+      "period": "FY",
+      "fiscalYear": "2025",
+      "revenue": 391035000000,
+      "operatingIncome": 123216000000,
+      "weightedAverageShsOutDil": 15408095000
+    }
+  ],
+  "balance-sheet-statement": [
+    {
+      "date": "2025-09-27",
+      "symbol": "AAPL",
+      "period": "FY",
+      "cashAndCashEquivalents": 29943000000,
+      "totalDebt": 106629000000
+    }
+  ],
+  "cash-flow-statement": [
+    {
+      "date": "2025-09-27",
+      "symbol": "AAPL",
+      "period": "FY",
+      "depreciationAndAmortization": 11445000000,
+      "capitalExpenditure": -9447000000,
+      "changeInWorkingCapital": 3651000000
+    }
+  ],
+  "profile": [
+    {
+      "symbol": "AAPL",
+      "companyName": "Apple Inc.",
+      "sector": "Technology",
+      "currency": "USD"
+    }
+  ],
+  "quote": [
+    {
+      "symbol": "AAPL",
+      "price": 245.5
+    }
+  ]
+}
