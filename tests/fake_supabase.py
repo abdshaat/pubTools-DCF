@@ -23,15 +23,23 @@ class FakeSupabaseBackend:
         self.customers: list[dict[str, Any]] = []
         self.keys: list[dict[str, Any]] = []
         self.audit_events: list[dict[str, Any]] = []
+        self.otp_requests: list[dict[str, Any]] = []
         self._counter = 0
 
     def register_login_code(
-        self, code: str, *, user_id: str, email: str | None, user_name: str
+        self,
+        code: str,
+        *,
+        user_id: str,
+        email: str | None,
+        user_name: str | None = None,
+        provider: str = "github",
     ) -> None:
         self.users_by_code[code] = {
             "id": user_id,
             "email": email,
-            "user_metadata": {"user_name": user_name},
+            "user_metadata": {"user_name": user_name} if user_name else {},
+            "app_metadata": {"provider": provider},
         }
 
     def _next_id(self, prefix: str) -> str:
@@ -77,6 +85,19 @@ class FakeSupabaseBackend:
 
         if path == "/auth/v1/logout":
             return httpx.Response(204)
+
+        if path == "/auth/v1/otp" and method == "POST":
+            body = json.loads(request.content)
+            self.otp_requests.append(
+                {
+                    "email": body.get("email"),
+                    "create_user": body.get("create_user"),
+                    "code_challenge": body.get("code_challenge"),
+                    "code_challenge_method": body.get("code_challenge_method"),
+                    "redirect_to": request.url.params.get("redirect_to"),
+                }
+            )
+            return httpx.Response(200, json={})
 
         if path == "/rest/v1/api_customers" and method == "GET":
             auth_user_id = request.url.params.get("auth_user_id", "").removeprefix("eq.")

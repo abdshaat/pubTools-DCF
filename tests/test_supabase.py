@@ -226,6 +226,8 @@ def test_supabase_auth_client_error_and_malformed_paths():
             return httpx.Response(400, json={"error": "invalid_grant"})
         if request.url.path == "/auth/v1/user":
             return httpx.Response(200, json=["not", "a", "dict"])
+        if request.url.path == "/auth/v1/otp":
+            return httpx.Response(500)
         raise AssertionError(f"unexpected request: {request.url}")
 
     async def exercise() -> None:
@@ -235,6 +237,10 @@ def test_supabase_auth_client_error_and_malformed_paths():
                 await client.exchange_code(auth_code="bad", code_verifier="v")
             with pytest.raises(SupabaseAuthError):
                 await client.get_user(access_token="whatever")
+            with pytest.raises(SupabaseAuthError):
+                await client.request_magic_link(
+                    email="a@example.com", redirect_to="http://x/callback", code_challenge="c"
+                )
         finally:
             await client.aclose()
 

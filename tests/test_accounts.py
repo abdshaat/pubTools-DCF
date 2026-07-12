@@ -16,11 +16,14 @@ from app.accounts import (
     AccountAuthError,
     AccountKeyNotFoundError,
     AccountLimitError,
+    InvalidEmailError,
     build_github_login,
     create_key,
     generate_pkce_pair,
     get_current_customer,
+    is_valid_email,
     list_keys,
+    request_email_login,
     revoke_key,
 )
 from app.supabase import SupabaseAuthClient, SupabaseClient, SupabaseConfig
@@ -65,6 +68,56 @@ def test_build_github_login_url_has_expected_params(monkeypatch):
     assert "redirect_to=http%3A%2F%2F127.0.0.1%3A8000%2Fv1%2Fauth%2Fcallback" in url
     assert "code_challenge_method=s256" in url
     assert len(verifier) >= 43
+
+
+@pytest.mark.parametrize(
+    "email,expected",
+    [
+        ("a@example.com", True),
+        ("a.b+tag@example.co.uk", True),
+        ("not-an-email", False),
+        ("missing-domain@", False),
+        ("@missing-local.com", False),
+        ("has space@example.com", False),
+        ("x" * 250 + "@example.com", False),  # over 254 chars
+    ],
+)
+def test_is_valid_email(email, expected):
+    assert is_valid_email(email) is expected
+
+
+def test_request_email_login_rejects_malformed_email():
+    backend = FakeSupabaseBackend()
+    auth_client = SupabaseAuthClient(_config(), transport=backend.transport())
+
+    async def exercise():
+        with pytest.raises(InvalidEmailError):
+            await request_email_login(auth_client, email="not-an-email")
+        assert backend.otp_requests == []  # rejected before ever calling Supabase
+
+    _run(exercise())
+
+
+def test_request_email_login_sends_otp_with_pkce_challenge(monkeypatch):
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+    backend = FakeSupabaseBackend()
+    auth_client = SupabaseAuthClient(_config(), transport=backend.transport())
+
+    async def exercise():
+        verifier = await request_email_login(auth_client, email="customer@example.com")
+        assert len(verifier) >= 43
+        assert len(backend.otp_requests) == 1
+        request = backend.otp_requests[0]
+        assert request["email"] == "customer@example.com"
+        assert request["create_user"] is True
+        assert request["code_challenge_method"] == "s256"
+        assert request["redirect_to"] == "http://127.0.0.1:8000/v1/auth/callback"
+        # the verifier returned to the caller must hash to the sent challenge
+        digest = hashlib.sha256(verifier.encode("ascii")).digest()
+        expected_challenge = base64.urlsafe_b64encode(digest).rstrip(b"=").decode("ascii")
+        assert request["code_challenge"] == expected_challenge
+
+    _run(exercise())
 
 
 def test_create_key_defaults_scope_quota_and_records_audit_event():

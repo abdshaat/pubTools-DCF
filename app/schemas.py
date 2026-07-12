@@ -155,6 +155,10 @@ class MeOut(BaseModel):
     name: str
 
 
+class EmailLoginRequest(BaseModel):
+    email: str = Field(max_length=254)
+
+
 class CreateKeyRequest(BaseModel):
     label: str | None = Field(default=None, max_length=64)
 

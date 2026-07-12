@@ -35,13 +35,15 @@ from .accounts import (
     AccountAuthError,
     AccountKeyNotFoundError,
     AccountLimitError,
+    InvalidEmailError,
     build_github_login,
     clear_session_cookies,
-    complete_github_login,
+    complete_login,
     create_key,
     get_current_customer,
     list_keys,
     public_base_url,
+    request_email_login,
     revoke_key,
     set_oauth_verifier_cookie,
     set_session_cookies,
@@ -64,6 +66,7 @@ from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
     CreateKeyRequest,
+    EmailLoginRequest,
     ErrorResponse,
     MeOut,
     ValuationResponse,
@@ -516,12 +519,48 @@ def create_app(
         set_oauth_verifier_cookie(response, verifier=verifier)
         return response
 
+    @app.post("/v1/auth/email/login", include_in_schema=False)
+    async def email_login(request: Request, payload: EmailLoginRequest) -> Response:
+        auth_client = request.app.state.auth_client
+        if auth_client is None:
+            return _auth_error_response(
+                request,
+                status_code=503,
+                code="auth_not_configured",
+                message="Sign-in is not configured.",
+            )
+        ip = request.client.host if request.client else "unknown"
+        result = await _resolve(
+            request.app.state.login_rate_limiter.check_and_increment(
+                identity=ip, limit=LOGIN_ATTEMPTS_DAILY_LIMIT
+            )
+        )
+        if not result.allowed:
+            return _auth_error_response(
+                request,
+                status_code=429,
+                code="login_rate_limited",
+                message="Too many sign-in attempts. Try again later.",
+            )
+        try:
+            verifier = await request_email_login(auth_client, email=payload.email)
+        except InvalidEmailError as exc:
+            return _error(request, 422, str(exc), "invalid_email", str(exc))
+        except SupabaseError:
+            detail = "Failed to send the sign-in email. Try again shortly."
+            return _error(request, 503, detail, "email_login_failed", detail)
+        response = JSONResponse(content={"sent": True})
+        set_oauth_verifier_cookie(response, verifier=verifier)
+        return response
+
     @app.get("/v1/auth/callback", include_in_schema=False)
-    async def github_callback(
+    async def auth_callback(
         request: Request,
         code: str | None = None,
         error: str | None = None,
     ) -> RedirectResponse:
+        """Completes either login method -- GitHub's authorize redirect and
+        Supabase's magic-link verify both land here with `?code=...`."""
         base = public_base_url()
 
         def error_redirect(reason: str) -> RedirectResponse:
@@ -538,7 +577,7 @@ def create_app(
 
         response = RedirectResponse(url=f"{base}/", status_code=302)
         try:
-            await complete_github_login(
+            await complete_login(
                 auth_client=auth_client,
                 supabase_client=supabase_client,
                 request=request,

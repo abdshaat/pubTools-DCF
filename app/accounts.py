@@ -1,4 +1,5 @@
-"""Customer login (GitHub via Supabase Auth) and self-service API keys.
+"""Customer login (GitHub OAuth or email magic link via Supabase Auth) and
+self-service API keys.
 
 A human's browser login session is a distinct credential class from the
 machine `X-API-Key` auth in app/auth.py and SupabaseAPIKeyAuthenticator in
@@ -6,15 +7,27 @@ app/supabase.py: a login session cookie is never accepted as an API key, and
 an API key is never accepted as a login session. This module only ever
 produces/consumes the cookies defined below; it never touches `X-API-Key`.
 
+Both login methods land on the same PKCE code-exchange completion
+(`complete_login`): GitHub's authorize redirect and Supabase's magic-link
+`/auth/v1/verify` both redirect the browser to `{PUBLIC_BASE_URL}/v1/auth/
+callback?code=...`, exchanged the same way regardless of which provider
+issued it. Nothing provider-specific happens after the code exchange except
+recording which provider was used, read back from Supabase's own
+`user.app_metadata.provider`.
+
 pubTools account model (Phase 6): a login identity (a Supabase Auth user) is
 distinct from an `api_customers` row (the billing/quota entity), which is
 distinct from an `api_keys` row. v1 scope: one login owns exactly one customer
-record (enforced by a unique constraint on `api_customers.auth_user_id`).
+record (enforced by a unique constraint on `api_customers.auth_user_id`); a
+customer who signs in with both GitHub and email gets two separate accounts
+today -- Supabase identity linking across providers is not wired up (deferred,
+see IMPLEMENTATION_PLAN.md Phase 6).
 """
 
 import base64
 import hashlib
 import os
+import re
 import secrets
 import string
 from dataclasses import dataclass
@@ -24,6 +37,8 @@ from fastapi import Request, Response
 
 from .auth import VALUATION_SCOPE, APIKeyAuthenticator
 from .supabase import AuthSession, SupabaseAuthClient, SupabaseAuthError, SupabaseClient
+
+_EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 SESSION_COOKIE = "pt_session"
 REFRESH_COOKIE = "pt_refresh"
@@ -49,6 +64,10 @@ class AccountKeyNotFoundError(Exception):
 
 class AccountLimitError(Exception):
     """A self-service action exceeds an account limit."""
+
+
+class InvalidEmailError(Exception):
+    """The submitted email address is not well-formed."""
 
 
 @dataclass(frozen=True)
@@ -124,11 +143,38 @@ def build_github_login(auth_client: SupabaseAuthClient) -> tuple[str, str]:
     return url, verifier
 
 
+def is_valid_email(email: str) -> bool:
+    return bool(_EMAIL_PATTERN.match(email)) and len(email) <= 254
+
+
+async def request_email_login(auth_client: SupabaseAuthClient, *, email: str) -> str:
+    """Sends a magic-link sign-in email; returns the code_verifier for the
+    caller to stash in the same short-lived cookie the GitHub flow uses.
+
+    Always succeeds from the caller's point of view for a well-formed email,
+    even if the address doesn't exist -- Supabase itself doesn't reveal
+    whether an account exists, and neither do we.
+    """
+    if not is_valid_email(email):
+        raise InvalidEmailError("must be a valid email address")
+    verifier, challenge = generate_pkce_pair()
+    redirect_to = f"{public_base_url()}/v1/auth/callback"
+    await auth_client.request_magic_link(
+        email=email, redirect_to=redirect_to, code_challenge=challenge
+    )
+    return verifier
+
+
 def _display_name(user: dict[str, Any], session: AuthSession) -> str:
     metadata = user.get("user_metadata") or {}
     return str(
         metadata.get("user_name") or metadata.get("full_name") or session.email or session.user_id
     )
+
+
+def _provider_of(user: dict[str, Any]) -> str:
+    app_metadata = user.get("app_metadata") or {}
+    return str(app_metadata.get("provider") or "unknown")
 
 
 async def _ensure_customer(
@@ -154,12 +200,12 @@ async def _ensure_customer(
         customer_id=account.customer_id,
         api_key_id=None,
         action="account.signup",
-        metadata={"provider": "github"},
+        metadata={"provider": _provider_of(user)},
     )
     return account
 
 
-async def complete_github_login(
+async def complete_login(
     *,
     auth_client: SupabaseAuthClient,
     supabase_client: SupabaseClient,
@@ -167,8 +213,9 @@ async def complete_github_login(
     response: Response,
     code: str,
 ) -> CustomerAccount:
-    """Validates the OAuth callback, exchanges the code, provisions the
-    customer record on first login, and sets session cookies on `response`.
+    """Completes either login method (GitHub OAuth or email magic link) --
+    both redirect the browser to this same code-exchange step. Provisions the
+    customer record on first login and sets session cookies on `response`.
 
     No `state` round trip is checked here: Supabase Auth manages its own
     `state` internally between itself and the provider (see
@@ -191,7 +238,7 @@ async def complete_github_login(
         customer_id=account.customer_id,
         api_key_id=None,
         action="account.login",
-        metadata={"provider": "github"},
+        metadata={"provider": _provider_of(user)},
     )
     return account
 

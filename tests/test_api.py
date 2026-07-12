@@ -762,6 +762,95 @@ def test_github_login_is_rate_limited_per_ip():
     assert blocked.json()["error"]["code"] == "login_rate_limited"
 
 
+def test_email_login_returns_503_when_supabase_not_configured():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "auth_not_configured"
+
+
+def test_email_login_rejects_malformed_email():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.post("/v1/auth/email/login", json={"email": "not-an-email"})
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "invalid_email"
+    assert backend.otp_requests == []
+
+
+def test_email_login_returns_503_when_supabase_send_fails():
+    config = _supabase_config()
+
+    async def broken_otp_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    auth_client = SupabaseAuthClient(config, transport=httpx.MockTransport(broken_otp_handler))
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    supabase_client = SupabaseClient(config, transport=FakeSupabaseBackend().transport())
+    app = create_app(fmp_client=fmp, supabase_client=supabase_client, auth_client=auth_client)
+
+    with TestClient(app) as test_client:
+        response = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "email_login_failed"
+
+
+def test_email_login_sends_magic_link_and_sets_verifier_cookie():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.post("/v1/auth/email/login", json={"email": "customer@example.com"})
+    assert response.status_code == 200
+    assert response.json() == {"sent": True}
+    assert "pt_oauth_verifier" in response.cookies
+    assert len(backend.otp_requests) == 1
+    assert backend.otp_requests[0]["email"] == "customer@example.com"
+
+
+def test_email_and_github_login_share_the_same_rate_limit_bucket():
+    """Both login entry points are meant to share one per-IP daily budget."""
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        for _ in range(LOGIN_ATTEMPTS_DAILY_LIMIT):
+            response = test_client.get("/v1/auth/github/login", follow_redirects=False)
+            assert response.status_code == 302
+        blocked = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "login_rate_limited"
+    assert backend.otp_requests == []
+
+
+def test_email_magic_link_completes_login_with_email_provider_recorded():
+    """Simulates the user clicking the emailed magic link: Supabase's own
+    /auth/v1/verify would redirect the browser here with ?code=..., the same
+    as the GitHub flow, after the customer already requested the email."""
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "magic-code", user_id="email-user-1", email="customer@example.com", provider="email"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        login_resp = test_client.post(
+            "/v1/auth/email/login", json={"email": "customer@example.com"}
+        )
+        assert login_resp.status_code == 200
+
+        callback_resp = test_client.get("/v1/auth/callback?code=magic-code", follow_redirects=False)
+        assert callback_resp.status_code == 302
+
+        me = test_client.get("/v1/auth/me")
+
+    assert me.status_code == 200
+    body = me.json()
+    assert body["email"] == "customer@example.com"
+    # no GitHub user_name -- display name falls back to the email address
+    assert body["name"] == "customer@example.com"
+    assert len(backend.customers) == 1
+    signup_events = [e for e in backend.audit_events if e["action"] == "account.signup"]
+    login_events = [e for e in backend.audit_events if e["action"] == "account.login"]
+    assert signup_events[0]["metadata"]["provider"] == "email"
+    assert login_events[0]["metadata"]["provider"] == "email"
+
+
 def test_github_callback_rejects_missing_verifier_cookie():
     """Hitting the callback without ever visiting /v1/auth/github/login first
     (no pt_oauth_verifier cookie) must not authenticate anyone."""

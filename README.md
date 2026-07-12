@@ -167,12 +167,18 @@ python scripts/report_usage.py --limit 50
 Only the generated key hash is stored. The full key is printed once and should
 be copied into the customer's secret manager.
 
-### Customer sign-in with GitHub (self-service API keys)
+### Customer sign-in with GitHub or email (self-service API keys)
 
-Phase 6 lets a customer sign in with GitHub and generate/manage their own API
-keys from the website, instead of only through the admin script above. Human
-login sessions are a separate credential class from `X-API-Key` machine auth —
-a login session is never usable as an API key.
+Phase 6 lets a customer sign in — with GitHub or a one-time email link — and
+generate/manage their own API keys from the website, instead of only through
+the admin script above. Human login sessions are a separate credential class
+from `X-API-Key` machine auth — a login session is never usable as an API key.
+
+Both methods share the same PKCE code-exchange completion: GitHub's authorize
+redirect and Supabase's magic-link verification both land on
+`{PUBLIC_BASE_URL}/v1/auth/callback?code=...`, so the setup below (redirect
+URL, `PUBLIC_BASE_URL`) covers both — there's no separate callback to
+register for email.
 
 1. Run `supabase/migrations/002_phase6_customer_login.sql` (after `001`).
 2. Create a GitHub OAuth App at
@@ -182,7 +188,9 @@ a login session is never usable as an API key.
    https://YOUR-PROJECT-REF.supabase.co/auth/v1/callback
    ```
 3. In the Supabase dashboard: **Authentication → Providers → GitHub** — enable
-   it and paste the GitHub OAuth App's Client ID and Client Secret.
+   it and paste the GitHub OAuth App's Client ID and Client Secret. Email
+   sign-in needs no separate provider setup — Supabase's built-in email OTP
+   provider is on by default.
 4. In the Supabase dashboard: **Authentication → URL Configuration → Redirect
    URLs** — add `{PUBLIC_BASE_URL}/v1/auth/callback` for every environment
    (e.g. `http://127.0.0.1:8000/v1/auth/callback` for local dev, and your
@@ -196,9 +204,20 @@ dashboard, and the existing `SUPABASE_SERVICE_ROLE_KEY` doubles as the
 `apikey` header Supabase Auth requires; it never reaches the browser.
 
 Once configured, a customer visits `/`, opens **Your account**, signs in with
-GitHub, and can create/label/revoke up to 5 active keys — each fixed to the
-`valuation:read` scope and a 100/day quota. The admin script remains the path
-for support-issued keys needing a custom quota or scope.
+GitHub or their email, and can create/label/revoke up to 5 active keys — each
+fixed to the `valuation:read` scope and a 100/day quota. The admin script
+remains the path for support-issued keys needing a custom quota or scope.
+
+**Email sending in production:** Supabase's default built-in email service is
+rate-limited (a few emails per hour on the free tier) and meant for
+development/testing, not production customer traffic. Before relying on email
+sign-in for real customers, configure a custom SMTP provider under
+**Authentication → Settings → SMTP Settings** in the Supabase dashboard.
+
+**Note:** a customer who signs in with GitHub and later with email (or vice
+versa) using the same address currently gets **two separate accounts** —
+Supabase identity linking across providers isn't wired up yet (tracked in
+`IMPLEMENTATION_PLAN.md` Phase 6).
 
 ### Run the API server
 

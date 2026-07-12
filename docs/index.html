@@ -748,14 +748,24 @@ FMP_API_KEY=your-key-here</code></pre>
 
 <section id="account">
   <h2>Your account</h2>
-  <p>Sign in with GitHub to generate your own API key instantly — no waiting on an
+  <p>Sign in to generate your own API key instantly — no waiting on an
   operator. Keys you create here are scoped to your account only, and you can label,
   list, and revoke them at any time.</p>
 
   <div id="account-error" class="note" hidden></div>
+  <div id="account-email-sent" class="note tip" hidden></div>
 
   <div id="account-signed-out">
     <a id="account-signin" class="run" href="/v1/auth/github/login">Sign in with GitHub</a>
+
+    <p class="hint" style="margin: 16px 0 8px;">Or sign in with a one-time link sent to your email:</p>
+    <div class="grid">
+      <div class="field">
+        <label for="account-email-input">Email</label>
+        <input id="account-email-input" type="email" placeholder="you@example.com" autocomplete="email">
+      </div>
+    </div>
+    <p><button id="account-email-send" type="button" class="run">Send sign-in link</button></p>
   </div>
 
   <div id="account-signed-in" class="builder" hidden>
@@ -1558,6 +1568,40 @@ FMP_API_KEY=your-key-here</code></pre>
     window.location.reload();
   }
 
+  function friendlyEmailLoginError(code) {
+    var messages = {
+      invalid_email: "Enter a valid email address.",
+      login_rate_limited: "Too many sign-in attempts. Please try again later.",
+      auth_not_configured: "Sign-in isn't available on this deployment yet.",
+      email_login_failed: "Could not send the sign-in email. Please try again shortly."
+    };
+    return messages[code] || "Could not send the sign-in email. Please try again.";
+  }
+
+  async function sendEmailLogin() {
+    var email = $("account-email-input").value.trim();
+    var button = $("account-email-send");
+    button.disabled = true;
+    try {
+      var response = await fetch("/v1/auth/email/login", {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email: email })
+      });
+      var body = await response.json();
+      if (!response.ok) {
+        showError(friendlyEmailLoginError(body.error && body.error.code));
+        return;
+      }
+      var box = $("account-email-sent");
+      box.textContent = "Check " + email + " for a sign-in link. It expires in 10 minutes.";
+      box.hidden = false;
+    } finally {
+      button.disabled = false;
+    }
+  }
+
   async function init() {
     var params = new URLSearchParams(window.location.search);
     var loginError = params.get("login_error");
@@ -1585,6 +1629,7 @@ FMP_API_KEY=your-key-here</code></pre>
 
   $("account-create-key").addEventListener("click", createKey);
   $("account-signout").addEventListener("click", signOut);
+  $("account-email-send").addEventListener("click", sendEmailLogin);
   init();
 })();
 </script>

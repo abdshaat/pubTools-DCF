@@ -317,9 +317,10 @@ def _session_from_token_payload(payload: Any) -> AuthSession:
 
 
 class SupabaseAuthClient:
-    """Supabase Auth (GoTrue) calls for the GitHub sign-in flow: building the
-    authorize URL, exchanging a PKCE code, refreshing, fetching the current
-    user, and logout. Never used for the machine `X-API-Key` auth path."""
+    """Supabase Auth (GoTrue) calls for customer sign-in: building the GitHub
+    OAuth authorize URL, requesting an email magic link, exchanging a PKCE
+    code (shared by both flows), refreshing, fetching the current user, and
+    logout. Never used for the machine `X-API-Key` auth path."""
 
     def __init__(
         self,
@@ -355,6 +356,26 @@ class SupabaseAuthClient:
             }
         )
         return f"{self._config.url}/auth/v1/authorize?{query}"
+
+    async def request_magic_link(
+        self, *, email: str, redirect_to: str, code_challenge: str
+    ) -> None:
+        """Sends a one-time sign-in email. The link in that email points at
+        Supabase's own `/auth/v1/verify`, which -- because we supplied a PKCE
+        challenge -- redirects the browser to `redirect_to?code=...` after
+        verifying, landing on the same callback/exchange path as GitHub."""
+        response = await self._client.post(
+            "/auth/v1/otp",
+            params={"redirect_to": redirect_to},
+            json={
+                "email": email,
+                "create_user": True,
+                "code_challenge": code_challenge,
+                "code_challenge_method": "s256",
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseAuthError("failed to send the sign-in email")
 
     async def exchange_code(self, *, auth_code: str, code_verifier: str) -> AuthSession:
         response = await self._client.post(
