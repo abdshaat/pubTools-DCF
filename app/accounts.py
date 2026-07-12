@@ -27,7 +27,6 @@ from .supabase import AuthSession, SupabaseAuthClient, SupabaseAuthError, Supaba
 
 SESSION_COOKIE = "pt_session"
 REFRESH_COOKIE = "pt_refresh"
-OAUTH_STATE_COOKIE = "pt_oauth_state"
 OAUTH_VERIFIER_COOKIE = "pt_oauth_verifier"
 
 OAUTH_COOKIE_MAX_AGE = 600  # 10 minutes to complete the GitHub redirect round trip
@@ -41,7 +40,7 @@ MAX_SELF_SERVICE_KEYS_PER_CUSTOMER = 5
 
 
 class AccountAuthError(Exception):
-    """No valid login session (missing, expired, or CSRF-state mismatch)."""
+    """No valid login session (missing or expired)."""
 
 
 class AccountKeyNotFoundError(Exception):
@@ -76,32 +75,18 @@ def generate_pkce_pair() -> tuple[str, str]:
     return verifier, challenge
 
 
-def generate_state() -> str:
-    return secrets.token_urlsafe(24)
-
-
-def set_oauth_cookies(response: Response, *, state: str, verifier: str) -> None:
-    secure = _cookies_secure()
-    response.set_cookie(
-        OAUTH_STATE_COOKIE,
-        state,
-        max_age=OAUTH_COOKIE_MAX_AGE,
-        httponly=True,
-        secure=secure,
-        samesite="lax",
-    )
+def set_oauth_verifier_cookie(response: Response, *, verifier: str) -> None:
     response.set_cookie(
         OAUTH_VERIFIER_COOKIE,
         verifier,
         max_age=OAUTH_COOKIE_MAX_AGE,
         httponly=True,
-        secure=secure,
+        secure=_cookies_secure(),
         samesite="lax",
     )
 
 
-def clear_oauth_cookies(response: Response) -> None:
-    response.delete_cookie(OAUTH_STATE_COOKIE)
+def clear_oauth_verifier_cookie(response: Response) -> None:
     response.delete_cookie(OAUTH_VERIFIER_COOKIE)
 
 
@@ -130,14 +115,13 @@ def clear_session_cookies(response: Response) -> None:
     response.delete_cookie(REFRESH_COOKIE)
 
 
-def build_github_login(auth_client: SupabaseAuthClient) -> tuple[str, str, str]:
-    """Returns (authorize_url, state, code_verifier) for the login route to
-    hand to the browser and stash in short-lived cookies."""
-    state = generate_state()
+def build_github_login(auth_client: SupabaseAuthClient) -> tuple[str, str]:
+    """Returns (authorize_url, code_verifier) for the login route to hand to
+    the browser and stash in a short-lived cookie."""
     verifier, challenge = generate_pkce_pair()
     redirect_to = f"{public_base_url()}/v1/auth/callback"
-    url = auth_client.authorize_url(redirect_to=redirect_to, code_challenge=challenge, state=state)
-    return url, state, verifier
+    url = auth_client.authorize_url(redirect_to=redirect_to, code_challenge=challenge)
+    return url, verifier
 
 
 def _display_name(user: dict[str, Any], session: AuthSession) -> str:
@@ -182,14 +166,20 @@ async def complete_github_login(
     request: Request,
     response: Response,
     code: str,
-    state: str,
 ) -> CustomerAccount:
     """Validates the OAuth callback, exchanges the code, provisions the
-    customer record on first login, and sets session cookies on `response`."""
-    cookie_state = request.cookies.get(OAUTH_STATE_COOKIE)
+    customer record on first login, and sets session cookies on `response`.
+
+    No `state` round trip is checked here: Supabase Auth manages its own
+    `state` internally between itself and the provider (see
+    SupabaseAuthClient.authorize_url), so there is nothing of ours to compare
+    it against. The `code_verifier` cookie is what actually protects this
+    exchange -- PKCE makes the token exchange fail unless the verifier
+    matches the challenge the code was issued for.
+    """
     verifier = request.cookies.get(OAUTH_VERIFIER_COOKIE)
-    clear_oauth_cookies(response)
-    if not cookie_state or not verifier or not secrets.compare_digest(cookie_state, state):
+    clear_oauth_verifier_cookie(response)
+    if not verifier:
         raise AccountAuthError("invalid or expired sign-in attempt")
 
     session = await auth_client.exchange_code(auth_code=code, code_verifier=verifier)

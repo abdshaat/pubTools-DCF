@@ -339,14 +339,19 @@ class SupabaseAuthClient:
     async def aclose(self) -> None:
         await self._client.aclose()
 
-    def authorize_url(self, *, redirect_to: str, code_challenge: str, state: str) -> str:
+    def authorize_url(self, *, redirect_to: str, code_challenge: str) -> str:
+        # `state` is deliberately omitted: Supabase Auth manages it internally
+        # to correlate its own round trip with the provider. A caller-supplied
+        # `state` is forwarded to the provider but then fails Supabase's own
+        # callback validation (`bad_oauth_state`). PKCE's code_verifier/
+        # code_challenge binding already gives us the CSRF protection a
+        # custom state parameter would otherwise be for.
         query = urlencode(
             {
                 "provider": "github",
                 "redirect_to": redirect_to,
                 "code_challenge": code_challenge,
                 "code_challenge_method": "s256",
-                "state": state,
             }
         )
         return f"{self._config.url}/auth/v1/authorize?{query}"

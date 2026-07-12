@@ -721,11 +721,8 @@ def _login(test_client: TestClient, *, code: str) -> None:
     `test_client`'s own cookie jar, same as a real browser."""
     login_resp = test_client.get("/v1/auth/github/login", follow_redirects=False)
     assert login_resp.status_code == 302
-    state = parse_qs(urlparse(login_resp.headers["location"]).query)["state"][0]
 
-    callback_resp = test_client.get(
-        f"/v1/auth/callback?code={code}&state={state}", follow_redirects=False
-    )
+    callback_resp = test_client.get(f"/v1/auth/callback?code={code}", follow_redirects=False)
     assert callback_resp.status_code == 302
 
 
@@ -737,7 +734,7 @@ def test_github_login_returns_503_when_supabase_not_configured():
     assert response.json()["error"]["code"] == "auth_not_configured"
 
 
-def test_github_login_redirects_with_pkce_and_state_cookies():
+def test_github_login_redirects_with_pkce_verifier_cookie():
     backend = FakeSupabaseBackend()
     with TestClient(_accounts_app(backend)) as test_client:
         response = test_client.get("/v1/auth/github/login", follow_redirects=False)
@@ -748,7 +745,9 @@ def test_github_login_redirects_with_pkce_and_state_cookies():
     query = parse_qs(urlparse(location).query)
     assert query["provider"] == ["github"]
     assert query["code_challenge_method"] == ["s256"]
-    assert "pt_oauth_state" in response.cookies
+    # no `state` sent -- Supabase Auth manages it internally; a caller-supplied
+    # value breaks its own callback validation (bad_oauth_state).
+    assert "state" not in query
     assert "pt_oauth_verifier" in response.cookies
 
 
@@ -763,19 +762,20 @@ def test_github_login_is_rate_limited_per_ip():
     assert blocked.json()["error"]["code"] == "login_rate_limited"
 
 
-def test_github_callback_rejects_state_mismatch():
+def test_github_callback_rejects_missing_verifier_cookie():
+    """Hitting the callback without ever visiting /v1/auth/github/login first
+    (no pt_oauth_verifier cookie) must not authenticate anyone."""
     backend = FakeSupabaseBackend()
     backend.register_login_code(
         "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
     )
     with TestClient(_accounts_app(backend)) as test_client:
-        test_client.get("/v1/auth/github/login", follow_redirects=False)
         response = test_client.get(
-            "/v1/auth/callback?code=good-code&state=not-the-real-state",
+            "/v1/auth/callback?code=good-code",
             follow_redirects=False,
         )
         assert response.status_code == 302
-        assert "login_error=invalid_state" in response.headers["location"]
+        assert "login_error=expired_attempt" in response.headers["location"]
         me = test_client.get("/v1/auth/me")
     assert me.status_code == 401
 
@@ -791,7 +791,7 @@ def test_github_callback_redirects_on_access_denied():
 def test_github_callback_returns_error_when_supabase_not_configured():
     fmp = FMPClient(api_key="test-key", transport=fixture_transport())
     with TestClient(create_app(fmp_client=fmp)) as test_client:
-        response = test_client.get("/v1/auth/callback?code=x&state=y", follow_redirects=False)
+        response = test_client.get("/v1/auth/callback?code=x", follow_redirects=False)
     assert response.status_code == 302
     assert "login_error=auth_not_configured" in response.headers["location"]
 
@@ -818,11 +818,8 @@ def test_github_callback_signin_failure_redirects_on_supabase_error():
     )
 
     with TestClient(app) as test_client:
-        login_resp = test_client.get("/v1/auth/github/login", follow_redirects=False)
-        state = parse_qs(urlparse(login_resp.headers["location"]).query)["state"][0]
-        response = test_client.get(
-            f"/v1/auth/callback?code=good-code&state={state}", follow_redirects=False
-        )
+        test_client.get("/v1/auth/github/login", follow_redirects=False)
+        response = test_client.get("/v1/auth/callback?code=good-code", follow_redirects=False)
     assert response.status_code == 302
     assert "login_error=signin_failed" in response.headers["location"]
 

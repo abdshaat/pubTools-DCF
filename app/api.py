@@ -43,7 +43,7 @@ from .accounts import (
     list_keys,
     public_base_url,
     revoke_key,
-    set_oauth_cookies,
+    set_oauth_verifier_cookie,
     set_session_cookies,
 )
 from .auth import VALUATION_SCOPE, APIKeyAuthenticator, AuthFailure, AuthFailureReason
@@ -511,23 +511,21 @@ def create_app(
                 code="login_rate_limited",
                 message="Too many sign-in attempts. Try again later.",
             )
-        url, state, verifier = build_github_login(auth_client)
+        url, verifier = build_github_login(auth_client)
         response = RedirectResponse(url=url, status_code=302)
-        set_oauth_cookies(response, state=state, verifier=verifier)
+        set_oauth_verifier_cookie(response, verifier=verifier)
         return response
 
     @app.get("/v1/auth/callback", include_in_schema=False)
     async def github_callback(
         request: Request,
         code: str | None = None,
-        state: str | None = None,
         error: str | None = None,
     ) -> RedirectResponse:
         base = public_base_url()
 
         def error_redirect(reason: str) -> RedirectResponse:
             resp = RedirectResponse(url=f"{base}/?login_error={reason}", status_code=302)
-            resp.delete_cookie("pt_oauth_state")
             resp.delete_cookie("pt_oauth_verifier")
             return resp
 
@@ -535,7 +533,7 @@ def create_app(
         supabase_client = request.app.state.supabase_client
         if auth_client is None or supabase_client is None:
             return error_redirect("auth_not_configured")
-        if error or not code or not state:
+        if error or not code:
             return error_redirect("access_denied" if error else "invalid_request")
 
         response = RedirectResponse(url=f"{base}/", status_code=302)
@@ -546,10 +544,9 @@ def create_app(
                 request=request,
                 response=response,
                 code=code,
-                state=state,
             )
         except AccountAuthError:
-            return error_redirect("invalid_state")
+            return error_redirect("expired_attempt")
         except SupabaseError:
             return error_redirect("signin_failed")
         return response

@@ -19,7 +19,6 @@ from app.accounts import (
     build_github_login,
     create_key,
     generate_pkce_pair,
-    generate_state,
     get_current_customer,
     list_keys,
     revoke_key,
@@ -53,17 +52,16 @@ def test_generate_pkce_pair_produces_a_valid_s256_challenge():
     assert "=" not in challenge
 
 
-def test_generate_state_is_random():
-    assert generate_state() != generate_state()
-
-
 def test_build_github_login_url_has_expected_params(monkeypatch):
     monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
     auth_client = SupabaseAuthClient(_config())
-    url, state, verifier = build_github_login(auth_client)
+    url, verifier = build_github_login(auth_client)
     assert url.startswith("https://example.supabase.co/auth/v1/authorize?")
     assert "provider=github" in url
-    assert f"state={state}" in url
+    # `state` is deliberately not sent -- Supabase Auth manages it internally
+    # and a caller-supplied value breaks its own callback validation
+    # (bad_oauth_state).
+    assert "state=" not in url
     assert "redirect_to=http%3A%2F%2F127.0.0.1%3A8000%2Fv1%2Fauth%2Fcallback" in url
     assert "code_challenge_method=s256" in url
     assert len(verifier) >= 43
