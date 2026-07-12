@@ -27,6 +27,7 @@ see IMPLEMENTATION_PLAN.md Phase 6).
 import asyncio
 import base64
 import hashlib
+import hmac
 import os
 import re
 import secrets
@@ -45,6 +46,8 @@ _EMAIL_PATTERN = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 SESSION_COOKIE = "pt_session"
 REFRESH_COOKIE = "pt_refresh"
 OAUTH_VERIFIER_COOKIE = "pt_oauth_verifier"
+CSRF_COOKIE = "pt_csrf"
+CSRF_HEADER = "X-CSRF-Token"
 
 OAUTH_COOKIE_MAX_AGE = 600  # 10 minutes to complete the GitHub redirect round trip
 REFRESH_COOKIE_MAX_AGE = 60 * 60 * 24 * 30  # 30 days
@@ -134,6 +137,33 @@ def set_session_cookies(response: Response, session: AuthSession) -> None:
 def clear_session_cookies(response: Response) -> None:
     response.delete_cookie(SESSION_COOKIE)
     response.delete_cookie(REFRESH_COOKIE)
+
+
+def generate_csrf_token() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def set_csrf_cookie(response: Response, *, token: str | None = None) -> str:
+    token = token or generate_csrf_token()
+    response.set_cookie(
+        CSRF_COOKIE,
+        token,
+        max_age=REFRESH_COOKIE_MAX_AGE,
+        httponly=False,
+        secure=_cookies_secure(),
+        samesite="lax",
+    )
+    return token
+
+
+def clear_csrf_cookie(response: Response) -> None:
+    response.delete_cookie(CSRF_COOKIE)
+
+
+def csrf_tokens_match(*, cookie_token: str | None, header_token: str | None) -> bool:
+    if not cookie_token or not header_token:
+        return False
+    return hmac.compare_digest(cookie_token, header_token)
 
 
 def build_github_login(auth_client: SupabaseAuthClient) -> tuple[str, str]:
@@ -236,6 +266,7 @@ async def complete_login(
     account = await _ensure_customer(supabase_client, session=session, user=user)
 
     set_session_cookies(response, session)
+    set_csrf_cookie(response)
     await supabase_client.record_audit_event(
         customer_id=account.customer_id,
         api_key_id=None,

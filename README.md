@@ -49,9 +49,18 @@ math (e.g. `terminal_growth >= wacc`) return 422 with per-field messages.
 
 Valuation requests are capped at **100 per API key per UTC day** by default.
 Calls made through the website use the same `/v1/valuations/{ticker}` endpoint
-and count toward the same key quota. Responses include `X-RateLimit-Limit`,
-`X-RateLimit-Remaining`, and `X-RateLimit-Reset`; exhausted callers receive
-`429` with `Retry-After`.
+and count toward the same key quota. Exhausted callers receive `429` with
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and
+`Retry-After`. Successful valuation responses deliberately omit per-caller
+quota headers because they are HTTP-cacheable and may be served from a shared
+cache.
+
+Valuation responses include an `ETag`. Revalidating with `If-None-Match` can
+return `304 Not Modified`, and a 304 does **not** count against the daily
+quota. If the request reaches the origin server, the app may still rebuild the
+valuation to decide whether the ETag matches; it is quota-free, not guaranteed
+provider/compute-free. A CDN/shared cache can avoid that origin work when it
+answers the conditional request itself.
 
 Production deployments should set `SUPABASE_URL` and
 `SUPABASE_SERVICE_ROLE_KEY`. When both are present, `/v1/valuations/{ticker}`
@@ -150,6 +159,7 @@ then set these Vercel server-side environment variables:
 ```bash
 SUPABASE_URL=https://your-project.supabase.co
 SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+API_KEY_HASH_PEPPER=long-random-server-side-secret
 ```
 
 Create an API key from a trusted terminal:
@@ -164,8 +174,10 @@ Report recent usage events:
 python scripts/report_usage.py --limit 50
 ```
 
-Only the generated key hash is stored. The full key is printed once and should
-be copied into the customer's secret manager.
+Only the generated key hash is stored. If `API_KEY_HASH_PEPPER` is set, newly
+created and rotated keys use a peppered, versioned HMAC-SHA256 hash; legacy
+unprefixed SHA-256 hashes still verify so existing keys keep working. The full
+key is printed once and should be copied into the customer's secret manager.
 
 ### Customer sign-in with GitHub or email (self-service API keys)
 

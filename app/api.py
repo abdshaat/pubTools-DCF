@@ -31,21 +31,27 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 
 from . import MODEL_VERSION
 from .accounts import (
+    CSRF_COOKIE,
+    CSRF_HEADER,
     LOGIN_ATTEMPTS_DAILY_LIMIT,
     AccountAuthError,
     AccountKeyNotFoundError,
     AccountLimitError,
+    CustomerAccount,
     InvalidEmailError,
     build_github_login,
+    clear_csrf_cookie,
     clear_session_cookies,
     complete_login,
     create_key,
+    csrf_tokens_match,
     get_current_customer,
     list_keys,
     public_base_url,
     request_email_login,
     revoke_key,
     rotate_key,
+    set_csrf_cookie,
     set_oauth_verifier_cookie,
     set_session_cookies,
 )
@@ -60,6 +66,13 @@ from .exceptions import (
     UnsupportedSectorError,
 )
 from .fundamentals import FundamentalsService
+from .http_cache import (
+    NO_STORE,
+    VALUATION_CACHE_CONTROL,
+    VALUATION_VARY,
+    compute_etag,
+    if_none_match_satisfied,
+)
 from .models import Assumptions
 from .providers.fmp import FileRawSink, FMPClient
 from .rate_limit import DailyRequestLimiter, RateLimitResult
@@ -75,6 +88,7 @@ from .schemas import (
     build_valuation_response,
 )
 from .supabase import (
+    AuthSession,
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
     SupabaseClient,
@@ -205,6 +219,7 @@ def _unauthenticated_account_response(request: Request) -> JSONResponse:
         request, status_code=401, code="not_signed_in", message="Not signed in."
     )
     clear_session_cookies(response)
+    clear_csrf_cookie(response)
     return response
 
 
@@ -288,14 +303,21 @@ def create_app(
     app.state.login_rate_limiter = DailyRequestLimiter(LOGIN_ATTEMPTS_DAILY_LIMIT)
 
     @app.middleware("http")
-    async def _request_id(request: Request, call_next: Any) -> JSONResponse:
+    async def _request_id(request: Request, call_next: Any) -> Response:
         request.state.request_id = str(uuid4())
-        rate_limit: RateLimitResult | None = None
+        # Set by the valuation route when a conditional request matched: a 304
+        # is "free" (no quota consumed, no usage event) per Phase 7.
+        request.state.is_not_modified = False
         principal = None
-        quota_consumed = False
-        rate_limited = False
+        identity = "anonymous"
+        limit = daily_rate_limit
         valuation_ticker = _valuation_ticker_from_path(request.url.path)
-        if request.method == "GET" and request.url.path.startswith("/v1/valuations/"):
+        is_valuation = request.method == "GET" and request.url.path.startswith("/v1/valuations/")
+
+        # --- Phase A: authenticate + NON-consuming quota peek (pre-flight) ---
+        # Auth and the over-limit gate must run before any fetch/compute. The
+        # actual quota *consume* is deferred to Phase B so a 304 stays free.
+        if is_valuation:
             try:
                 principal = await _resolve(
                     request.app.state.authenticator.authenticate(
@@ -328,16 +350,12 @@ def create_app(
                 else daily_rate_limit
             )
             try:
-                rate_limit = await _resolve(
-                    request.app.state.rate_limiter.check_and_increment(
-                        identity=identity,
-                        limit=limit,
-                    )
+                peek = await _resolve(
+                    request.app.state.rate_limiter.peek(identity=identity, limit=limit)
                 )
             except SupabaseError:
                 return _storage_error_response(request)
-            if not rate_limit.allowed:
-                rate_limited = True
+            if not peek.allowed:
                 response = JSONResponse(
                     status_code=429,
                     content={
@@ -350,8 +368,13 @@ def create_app(
                             "fields": [],
                         },
                     },
-                    headers=_rate_limit_headers(rate_limit),
+                    # Rate-limit headers stay ONLY on the 429 (never cached);
+                    # they are deliberately absent from cacheable valuation
+                    # responses so a shared cache can't leak one caller's quota
+                    # state to another.
+                    headers=_rate_limit_headers(peek),
                 )
+                response.headers["Cache-Control"] = NO_STORE
                 response.headers["X-Request-ID"] = request.state.request_id
                 response.headers.update(_SECURITY_HEADERS)
                 if request.app.state.usage_meter is not None:
@@ -367,25 +390,40 @@ def create_app(
                             rate_limited=True,
                         )
                 return response
-            quota_consumed = True
 
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers.update(_SECURITY_HEADERS)
-        if rate_limit is not None:
-            response.headers.update(_rate_limit_headers(rate_limit))
-        if request.app.state.usage_meter is not None and valuation_ticker is not None:
-            with suppress(SupabaseError):
-                await request.app.state.usage_meter.record(
-                    request_id=request.state.request_id,
-                    principal=principal,
-                    method=request.method,
-                    path=request.url.path,
-                    status_code=response.status_code,
-                    ticker=valuation_ticker,
-                    quota_consumed=quota_consumed,
-                    rate_limited=rate_limited,
+
+        # --- Phase B: consume quota + record usage (post-computation) ---
+        # A 304 is free. Every other valuation response (fresh 200 OR an error
+        # such as 404/422/502) consumes quota, preserving the deliberate
+        # "invalid requests count against the limit" behavior.
+        if is_valuation and not request.state.is_not_modified:
+            try:
+                await _resolve(
+                    request.app.state.rate_limiter.check_and_increment(
+                        identity=identity, limit=limit
+                    )
                 )
+            except SupabaseError:
+                # Fail closed: never serve a valuation we couldn't meter.
+                return _storage_error_response(request)
+            # Error responses on the valuation path must never be cached.
+            if response.status_code not in (200, 304):
+                response.headers["Cache-Control"] = NO_STORE
+            if request.app.state.usage_meter is not None and valuation_ticker is not None:
+                with suppress(SupabaseError):
+                    await request.app.state.usage_meter.record(
+                        request_id=request.state.request_id,
+                        principal=principal,
+                        method=request.method,
+                        path=request.url.path,
+                        status_code=response.status_code,
+                        ticker=valuation_ticker,
+                        quota_consumed=True,
+                        rate_limited=False,
+                    )
         return response
 
     # --- error mapping (see app/exceptions.py for the rationale) ---
@@ -480,12 +518,86 @@ def create_app(
 
     # --- routes ---
 
+    async def _account_context(
+        request: Request,
+    ) -> tuple[CustomerAccount, SupabaseClient, AuthSession | None] | JSONResponse:
+        auth_client = request.app.state.auth_client
+        supabase_client = request.app.state.supabase_client
+        if auth_client is None or supabase_client is None:
+            return _unauthenticated_account_response(request)
+        try:
+            account, refreshed = await get_current_customer(
+                auth_client=auth_client,
+                supabase_client=supabase_client,
+                request=request,
+            )
+        except (AccountAuthError, SupabaseError):
+            return _unauthenticated_account_response(request)
+        return account, supabase_client, refreshed
+
+    def _with_refreshed_session(
+        request: Request, response: JSONResponse, refreshed: AuthSession | None
+    ) -> JSONResponse:
+        if refreshed is not None:
+            set_session_cookies(response, refreshed)
+        if not request.cookies.get(CSRF_COOKIE):
+            set_csrf_cookie(response)
+        return response
+
+    def _csrf_error_response(request: Request) -> JSONResponse:
+        return _auth_error_response(
+            request,
+            status_code=403,
+            code="csrf_failed",
+            message="CSRF token is missing or invalid.",
+        )
+
+    def _require_csrf(request: Request) -> JSONResponse | None:
+        if csrf_tokens_match(
+            cookie_token=request.cookies.get(CSRF_COOKIE),
+            header_token=request.headers.get(CSRF_HEADER),
+        ):
+            return None
+        return _csrf_error_response(request)
+
+    def _account_key_not_found(request: Request) -> JSONResponse:
+        detail = "API key not found"
+        return _error(request, 404, detail, "account_key_not_found", detail)
+
+    def _auth_not_configured_response(request: Request) -> JSONResponse:
+        return _auth_error_response(
+            request,
+            status_code=503,
+            code="auth_not_configured",
+            message="Sign-in is not configured.",
+        )
+
+    async def _login_limit_response(request: Request) -> JSONResponse | None:
+        ip = request.client.host if request.client else "unknown"
+        result = await _resolve(
+            request.app.state.login_rate_limiter.check_and_increment(
+                identity=ip,
+                limit=LOGIN_ATTEMPTS_DAILY_LIMIT,
+            )
+        )
+        if result.allowed:
+            return None
+        return _auth_error_response(
+            request,
+            status_code=429,
+            code="login_rate_limited",
+            message="Too many sign-in attempts. Try again later.",
+        )
+
     @app.get("/", include_in_schema=False)
-    async def landing_page() -> FileResponse:
-        return FileResponse(
+    async def landing_page(request: Request) -> FileResponse:
+        response = FileResponse(
             FilePath(__file__).parent.parent / "docs" / "index.html",
             headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
         )
+        if not request.cookies.get(CSRF_COOKIE):
+            set_csrf_cookie(response)
+        return response
 
     # --- customer login (GitHub via Supabase Auth) and self-service keys ---
     # Human browser sessions here are a distinct credential class from the
@@ -496,25 +608,10 @@ def create_app(
     async def github_login(request: Request) -> Response:
         auth_client = request.app.state.auth_client
         if auth_client is None:
-            return _auth_error_response(
-                request,
-                status_code=503,
-                code="auth_not_configured",
-                message="Sign-in is not configured.",
-            )
-        ip = request.client.host if request.client else "unknown"
-        result = await _resolve(
-            request.app.state.login_rate_limiter.check_and_increment(
-                identity=ip, limit=LOGIN_ATTEMPTS_DAILY_LIMIT
-            )
-        )
-        if not result.allowed:
-            return _auth_error_response(
-                request,
-                status_code=429,
-                code="login_rate_limited",
-                message="Too many sign-in attempts. Try again later.",
-            )
+            return _auth_not_configured_response(request)
+        limited = await _login_limit_response(request)
+        if limited is not None:
+            return limited
         url, verifier = build_github_login(auth_client)
         response = RedirectResponse(url=url, status_code=302)
         set_oauth_verifier_cookie(response, verifier=verifier)
@@ -524,25 +621,13 @@ def create_app(
     async def email_login(request: Request, payload: EmailLoginRequest) -> Response:
         auth_client = request.app.state.auth_client
         if auth_client is None:
-            return _auth_error_response(
-                request,
-                status_code=503,
-                code="auth_not_configured",
-                message="Sign-in is not configured.",
-            )
-        ip = request.client.host if request.client else "unknown"
-        result = await _resolve(
-            request.app.state.login_rate_limiter.check_and_increment(
-                identity=ip, limit=LOGIN_ATTEMPTS_DAILY_LIMIT
-            )
-        )
-        if not result.allowed:
-            return _auth_error_response(
-                request,
-                status_code=429,
-                code="login_rate_limited",
-                message="Too many sign-in attempts. Try again later.",
-            )
+            return _auth_not_configured_response(request)
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
+        limited = await _login_limit_response(request)
+        if limited is not None:
+            return limited
         try:
             verifier = await request_email_login(auth_client, email=payload.email)
         except InvalidEmailError as exc:
@@ -593,27 +678,22 @@ def create_app(
 
     @app.get("/v1/auth/me", response_model=MeOut, include_in_schema=False)
     async def auth_me(request: Request) -> JSONResponse:
-        auth_client = request.app.state.auth_client
-        supabase_client = request.app.state.supabase_client
-        if auth_client is None or supabase_client is None:
-            return _unauthenticated_account_response(request)
-        try:
-            account, refreshed = await get_current_customer(
-                auth_client=auth_client, supabase_client=supabase_client, request=request
-            )
-        except (AccountAuthError, SupabaseError):
-            return _unauthenticated_account_response(request)
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        account, _, refreshed = context
         response = JSONResponse(
             content=MeOut(
                 customer_id=account.customer_id, email=account.email, name=account.name
             ).model_dump()
         )
-        if refreshed is not None:
-            set_session_cookies(response, refreshed)
-        return response
+        return _with_refreshed_session(request, response, refreshed)
 
     @app.post("/v1/auth/logout", include_in_schema=False)
     async def logout(request: Request) -> JSONResponse:
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
         auth_client = request.app.state.auth_client
         supabase_client = request.app.state.supabase_client
         access_token = request.cookies.get("pt_session")
@@ -632,29 +712,22 @@ def create_app(
             await auth_client.logout(access_token=access_token)
         response = JSONResponse(content={"signed_out": True})
         clear_session_cookies(response)
+        clear_csrf_cookie(response)
         return response
 
     @app.get("/v1/account/keys", response_model=AccountKeysOut, include_in_schema=False)
     async def list_account_keys(request: Request) -> JSONResponse:
-        auth_client = request.app.state.auth_client
-        supabase_client = request.app.state.supabase_client
-        if auth_client is None or supabase_client is None:
-            return _unauthenticated_account_response(request)
-        try:
-            account, refreshed = await get_current_customer(
-                auth_client=auth_client, supabase_client=supabase_client, request=request
-            )
-        except (AccountAuthError, SupabaseError):
-            return _unauthenticated_account_response(request)
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        account, supabase_client, refreshed = context
         rows = await list_keys(supabase_client, customer_id=account.customer_id)
         response = JSONResponse(
             content=AccountKeysOut(keys=[build_api_key_summary(row) for row in rows]).model_dump(
                 mode="json"
             )
         )
-        if refreshed is not None:
-            set_session_cookies(response, refreshed)
-        return response
+        return _with_refreshed_session(request, response, refreshed)
 
     @app.post(
         "/v1/account/keys",
@@ -663,16 +736,13 @@ def create_app(
         include_in_schema=False,
     )
     async def create_account_key(request: Request, payload: CreateKeyRequest) -> JSONResponse:
-        auth_client = request.app.state.auth_client
-        supabase_client = request.app.state.supabase_client
-        if auth_client is None or supabase_client is None:
-            return _unauthenticated_account_response(request)
-        try:
-            account, refreshed = await get_current_customer(
-                auth_client=auth_client, supabase_client=supabase_client, request=request
-            )
-        except (AccountAuthError, SupabaseError):
-            return _unauthenticated_account_response(request)
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
+        account, supabase_client, refreshed = context
         try:
             record, full_key = await create_key(
                 supabase_client, customer_id=account.customer_id, label=payload.label
@@ -686,31 +756,23 @@ def create_app(
                 mode="json"
             ),
         )
-        if refreshed is not None:
-            set_session_cookies(response, refreshed)
-        return response
+        return _with_refreshed_session(request, response, refreshed)
 
     @app.post("/v1/account/keys/{key_id}/revoke", include_in_schema=False)
     async def revoke_account_key(request: Request, key_id: str) -> JSONResponse:
-        auth_client = request.app.state.auth_client
-        supabase_client = request.app.state.supabase_client
-        if auth_client is None or supabase_client is None:
-            return _unauthenticated_account_response(request)
-        try:
-            account, refreshed = await get_current_customer(
-                auth_client=auth_client, supabase_client=supabase_client, request=request
-            )
-        except (AccountAuthError, SupabaseError):
-            return _unauthenticated_account_response(request)
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
+        account, supabase_client, refreshed = context
         try:
             await revoke_key(supabase_client, customer_id=account.customer_id, key_id=key_id)
         except AccountKeyNotFoundError:
-            detail = "API key not found"
-            return _error(request, 404, detail, "account_key_not_found", detail)
+            return _account_key_not_found(request)
         response = JSONResponse(content={"revoked": True})
-        if refreshed is not None:
-            set_session_cookies(response, refreshed)
-        return response
+        return _with_refreshed_session(request, response, refreshed)
 
     @app.post(
         "/v1/account/keys/{key_id}/rotate",
@@ -718,32 +780,26 @@ def create_app(
         include_in_schema=False,
     )
     async def rotate_account_key(request: Request, key_id: str) -> JSONResponse:
-        auth_client = request.app.state.auth_client
-        supabase_client = request.app.state.supabase_client
-        if auth_client is None or supabase_client is None:
-            return _unauthenticated_account_response(request)
-        try:
-            account, refreshed = await get_current_customer(
-                auth_client=auth_client, supabase_client=supabase_client, request=request
-            )
-        except (AccountAuthError, SupabaseError):
-            return _unauthenticated_account_response(request)
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
+        account, supabase_client, refreshed = context
         try:
             record, full_key = await rotate_key(
                 supabase_client, customer_id=account.customer_id, key_id=key_id
             )
         except AccountKeyNotFoundError:
-            detail = "API key not found"
-            return _error(request, 404, detail, "account_key_not_found", detail)
+            return _account_key_not_found(request)
         summary = build_api_key_summary(record)
         response = JSONResponse(
             content=ApiKeyCreatedOut(api_key=full_key, **summary.model_dump()).model_dump(
                 mode="json"
             )
         )
-        if refreshed is not None:
-            set_session_cookies(response, refreshed)
-        return response
+        return _with_refreshed_session(request, response, refreshed)
 
     @app.get(
         "/v1/valuations/{ticker}",
@@ -763,6 +819,7 @@ def create_app(
     )
     async def get_valuation(
         request: Request,
+        response: Response,
         ticker: str = Path(
             min_length=1,
             max_length=10,
@@ -799,7 +856,7 @@ def create_app(
                 "+/-0.5%). Pass false to omit it."
             ),
         ),
-    ) -> ValuationResponse:
+    ) -> ValuationResponse | Response:
         growth_values = _parse_revenue_growth(revenue_growth)
         assumptions = Assumptions(
             wacc=wacc,
@@ -813,13 +870,35 @@ def create_app(
         base = await request.app.state.fundamentals.get_base_financials(ticker)
         valuation = compute_dcf(base, assumptions)
         grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
-        return build_valuation_response(
+        payload = build_valuation_response(
             base,
             assumptions,
             valuation,
             grid,
             request_id=request.state.request_id,
         )
+
+        # HTTP caching (Phase 7): the ETag is derived from response *content*
+        # only (request_id/computed_at excluded), so equivalent requests share
+        # an ETag and any real change invalidates it automatically.
+        etag = compute_etag(payload)
+        if if_none_match_satisfied(request.headers.get("If-None-Match"), etag):
+            # Not modified: return a bodyless 304 and flag the middleware to
+            # skip quota consumption / usage metering for this "free" request.
+            request.state.is_not_modified = True
+            return Response(
+                status_code=304,
+                headers={
+                    "ETag": etag,
+                    "Cache-Control": VALUATION_CACHE_CONTROL,
+                    "Vary": VALUATION_VARY,
+                },
+            )
+
+        response.headers["ETag"] = etag
+        response.headers["Cache-Control"] = VALUATION_CACHE_CONTROL
+        response.headers["Vary"] = VALUATION_VARY
+        return payload
 
     @app.get("/health", include_in_schema=False)
     async def health() -> dict[str, str]:

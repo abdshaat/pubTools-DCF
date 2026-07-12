@@ -44,12 +44,10 @@ class DailyRequestLimiter:
         reset = datetime.combine(tomorrow, datetime.min.time(), tzinfo=UTC)
         return int(reset.timestamp())
 
-    def check_and_increment(
-        self,
-        *,
-        identity: str = "anonymous",
-        limit: int | None = None,
-    ) -> RateLimitResult:
+    def _prepare(self, limit: int | None) -> tuple[float, str, int, int, int]:
+        """Common setup for peek/consume: returns
+        (now, bucket, effective_limit, reset_epoch, retry_after) and prunes
+        counters from prior days so the dict never grows unbounded."""
         now = self._now()
         bucket = self._bucket_for(now)
         effective_limit = limit or self._limit
@@ -62,6 +60,35 @@ class DailyRequestLimiter:
 
         reset_epoch = self._reset_epoch_for(now)
         retry_after = max(1, reset_epoch - int(now))
+        return now, bucket, effective_limit, reset_epoch, retry_after
+
+    def peek(
+        self,
+        *,
+        identity: str = "anonymous",
+        limit: int | None = None,
+    ) -> RateLimitResult:
+        """Report current quota state WITHOUT consuming a request. Used as the
+        pre-flight gate (Phase 7): reject an already-over-limit caller before
+        any fetch/compute, while leaving the actual increment for after a
+        response is confirmed to be a fresh 200 (a 304 must stay free)."""
+        _, bucket, effective_limit, reset_epoch, retry_after = self._prepare(limit)
+        count = self._counts.get((identity, bucket), 0)
+        return RateLimitResult(
+            allowed=count < effective_limit,
+            limit=effective_limit,
+            remaining=max(effective_limit - count, 0),
+            reset_epoch=reset_epoch,
+            retry_after=retry_after,
+        )
+
+    def check_and_increment(
+        self,
+        *,
+        identity: str = "anonymous",
+        limit: int | None = None,
+    ) -> RateLimitResult:
+        _, bucket, effective_limit, reset_epoch, retry_after = self._prepare(limit)
         key = (identity, bucket)
         count = self._counts.get(key, 0)
         if count >= effective_limit:

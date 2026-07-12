@@ -2,18 +2,19 @@
 
 This is an admin-only helper. Run it from a trusted machine with
 SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY set. It prints the full API key once;
-only the SHA-256 hash is stored in Supabase.
+only a versioned hash is stored in Supabase.
 """
 
 import argparse
 import asyncio
-import hashlib
 import os
 import secrets
 import string
 from typing import Any
 
 import httpx
+
+from app.auth import APIKeyAuthenticator
 
 try:
     from dotenv import load_dotenv
@@ -33,10 +34,6 @@ def _required_env(name: str) -> str:
 def _generate_prefix() -> str:
     alphabet = string.ascii_lowercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(8))
-
-
-def _hash_secret(secret: str) -> str:
-    return hashlib.sha256(secret.encode("utf-8")).hexdigest()
 
 
 async def _post_returning(
@@ -95,7 +92,7 @@ async def _run(args: argparse.Namespace) -> int:
             {
                 "customer_id": customer_id,
                 "prefix": args.prefix,
-                "secret_hash": _hash_secret(full_key),
+                "secret_hash": APIKeyAuthenticator.hash_secret(full_key),
                 "scopes": args.scope,
                 "daily_quota": args.daily_quota,
                 "expires_at": args.expires_at,

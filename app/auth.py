@@ -1,17 +1,20 @@
 """API key authentication primitives.
 
-Keys are stored as SHA-256 hashes of the full presented secret. A short public
+Keys are stored as versioned hashes of the full presented secret. A short public
 prefix identifies the candidate record so the service never needs to compare a
 caller secret against every stored key.
 """
 
 import hashlib
 import hmac
+import os
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
 
 VALUATION_SCOPE = "valuation:read"
+LEGACY_SHA256_PREFIX = "sha256"
+PEPPERED_SHA256_PREFIX = "hmac-sha256-v1"
 
 
 class AuthFailureReason(StrEnum):
@@ -62,7 +65,29 @@ class APIKeyAuthenticator:
 
     @staticmethod
     def hash_secret(secret: str) -> str:
-        return hashlib.sha256(secret.encode("utf-8")).hexdigest()
+        encoded_secret = secret.encode("utf-8")
+        pepper = os.environ.get("API_KEY_HASH_PEPPER")
+        if pepper:
+            digest = hmac.new(pepper.encode("utf-8"), encoded_secret, hashlib.sha256).hexdigest()
+            return f"{PEPPERED_SHA256_PREFIX}:{digest}"
+        return f"{LEGACY_SHA256_PREFIX}:{hashlib.sha256(encoded_secret).hexdigest()}"
+
+    @staticmethod
+    def verify_secret(secret: str, stored_hash: str) -> bool:
+        encoded_secret = secret.encode("utf-8")
+        prefix, separator, digest = stored_hash.partition(":")
+        if separator and prefix == PEPPERED_SHA256_PREFIX:
+            pepper = os.environ.get("API_KEY_HASH_PEPPER")
+            if not pepper:
+                return False
+            expected = hmac.new(pepper.encode("utf-8"), encoded_secret, hashlib.sha256).hexdigest()
+        elif separator and prefix == LEGACY_SHA256_PREFIX:
+            expected = hashlib.sha256(encoded_secret).hexdigest()
+        else:
+            # Backward compatibility for hashes created before version prefixes.
+            digest = stored_hash
+            expected = hashlib.sha256(encoded_secret).hexdigest()
+        return hmac.compare_digest(expected, digest)
 
     @classmethod
     def record_from_secret(
@@ -115,8 +140,7 @@ class APIKeyAuthenticator:
 
         prefix, stripped = self.parse_presented_key(presented_key)
         record = self._records.get(prefix)
-        presented_hash = self.hash_secret(stripped)
-        if record is None or not hmac.compare_digest(presented_hash, record.secret_hash):
+        if record is None or not self.verify_secret(stripped, record.secret_hash):
             raise AuthFailure(AuthFailureReason.INVALID)
         if record.revoked:
             raise AuthFailure(AuthFailureReason.REVOKED)

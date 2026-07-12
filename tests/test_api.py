@@ -5,6 +5,7 @@ full stack (routing, validation, fetch, normalization, engine, response
 shaping, error mapping) is exercised without network or API key.
 """
 
+import hashlib
 import json
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
@@ -15,9 +16,10 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import MODEL_VERSION
-from app.accounts import LOGIN_ATTEMPTS_DAILY_LIMIT
+from app.accounts import CSRF_COOKIE, CSRF_HEADER, LOGIN_ATTEMPTS_DAILY_LIMIT
 from app.api import _default_raw_sink, create_app
-from app.auth import APIKeyAuthenticator
+from app.auth import APIKeyAuthenticator, APIKeyRecord
+from app.http_cache import VALUATION_CACHE_CONTROL
 from app.providers.fmp import FileRawSink, FMPClient
 from app.supabase import (
     SupabaseAPIKeyAuthenticator,
@@ -421,6 +423,47 @@ def test_authenticated_valuation_request_succeeds():
     assert response.json()["ticker"] == "AAPL"
 
 
+def test_api_key_hashes_are_versioned_and_legacy_hashes_still_verify(monkeypatch):
+    monkeypatch.delenv("API_KEY_HASH_PEPPER", raising=False)
+    key = "dcf_live_testsecret"
+    legacy_hash = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    versioned_hash = APIKeyAuthenticator.hash_secret(key)
+
+    assert versioned_hash.startswith("sha256:")
+    assert APIKeyAuthenticator.verify_secret(key, versioned_hash)
+    assert APIKeyAuthenticator.verify_secret(key, legacy_hash)
+    assert not APIKeyAuthenticator.verify_secret("dcf_live_wrong", versioned_hash)
+
+
+def test_api_key_hashing_uses_pepper_when_configured(monkeypatch):
+    key = "dcf_live_testsecret"
+    monkeypatch.setenv("API_KEY_HASH_PEPPER", "test-pepper")
+    peppered_hash = APIKeyAuthenticator.hash_secret(key)
+
+    assert peppered_hash.startswith("hmac-sha256-v1:")
+    assert APIKeyAuthenticator.verify_secret(key, peppered_hash)
+
+    monkeypatch.setenv("API_KEY_HASH_PEPPER", "different-pepper")
+    assert not APIKeyAuthenticator.verify_secret(key, peppered_hash)
+
+
+def test_legacy_unprefixed_api_key_hash_still_authenticates(monkeypatch):
+    monkeypatch.delenv("API_KEY_HASH_PEPPER", raising=False)
+    key = "dcf_live_testsecret"
+    legacy_record = APIKeyRecord(
+        key_id="customer-1",
+        customer_id="customer-1",
+        prefix="live",
+        secret_hash=hashlib.sha256(key.encode("utf-8")).hexdigest(),
+    )
+    auth = APIKeyAuthenticator([legacy_record], required=True)
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, authenticator=auth)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 200
+
+
 @pytest.mark.parametrize("header_value", [None, "", "not-a-key", "dcf_unknown_secret"])
 def test_missing_malformed_or_unknown_api_key_returns_401(header_value: str | None):
     key = "dcf_live_testsecret"
@@ -447,7 +490,10 @@ def test_missing_malformed_or_unknown_api_key_returns_401(header_value: str | No
     assert unauthorized.json()["error"]["code"] == "invalid_api_key"
     assert key not in unauthorized.text
     assert authorized.status_code == 200
-    assert authorized.headers["X-RateLimit-Remaining"] == "0"
+    # Phase 7: cacheable valuation responses carry an ETag and never leak the
+    # caller's per-key quota state via X-RateLimit-* headers.
+    assert authorized.headers["ETag"]
+    assert "X-RateLimit-Remaining" not in authorized.headers
 
 
 @pytest.mark.parametrize(
@@ -528,13 +574,15 @@ def test_valuation_requests_are_limited_per_day():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert first.status_code == 200
-    assert first.headers["X-RateLimit-Limit"] == "2"
-    assert first.headers["X-RateLimit-Remaining"] == "1"
     assert second.status_code == 200
-    assert second.headers["X-RateLimit-Remaining"] == "0"
+    # Phase 7: the per-caller quota headers live only on the 429 (never
+    # cached), not on the cacheable 200 responses.
+    assert "X-RateLimit-Limit" not in first.headers
+    assert "X-RateLimit-Remaining" not in second.headers
     assert blocked.status_code == 429
     assert blocked.headers["X-RateLimit-Limit"] == "2"
     assert blocked.headers["X-RateLimit-Remaining"] == "0"
+    assert blocked.headers["Cache-Control"] == "no-store"
     assert int(blocked.headers["Retry-After"]) > 0
     assert blocked.json()["error"]["code"] == "rate_limit_exceeded"
     assert blocked.json()["error"]["request_id"] == blocked.headers["X-Request-ID"]
@@ -571,7 +619,7 @@ def test_authenticated_keys_have_independent_daily_limits():
     assert first_allowed.status_code == 200
     assert first_blocked.status_code == 429
     assert second_allowed.status_code == 200
-    assert second_allowed.headers["X-RateLimit-Remaining"] == "0"
+    assert "X-RateLimit-Remaining" not in second_allowed.headers
 
 
 def test_supabase_auth_quota_and_usage_metering_are_used():
@@ -599,6 +647,10 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
         if request.url.path == "/rest/v1/api_keys" and request.method == "PATCH":
             calls.append(("last_used", json.loads(request.content)))
             return httpx.Response(204)
+        if request.url.path == "/rest/v1/daily_quota_counters" and request.method == "GET":
+            # Phase 7 pre-flight peek: read-only, must NOT increment.
+            calls.append(("peek", dict(request.url.params)))
+            return httpx.Response(200, json=[])
         if request.url.path == "/rest/v1/rpc/consume_daily_quota":
             calls.append(("quota", json.loads(request.content)))
             return httpx.Response(
@@ -636,12 +688,14 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
         response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
 
     assert response.status_code == 200
-    assert response.headers["X-RateLimit-Remaining"] == "99"
-    assert [name for name, _ in calls] == ["lookup", "last_used", "quota", "usage"]
-    quota_payload = calls[2][1]
+    # Phase 7 flow: auth (lookup + last_used), a non-consuming peek pre-flight,
+    # then consume + usage only after the fresh 200 is confirmed.
+    assert [name for name, _ in calls] == ["lookup", "last_used", "peek", "quota", "usage"]
+    assert "X-RateLimit-Remaining" not in response.headers
+    quota_payload = dict(calls)["quota"]
     assert quota_payload["p_subject_id"] == "key-1"
     assert quota_payload["p_limit"] == 100
-    usage_payload = calls[3][1]["p_event"]
+    usage_payload = dict(calls)["usage"]["p_event"]
     assert usage_payload["customer_id"] == "customer-1"
     assert usage_payload["api_key_id"] == "key-1"
     assert usage_payload["ticker"] == "AAPL"
@@ -659,7 +713,7 @@ def test_website_and_health_do_not_consume_valuation_limit():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert allowed.status_code == 200
-    assert allowed.headers["X-RateLimit-Remaining"] == "0"
+    assert "X-RateLimit-Remaining" not in allowed.headers
     assert blocked.status_code == 429
 
 
@@ -670,7 +724,10 @@ def test_invalid_valuation_requests_count_against_daily_limit():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert invalid.status_code == 422
-    assert invalid.headers["X-RateLimit-Remaining"] == "0"
+    # errors still consume quota (so the next request is blocked), but never
+    # carry the per-caller quota headers, and are never cacheable
+    assert "X-RateLimit-Remaining" not in invalid.headers
+    assert invalid.headers["Cache-Control"] == "no-store"
     assert blocked.status_code == 429
 
 
@@ -699,6 +756,7 @@ def test_root_serves_customer_landing_page():
     assert "connect-src 'self'" in csp
     assert "Run valuation" in response.text
     assert "/v1/valuations/" in response.text
+    assert CSRF_COOKIE in response.cookies
 
 
 # --- customer login (GitHub via Supabase Auth) and self-service keys ---
@@ -724,6 +782,16 @@ def _login(test_client: TestClient, *, code: str) -> None:
 
     callback_resp = test_client.get(f"/v1/auth/callback?code={code}", follow_redirects=False)
     assert callback_resp.status_code == 302
+
+
+def _csrf_headers(test_client: TestClient) -> dict[str, str]:
+    return {CSRF_HEADER: test_client.cookies[CSRF_COOKIE]}
+
+
+def _seed_csrf(test_client: TestClient) -> dict[str, str]:
+    response = test_client.get("/")
+    assert response.status_code == 200
+    return _csrf_headers(test_client)
 
 
 def test_github_login_returns_503_when_supabase_not_configured():
@@ -773,7 +841,11 @@ def test_email_login_returns_503_when_supabase_not_configured():
 def test_email_login_rejects_malformed_email():
     backend = FakeSupabaseBackend()
     with TestClient(_accounts_app(backend)) as test_client:
-        response = test_client.post("/v1/auth/email/login", json={"email": "not-an-email"})
+        response = test_client.post(
+            "/v1/auth/email/login",
+            json={"email": "not-an-email"},
+            headers=_seed_csrf(test_client),
+        )
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "invalid_email"
     assert backend.otp_requests == []
@@ -791,7 +863,11 @@ def test_email_login_returns_503_when_supabase_send_fails():
     app = create_app(fmp_client=fmp, supabase_client=supabase_client, auth_client=auth_client)
 
     with TestClient(app) as test_client:
-        response = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+        response = test_client.post(
+            "/v1/auth/email/login",
+            json={"email": "a@example.com"},
+            headers=_seed_csrf(test_client),
+        )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "email_login_failed"
 
@@ -799,12 +875,33 @@ def test_email_login_returns_503_when_supabase_send_fails():
 def test_email_login_sends_magic_link_and_sets_verifier_cookie():
     backend = FakeSupabaseBackend()
     with TestClient(_accounts_app(backend)) as test_client:
-        response = test_client.post("/v1/auth/email/login", json={"email": "customer@example.com"})
+        response = test_client.post(
+            "/v1/auth/email/login",
+            json={"email": "customer@example.com"},
+            headers=_seed_csrf(test_client),
+        )
     assert response.status_code == 200
     assert response.json() == {"sent": True}
     assert "pt_oauth_verifier" in response.cookies
     assert len(backend.otp_requests) == 1
     assert backend.otp_requests[0]["email"] == "customer@example.com"
+
+
+def test_email_login_requires_csrf_token():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        _seed_csrf(test_client)
+        missing = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+        mismatched = test_client.post(
+            "/v1/auth/email/login",
+            json={"email": "a@example.com"},
+            headers={CSRF_HEADER: "wrong-token"},
+        )
+
+    assert missing.status_code == 403
+    assert missing.json()["error"]["code"] == "csrf_failed"
+    assert mismatched.status_code == 403
+    assert backend.otp_requests == []
 
 
 def test_email_and_github_login_share_the_same_rate_limit_bucket():
@@ -814,7 +911,11 @@ def test_email_and_github_login_share_the_same_rate_limit_bucket():
         for _ in range(LOGIN_ATTEMPTS_DAILY_LIMIT):
             response = test_client.get("/v1/auth/github/login", follow_redirects=False)
             assert response.status_code == 302
-        blocked = test_client.post("/v1/auth/email/login", json={"email": "a@example.com"})
+        blocked = test_client.post(
+            "/v1/auth/email/login",
+            json={"email": "a@example.com"},
+            headers=_seed_csrf(test_client),
+        )
     assert blocked.status_code == 429
     assert blocked.json()["error"]["code"] == "login_rate_limited"
     assert backend.otp_requests == []
@@ -829,8 +930,11 @@ def test_email_magic_link_completes_login_with_email_provider_recorded():
         "magic-code", user_id="email-user-1", email="customer@example.com", provider="email"
     )
     with TestClient(_accounts_app(backend)) as test_client:
+        csrf_headers = _seed_csrf(test_client)
         login_resp = test_client.post(
-            "/v1/auth/email/login", json={"email": "customer@example.com"}
+            "/v1/auth/email/login",
+            json={"email": "customer@example.com"},
+            headers=csrf_headers,
         )
         assert login_resp.status_code == 200
 
@@ -991,13 +1095,33 @@ def test_logout_clears_session_cookies():
     )
     with TestClient(_accounts_app(backend)) as test_client:
         _login(test_client, code="good-code")
-        logout_resp = test_client.post("/v1/auth/logout")
+        logout_resp = test_client.post("/v1/auth/logout", headers=_csrf_headers(test_client))
         me_after = test_client.get("/v1/auth/me")
 
     assert logout_resp.status_code == 200
     assert logout_resp.json()["signed_out"] is True
     assert me_after.status_code == 401
     assert any(event["action"] == "account.logout" for event in backend.audit_events)
+
+
+def test_account_state_changes_require_csrf_token_after_login():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        missing = test_client.post("/v1/account/keys", json={})
+        mismatched = test_client.post(
+            "/v1/account/keys", json={}, headers={CSRF_HEADER: "wrong-token"}
+        )
+        logout_missing = test_client.post("/v1/auth/logout")
+
+    assert missing.status_code == 403
+    assert missing.json()["error"]["code"] == "csrf_failed"
+    assert mismatched.status_code == 403
+    assert logout_missing.status_code == 403
+    assert backend.keys == []
 
 
 def test_self_service_key_endpoints_require_session():
@@ -1029,7 +1153,9 @@ def test_self_service_keys_are_isolated_between_customers():
         _login(alice, code="code-alice")
         _login(bob, code="code-bob")
 
-        create_resp = alice.post("/v1/account/keys", json={"label": "alice-key"})
+        create_resp = alice.post(
+            "/v1/account/keys", json={"label": "alice-key"}, headers=_csrf_headers(alice)
+        )
         assert create_resp.status_code == 201
         alice_key = create_resp.json()
         assert alice_key["api_key"].startswith("dcf_")
@@ -1037,7 +1163,9 @@ def test_self_service_keys_are_isolated_between_customers():
         bob_list = bob.get("/v1/account/keys")
         assert bob_list.json()["keys"] == []
 
-        bob_revoke = bob.post(f"/v1/account/keys/{alice_key['id']}/revoke")
+        bob_revoke = bob.post(
+            f"/v1/account/keys/{alice_key['id']}/revoke", headers=_csrf_headers(bob)
+        )
         assert bob_revoke.status_code == 404
 
         alice_list = alice.get("/v1/account/keys")
@@ -1045,7 +1173,9 @@ def test_self_service_keys_are_isolated_between_customers():
         assert alice_list.json()["keys"][0]["revoked"] is False
         assert "api_key" not in alice_list.json()["keys"][0]
 
-        own_revoke = alice.post(f"/v1/account/keys/{alice_key['id']}/revoke")
+        own_revoke = alice.post(
+            f"/v1/account/keys/{alice_key['id']}/revoke", headers=_csrf_headers(alice)
+        )
         assert own_revoke.status_code == 200
         alice_list_after = alice.get("/v1/account/keys")
         assert alice_list_after.json()["keys"][0]["revoked"] is True
@@ -1065,9 +1195,11 @@ def test_bob_cannot_rotate_alices_key():
         _login(alice, code="code-alice")
         _login(bob, code="code-bob")
 
-        alice_key = alice.post("/v1/account/keys", json={}).json()
+        alice_key = alice.post("/v1/account/keys", json={}, headers=_csrf_headers(alice)).json()
 
-        bob_rotate = bob.post(f"/v1/account/keys/{alice_key['id']}/rotate")
+        bob_rotate = bob.post(
+            f"/v1/account/keys/{alice_key['id']}/rotate", headers=_csrf_headers(bob)
+        )
         assert bob_rotate.status_code == 404
 
         # unaffected: alice's original key still authenticates
@@ -1084,10 +1216,16 @@ def test_rotate_account_key_issues_a_new_secret_and_invalidates_the_old_one():
     )
     with TestClient(_accounts_app(backend)) as test_client:
         _login(test_client, code="good-code")
-        created = test_client.post("/v1/account/keys", json={"label": "my key"}).json()
+        created = test_client.post(
+            "/v1/account/keys",
+            json={"label": "my key"},
+            headers=_csrf_headers(test_client),
+        ).json()
         old_key = created["api_key"]
 
-        rotate_resp = test_client.post(f"/v1/account/keys/{created['id']}/rotate")
+        rotate_resp = test_client.post(
+            f"/v1/account/keys/{created['id']}/rotate", headers=_csrf_headers(test_client)
+        )
         assert rotate_resp.status_code == 200
         rotated = rotate_resp.json()
         new_key = rotated["api_key"]
@@ -1114,10 +1252,20 @@ def test_rotate_account_key_returns_404_for_revoked_key():
     )
     with TestClient(_accounts_app(backend)) as test_client:
         _login(test_client, code="good-code")
-        created = test_client.post("/v1/account/keys", json={}).json()
-        assert test_client.post(f"/v1/account/keys/{created['id']}/revoke").status_code == 200
+        created = test_client.post(
+            "/v1/account/keys", json={}, headers=_csrf_headers(test_client)
+        ).json()
+        assert (
+            test_client.post(
+                f"/v1/account/keys/{created['id']}/revoke",
+                headers=_csrf_headers(test_client),
+            ).status_code
+            == 200
+        )
 
-        rotate_resp = test_client.post(f"/v1/account/keys/{created['id']}/rotate")
+        rotate_resp = test_client.post(
+            f"/v1/account/keys/{created['id']}/rotate", headers=_csrf_headers(test_client)
+        )
 
     assert rotate_resp.status_code == 404
     assert rotate_resp.json()["error"]["code"] == "account_key_not_found"
@@ -1138,8 +1286,13 @@ def test_self_service_key_creation_enforces_active_key_limit():
     with TestClient(_accounts_app(backend)) as test_client:
         _login(test_client, code="good-code")
         for _ in range(5):
-            assert test_client.post("/v1/account/keys", json={}).status_code == 201
-        blocked = test_client.post("/v1/account/keys", json={})
+            assert (
+                test_client.post(
+                    "/v1/account/keys", json={}, headers=_csrf_headers(test_client)
+                ).status_code
+                == 201
+            )
+        blocked = test_client.post("/v1/account/keys", json={}, headers=_csrf_headers(test_client))
 
     assert blocked.status_code == 422
     assert blocked.json()["error"]["code"] == "account_key_limit"
@@ -1152,7 +1305,9 @@ def test_account_keys_list_reports_requests_used_today():
     )
     with TestClient(_accounts_app(backend)) as test_client:
         _login(test_client, code="good-code")
-        create_resp = test_client.post("/v1/account/keys", json={})
+        create_resp = test_client.post(
+            "/v1/account/keys", json={}, headers=_csrf_headers(test_client)
+        )
         assert create_resp.status_code == 201
         assert create_resp.json()["requests_used_today"] == 0
 
@@ -1167,3 +1322,146 @@ def test_account_keys_list_reports_requests_used_today():
     assert len(keys) == 1
     assert keys[0]["requests_used_today"] == 3
     assert keys[0]["daily_quota"] == 100
+
+
+# --- Phase 7: HTTP caching and canonical requests ---
+
+
+def _seed_valuation_key(
+    backend: FakeSupabaseBackend,
+    key: str,
+    *,
+    key_id: str = "key-1",
+    customer_id: str = "cust-1",
+    prefix: str = "live",
+    daily_quota: int = 100,
+) -> None:
+    backend.keys.append(
+        {
+            "id": key_id,
+            "customer_id": customer_id,
+            "prefix": prefix,
+            "secret_hash": APIKeyAuthenticator.hash_secret(key),
+            "label": None,
+            "scopes": ["valuation:read"],
+            "daily_quota": daily_quota,
+            "revoked": False,
+            "expires_at": None,
+            "created_at": "2026-07-11T00:00:00+00:00",
+            "last_used_at": None,
+        }
+    )
+
+
+def _valuation_supabase_app(backend: FakeSupabaseBackend):
+    config = _supabase_config()
+    supabase_client = SupabaseClient(config, transport=backend.transport())
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    return create_app(
+        fmp_client=fmp,
+        supabase_client=supabase_client,
+        authenticator=SupabaseAPIKeyAuthenticator(supabase_client),
+    )
+
+
+def test_fresh_valuation_carries_cache_headers_and_no_quota_headers(client: TestClient):
+    response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == VALUATION_CACHE_CONTROL
+    assert response.headers["Vary"] == "Accept-Encoding"
+    assert response.headers["ETag"].startswith('"')
+    assert "X-RateLimit-Remaining" not in response.headers
+
+
+def test_equivalent_request_forms_produce_identical_etags(client: TestClient):
+    # param order + explicit-vs-default tax_rate + scalar-vs-expanded growth
+    canonical = client.get(
+        "/v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30"
+        "&revenue_growth=0.05&projection_years=5&tax_rate=0.21"
+    )
+    reshuffled = client.get(
+        "/v1/valuations/AAPL?projection_years=5"
+        "&revenue_growth=0.05,0.05,0.05,0.05,0.05&terminal_growth=0.025"
+        "&ebit_margin=0.30&wacc=0.09"
+    )
+    assert canonical.status_code == 200
+    assert reshuffled.status_code == 200
+    assert canonical.headers["ETag"] == reshuffled.headers["ETag"]
+
+
+def test_over_quota_request_is_rejected_before_any_provider_fetch():
+    call_log: list = []
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport(call_log))
+    with TestClient(create_app(fmp_client=fmp, daily_rate_limit=1)) as test_client:
+        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        assert first.status_code == 200
+        fetches_after_first = len(call_log)
+        assert fetches_after_first > 0
+
+        blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert blocked.status_code == 429
+    # the over-limit request must not have reached the provider at all
+    assert len(call_log) == fetches_after_first
+
+
+def test_conditional_request_returns_free_304_without_quota_or_usage():
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key)
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        fresh = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+        assert fresh.status_code == 200
+        etag = fresh.headers["ETag"]
+        quota_after_fresh = dict(backend.quota_counters)
+        usage_after_fresh = len(backend.usage_events)
+
+        not_modified = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key, "If-None-Match": etag},
+        )
+
+    assert not_modified.status_code == 304
+    assert not_modified.content == b""
+    assert not_modified.headers["ETag"] == etag
+    assert not_modified.headers["Cache-Control"] == VALUATION_CACHE_CONTROL
+    assert not_modified.headers["Vary"] == "Accept-Encoding"
+    assert "X-RateLimit-Remaining" not in not_modified.headers
+    # a 304 is free: no quota consumed, no usage event recorded
+    assert dict(backend.quota_counters) == quota_after_fresh
+    assert len(backend.usage_events) == usage_after_fresh
+
+
+def test_non_matching_conditional_request_returns_a_fresh_metered_200():
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key)
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+        assert first.status_code == 200
+        usage_after_first = len(backend.usage_events)
+
+        stale = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key, "If-None-Match": '"not-the-real-etag"'},
+        )
+
+    assert stale.status_code == 200
+    assert stale.json()["ticker"] == "AAPL"
+    # a non-matching conditional request is a normal metered request
+    assert len(backend.usage_events) == usage_after_first + 1
+
+
+def test_over_quota_blocks_even_a_would_be_304():
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key, daily_quota=100)
+    today = datetime.now(UTC).date().isoformat()
+    backend.quota_counters[("key-1", today)] = 100  # already at the limit
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        response = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}",
+            headers={"X-API-Key": key, "If-None-Match": '"anything"'},
+        )
+    assert response.status_code == 429
+    assert response.headers["Cache-Control"] == "no-store"

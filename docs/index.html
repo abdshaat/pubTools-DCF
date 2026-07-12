@@ -742,8 +742,34 @@ FMP_API_KEY=your-key-here</code></pre>
   general availability — include it now so your integration doesn't break later.</div>
   --><div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per API key
   per UTC day by default. Calls made from this website use the same API endpoint and count toward the same key limit.
-  Responses include <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
-  <code>X-RateLimit-Reset</code>, and, after exhaustion, <code>Retry-After</code>.</div>
+  A <code>429</code> response carries <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
+  <code>X-RateLimit-Reset</code>, and <code>Retry-After</code>. Successful (<code>200</code>) valuation responses
+  deliberately omit these headers — see caching below.</div>
+
+  <h3 id="caching">Caching</h3>
+  <p>Valuation responses are safely HTTP-cacheable. Each carries a strong
+  <code>ETag</code> and <code>Cache-Control: public</code>, so you (and any shared CDN in front of the API)
+  can reuse a result and revalidate cheaply with a conditional request:</p>
+  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> -H <span class="s">'If-None-Match: "&lt;etag&gt;"'</span> <span class="s">"https://api.example.com/v1/valuations/AAPL?..."</span></code></pre>
+  <p>If the valuation is unchanged you get a <code>304 Not Modified</code> with no body. <strong>A 304 is
+  free</strong> — it does not count against your daily quota. The <code>ETag</code> changes automatically whenever
+  anything you can observe changes (the price, the underlying financials, or the model version), so a matching
+  ETag always means an identical result.</p>
+  <p class="hint">Quota-free is not the same as guaranteed provider/compute-free: if a conditional request reaches
+  the origin server, the API may still rebuild the valuation to decide whether the <code>ETag</code> matches. A CDN
+  or shared cache can avoid that origin work when it answers the conditional request itself.</p>
+  <div class="note"><strong>Two consequences worth knowing:</strong>
+  <ul style="margin: 8px 0 0; padding-left: 20px;">
+    <li>Because the cache is <em>public/shared</em>, a valuation already cached at a CDN edge can be served to
+    anyone requesting that exact URL — a cache hit never reaches the API's authentication layer. Valuations are a
+    deterministic function of public financial data and your assumptions, not confidential per-customer data, so this
+    is by design; but do not treat a valuation URL as a secret.</li>
+    <li>Per-caller quota headers (<code>X-RateLimit-*</code>) are therefore <em>not</em> included on
+    <code>200</code>/<code>304</code> valuation responses — a shared cache must never serve one customer's quota
+    state to another. Your authoritative quota status comes only from requests that reach the origin.</li>
+  </ul></div>
+  <p>The <a href="#builder">endpoint builder</a> below emits parameters in canonical order with resolved defaults, which
+  gives repeated and shared requests the best cache reuse.</p>
 </section>
 
 <section id="account">
@@ -1203,6 +1229,20 @@ FMP_API_KEY=your-key-here</code></pre>
   "use strict";
 
   var $ = function (id) { return document.getElementById(id); };
+
+  function cookieValue(name) {
+    return document.cookie
+      .split(";")
+      .map(function (part) { return part.trim(); })
+      .filter(function (part) { return part.indexOf(name + "=") === 0; })
+      .map(function (part) { return decodeURIComponent(part.slice(name.length + 1)); })[0] || "";
+  }
+
+  function csrfHeaders(extra) {
+    var headers = extra || {};
+    headers["X-CSRF-Token"] = cookieValue("pt_csrf");
+    return headers;
+  }
   var mode = "single";
   var currentUrl = "";
 
@@ -1576,7 +1616,7 @@ FMP_API_KEY=your-key-here</code></pre>
     var response = await fetch("/v1/account/keys", {
       method: "POST",
       credentials: "same-origin",
-      headers: { "Content-Type": "application/json" },
+      headers: csrfHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify({ label: label || null })
     });
     if (!response.ok) {
@@ -1592,7 +1632,8 @@ FMP_API_KEY=your-key-here</code></pre>
   async function revokeKey(id) {
     await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/revoke", {
       method: "POST",
-      credentials: "same-origin"
+      credentials: "same-origin",
+      headers: csrfHeaders()
     });
     loadKeys();
   }
@@ -1600,7 +1641,8 @@ FMP_API_KEY=your-key-here</code></pre>
   async function rotateKey(id) {
     var response = await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/rotate", {
       method: "POST",
-      credentials: "same-origin"
+      credentials: "same-origin",
+      headers: csrfHeaders()
     });
     if (!response.ok) {
       showError("Could not rotate that key. Try reloading the page.");
@@ -1612,7 +1654,11 @@ FMP_API_KEY=your-key-here</code></pre>
   }
 
   async function signOut() {
-    await fetch("/v1/auth/logout", { method: "POST", credentials: "same-origin" });
+    await fetch("/v1/auth/logout", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: csrfHeaders()
+    });
     window.location.reload();
   }
 
@@ -1634,7 +1680,7 @@ FMP_API_KEY=your-key-here</code></pre>
       var response = await fetch("/v1/auth/email/login", {
         method: "POST",
         credentials: "same-origin",
-        headers: { "Content-Type": "application/json" },
+        headers: csrfHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({ email: email })
       });
       var body = await response.json();

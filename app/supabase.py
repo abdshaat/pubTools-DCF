@@ -12,11 +12,10 @@ required `apikey` header identifying our project to Supabase -- it never
 leaves this backend.
 """
 
-import hmac
 import os
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from typing import Any
 from urllib.parse import quote, urlencode
 
@@ -485,9 +484,8 @@ class SupabaseAPIKeyAuthenticator:
 
         prefix, stripped = APIKeyAuthenticator.parse_presented_key(presented_key)
         record = await self._client.get_api_key_by_prefix(prefix)
-        presented_hash = APIKeyAuthenticator.hash_secret(stripped)
-        if record is None or not hmac.compare_digest(
-            presented_hash, str(record.get("secret_hash", ""))
+        if record is None or not APIKeyAuthenticator.verify_secret(
+            stripped, str(record.get("secret_hash", ""))
         ):
             raise AuthFailure(AuthFailureReason.INVALID)
         if bool(record.get("revoked")):
@@ -520,6 +518,31 @@ class SupabaseDailyQuotaLimiter:
     def __init__(self, client: SupabaseClient, *, default_limit: int = 100):
         self._client = client
         self._default_limit = default_limit
+
+    async def peek(
+        self,
+        *,
+        identity: str = "anonymous",
+        limit: int | None = None,
+    ) -> RateLimitResult:
+        """Read current usage WITHOUT incrementing (Phase 7 pre-flight gate).
+        Reuses the read-only counter lookup rather than the always-incrementing
+        consume RPC, so conditional requests that end in a 304 stay free."""
+        now = datetime.now(UTC)
+        effective_limit = limit or self._default_limit
+        used = await self._client.get_daily_quota_usage(
+            subject_id=identity, window=now.date().isoformat()
+        )
+        reset = datetime.combine(now.date() + timedelta(days=1), time.min, tzinfo=UTC)
+        reset_epoch = int(reset.timestamp())
+        retry_after = max(1, reset_epoch - int(now.timestamp()))
+        return RateLimitResult(
+            allowed=used < effective_limit,
+            limit=effective_limit,
+            remaining=max(effective_limit - used, 0),
+            reset_epoch=reset_epoch,
+            retry_after=retry_after,
+        )
 
     async def check_and_increment(
         self,
