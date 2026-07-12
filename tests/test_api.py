@@ -1051,6 +1051,85 @@ def test_self_service_keys_are_isolated_between_customers():
         assert alice_list_after.json()["keys"][0]["revoked"] is True
 
 
+def test_bob_cannot_rotate_alices_key():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-alice", user_id="gh-alice", email="alice@example.com", user_name="alice"
+    )
+    backend.register_login_code(
+        "code-bob", user_id="gh-bob", email="bob@example.com", user_name="bob"
+    )
+    app = _accounts_app(backend)
+
+    with TestClient(app) as alice, TestClient(app) as bob:
+        _login(alice, code="code-alice")
+        _login(bob, code="code-bob")
+
+        alice_key = alice.post("/v1/account/keys", json={}).json()
+
+        bob_rotate = bob.post(f"/v1/account/keys/{alice_key['id']}/rotate")
+        assert bob_rotate.status_code == 404
+
+        # unaffected: alice's original key still authenticates
+        valuation = alice.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": alice_key["api_key"]}
+        )
+        assert valuation.status_code == 200
+
+
+def test_rotate_account_key_issues_a_new_secret_and_invalidates_the_old_one():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        created = test_client.post("/v1/account/keys", json={"label": "my key"}).json()
+        old_key = created["api_key"]
+
+        rotate_resp = test_client.post(f"/v1/account/keys/{created['id']}/rotate")
+        assert rotate_resp.status_code == 200
+        rotated = rotate_resp.json()
+        new_key = rotated["api_key"]
+
+        assert new_key != old_key
+        assert rotated["id"] == created["id"]
+        assert rotated["label"] == "my key"
+
+        old_key_response = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": old_key}
+        )
+        assert old_key_response.status_code == 401
+
+        new_key_response = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": new_key}
+        )
+        assert new_key_response.status_code == 200
+
+
+def test_rotate_account_key_returns_404_for_revoked_key():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        created = test_client.post("/v1/account/keys", json={}).json()
+        assert test_client.post(f"/v1/account/keys/{created['id']}/revoke").status_code == 200
+
+        rotate_resp = test_client.post(f"/v1/account/keys/{created['id']}/rotate")
+
+    assert rotate_resp.status_code == 404
+    assert rotate_resp.json()["error"]["code"] == "account_key_not_found"
+
+
+def test_rotate_account_key_requires_session():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.post("/v1/account/keys/some-id/rotate")
+    assert response.status_code == 401
+
+
 def test_self_service_key_creation_enforces_active_key_limit():
     backend = FakeSupabaseBackend()
     backend.register_login_code(
@@ -1064,3 +1143,27 @@ def test_self_service_key_creation_enforces_active_key_limit():
 
     assert blocked.status_code == 422
     assert blocked.json()["error"]["code"] == "account_key_limit"
+
+
+def test_account_keys_list_reports_requests_used_today():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        create_resp = test_client.post("/v1/account/keys", json={})
+        assert create_resp.status_code == 201
+        assert create_resp.json()["requests_used_today"] == 0
+
+        key_id = create_resp.json()["id"]
+        today = datetime.now(UTC).date().isoformat()
+        backend.quota_counters[(key_id, today)] = 3
+
+        list_resp = test_client.get("/v1/account/keys")
+
+    assert list_resp.status_code == 200
+    keys = list_resp.json()["keys"]
+    assert len(keys) == 1
+    assert keys[0]["requests_used_today"] == 3
+    assert keys[0]["daily_quota"] == 100

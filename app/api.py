@@ -45,6 +45,7 @@ from .accounts import (
     public_base_url,
     request_email_login,
     revoke_key,
+    rotate_key,
     set_oauth_verifier_cookie,
     set_session_cookies,
 )
@@ -707,6 +708,39 @@ def create_app(
             detail = "API key not found"
             return _error(request, 404, detail, "account_key_not_found", detail)
         response = JSONResponse(content={"revoked": True})
+        if refreshed is not None:
+            set_session_cookies(response, refreshed)
+        return response
+
+    @app.post(
+        "/v1/account/keys/{key_id}/rotate",
+        response_model=ApiKeyCreatedOut,
+        include_in_schema=False,
+    )
+    async def rotate_account_key(request: Request, key_id: str) -> JSONResponse:
+        auth_client = request.app.state.auth_client
+        supabase_client = request.app.state.supabase_client
+        if auth_client is None or supabase_client is None:
+            return _unauthenticated_account_response(request)
+        try:
+            account, refreshed = await get_current_customer(
+                auth_client=auth_client, supabase_client=supabase_client, request=request
+            )
+        except (AccountAuthError, SupabaseError):
+            return _unauthenticated_account_response(request)
+        try:
+            record, full_key = await rotate_key(
+                supabase_client, customer_id=account.customer_id, key_id=key_id
+            )
+        except AccountKeyNotFoundError:
+            detail = "API key not found"
+            return _error(request, 404, detail, "account_key_not_found", detail)
+        summary = build_api_key_summary(record)
+        response = JSONResponse(
+            content=ApiKeyCreatedOut(api_key=full_key, **summary.model_dump()).model_dump(
+                mode="json"
+            )
+        )
         if refreshed is not None:
             set_session_cookies(response, refreshed)
         return response

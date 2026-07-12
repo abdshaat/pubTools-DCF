@@ -169,6 +169,7 @@ class ApiKeySummaryOut(BaseModel):
     label: str | None
     scopes: list[str]
     daily_quota: int
+    requests_used_today: int | None
     revoked: bool
     expires_at: datetime | None
     created_at: datetime
@@ -184,12 +185,14 @@ class AccountKeysOut(BaseModel):
 
 
 def build_api_key_summary(row: dict[str, Any]) -> ApiKeySummaryOut:
+    requests_used_today = row.get("requests_used_today")
     return ApiKeySummaryOut(
         id=str(row["id"]),
         prefix=str(row["prefix"]),
         label=row.get("label"),
         scopes=[str(scope) for scope in (row.get("scopes") or [])],
         daily_quota=int(row["daily_quota"]),
+        requests_used_today=(int(requests_used_today) if requests_used_today is not None else None),
         revoked=bool(row.get("revoked")),
         expires_at=row.get("expires_at"),
         created_at=row["created_at"],

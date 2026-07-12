@@ -1480,6 +1480,22 @@ FMP_API_KEY=your-key-here</code></pre>
     return messages[code] || "Sign-in failed. Please try again.";
   }
 
+  function timeAgo(isoString) {
+    var then = new Date(isoString).getTime();
+    if (isNaN(then)) return isoString;
+    var seconds = Math.round((Date.now() - then) / 1000);
+    if (seconds < 60) return "just now";
+    var minutes = Math.round(seconds / 60);
+    if (minutes < 60) return minutes + (minutes === 1 ? " minute ago" : " minutes ago");
+    var hours = Math.round(minutes / 60);
+    if (hours < 24) return hours + (hours === 1 ? " hour ago" : " hours ago");
+    var days = Math.round(hours / 24);
+    if (days < 30) return days + (days === 1 ? " day ago" : " days ago");
+    return new Date(isoString).toLocaleDateString(undefined, {
+      year: "numeric", month: "short", day: "numeric"
+    });
+  }
+
   function renderKeys(keys) {
     var box = $("account-keys");
     box.textContent = "";
@@ -1499,27 +1515,53 @@ FMP_API_KEY=your-key-here</code></pre>
       label.className = "label";
       label.textContent = (key.label ? key.label + " — " : "") + "dcf_" + key.prefix + "_...";
 
+      var quotaText = key.requests_used_today != null
+        ? key.requests_used_today + "/" + key.daily_quota + " today"
+        : key.daily_quota + "/day";
       var value = document.createElement("span");
       value.className = "value";
       value.textContent = key.revoked
         ? "revoked"
-        : "quota " + key.daily_quota + "/day" +
-          (key.last_used_at ? ", last used " + key.last_used_at : ", never used");
+        : quotaText + (key.last_used_at ? ", last used " + timeAgo(key.last_used_at) : ", never used");
 
       row.appendChild(label);
       row.appendChild(value);
 
       if (!key.revoked) {
+        var rotateBtn = document.createElement("button");
+        rotateBtn.type = "button";
+        rotateBtn.className = "run";
+        rotateBtn.style.marginLeft = "12px";
+        rotateBtn.style.background = "var(--panel)";
+        rotateBtn.style.color = "var(--ink)";
+        rotateBtn.style.border = "1px solid var(--line)";
+        rotateBtn.textContent = "Rotate";
+        rotateBtn.title = "Generate a new secret for this key; the old one stops working immediately.";
+        rotateBtn.addEventListener("click", function () { rotateKey(key.id); });
+        row.appendChild(rotateBtn);
+
         var revokeBtn = document.createElement("button");
         revokeBtn.type = "button";
         revokeBtn.className = "run";
-        revokeBtn.style.marginLeft = "12px";
+        revokeBtn.style.marginLeft = "8px";
         revokeBtn.textContent = "Revoke";
         revokeBtn.addEventListener("click", function () { revokeKey(key.id); });
         row.appendChild(revokeBtn);
       }
       box.appendChild(row);
     });
+  }
+
+  function showNewKey(apiKey) {
+    var box = $("account-new-key");
+    box.hidden = false;
+    box.textContent = "";
+    var strong = document.createElement("strong");
+    strong.textContent = "New key (copy it now, shown once): ";
+    var code = document.createElement("code");
+    code.textContent = apiKey;
+    box.appendChild(strong);
+    box.appendChild(code);
   }
 
   async function loadKeys() {
@@ -1542,15 +1584,7 @@ FMP_API_KEY=your-key-here</code></pre>
       return;
     }
     var body = await response.json();
-    var box = $("account-new-key");
-    box.hidden = false;
-    box.textContent = "";
-    var strong = document.createElement("strong");
-    strong.textContent = "New key (copy it now, shown once): ";
-    var code = document.createElement("code");
-    code.textContent = body.api_key;
-    box.appendChild(strong);
-    box.appendChild(code);
+    showNewKey(body.api_key);
     $("account-key-label").value = "";
     loadKeys();
   }
@@ -1560,6 +1594,20 @@ FMP_API_KEY=your-key-here</code></pre>
       method: "POST",
       credentials: "same-origin"
     });
+    loadKeys();
+  }
+
+  async function rotateKey(id) {
+    var response = await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/rotate", {
+      method: "POST",
+      credentials: "same-origin"
+    });
+    if (!response.ok) {
+      showError("Could not rotate that key. Try reloading the page.");
+      return;
+    }
+    var body = await response.json();
+    showNewKey(body.api_key);
     loadKeys();
   }
 

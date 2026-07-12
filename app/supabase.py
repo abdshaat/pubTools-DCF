@@ -161,6 +161,26 @@ class SupabaseClient:
         if response.status_code >= 400:
             raise SupabaseError("Supabase usage-event RPC failed")
 
+    async def get_daily_quota_usage(self, *, subject_id: str, window: str) -> int:
+        """Read-only lookup of today's request count for a quota subject
+        (e.g. an API key id). Does not consume/increment anything. Returns 0
+        if no counter row exists yet for this window (no requests made)."""
+        response = await self._client.get(
+            "/rest/v1/daily_quota_counters",
+            params={
+                "subject_id": f"eq.{subject_id}",
+                "quota_window": f"eq.{window}",
+                "select": "request_count",
+                "limit": "1",
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase quota-usage lookup failed")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise SupabaseError("Supabase quota-usage lookup returned a non-list payload")
+        return int(payload[0]["request_count"]) if payload else 0
+
     # --- customer accounts / self-service keys (Phase 6) ---
 
     async def get_customer_by_auth_user_id(self, auth_user_id: str) -> dict[str, Any] | None:
@@ -256,6 +276,31 @@ class SupabaseClient:
         payload = response.json()
         if not isinstance(payload, list):
             raise SupabaseError("Supabase key revocation returned a non-list payload")
+        return payload[0] if payload else None
+
+    async def rotate_customer_key(
+        self, *, customer_id: str, key_id: str, secret_hash: str
+    ) -> dict[str, Any] | None:
+        """Replaces a key's secret in place (same id/prefix/label/history).
+        Scoped to non-revoked keys owned by `customer_id`; returns None if no
+        such key exists, matching the ownership-check pattern used elsewhere
+        so a caller can't distinguish "not found" from "not yours" from
+        "already revoked"."""
+        response = await self._client.patch(
+            "/rest/v1/api_keys",
+            params={
+                "id": f"eq.{key_id}",
+                "customer_id": f"eq.{customer_id}",
+                "revoked": "eq.false",
+            },
+            headers={"Prefer": "return=representation"},
+            json={"secret_hash": secret_hash},
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase key rotation failed")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise SupabaseError("Supabase key rotation returned a non-list payload")
         return payload[0] if payload else None
 
     async def record_audit_event(

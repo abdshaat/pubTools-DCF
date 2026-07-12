@@ -24,6 +24,7 @@ today -- Supabase identity linking across providers is not wired up (deferred,
 see IMPLEMENTATION_PLAN.md Phase 6).
 """
 
+import asyncio
 import base64
 import hashlib
 import os
@@ -31,6 +32,7 @@ import re
 import secrets
 import string
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import Request, Response
@@ -293,8 +295,26 @@ def _generate_prefix() -> str:
     return "".join(secrets.choice(alphabet) for _ in range(8))
 
 
+def _today_window() -> str:
+    return datetime.now(UTC).date().isoformat()
+
+
+async def _with_usage_today(supabase_client: SupabaseClient, row: dict[str, Any]) -> dict[str, Any]:
+    """Attaches `requests_used_today` to a copy of a key row. Revoked keys
+    don't consume quota anymore, so their usage isn't looked up."""
+    enriched = dict(row)
+    if row.get("revoked"):
+        enriched["requests_used_today"] = None
+        return enriched
+    enriched["requests_used_today"] = await supabase_client.get_daily_quota_usage(
+        subject_id=str(row["id"]), window=_today_window()
+    )
+    return enriched
+
+
 async def list_keys(supabase_client: SupabaseClient, *, customer_id: str) -> list[dict[str, Any]]:
-    return await supabase_client.list_customer_keys(customer_id)
+    rows = await supabase_client.list_customer_keys(customer_id)
+    return list(await asyncio.gather(*(_with_usage_today(supabase_client, row) for row in rows)))
 
 
 async def create_key(
@@ -323,6 +343,8 @@ async def create_key(
         action="account.key_created",
         metadata={"prefix": prefix},
     )
+    # brand new key: no requests have been made against it yet, no lookup needed
+    record = {**record, "requests_used_today": 0}
     return record, full_key
 
 
@@ -336,3 +358,37 @@ async def revoke_key(supabase_client: SupabaseClient, *, customer_id: str, key_i
         action="account.key_revoked",
         metadata={},
     )
+
+
+async def rotate_key(
+    supabase_client: SupabaseClient, *, customer_id: str, key_id: str
+) -> tuple[dict[str, Any], str]:
+    """Regenerates a key's secret in place -- same id/prefix/label/created_at,
+    only the secret (and its hash) change. Revoked keys can't be rotated
+    (rotating one back to a usable state would be surprising and isn't
+    supported -- create a new key instead); this looks like a generic
+    not-found to the caller, same as revoking someone else's key does, so
+    neither leaks *why* the action was rejected.
+    """
+    existing = await supabase_client.list_customer_keys(customer_id)
+    match = next((row for row in existing if str(row["id"]) == key_id), None)
+    if match is None or match.get("revoked"):
+        raise AccountKeyNotFoundError("API key not found")
+
+    full_key = f"dcf_{match['prefix']}_{secrets.token_urlsafe(32)}"
+    updated = await supabase_client.rotate_customer_key(
+        customer_id=customer_id,
+        key_id=key_id,
+        secret_hash=APIKeyAuthenticator.hash_secret(full_key),
+    )
+    if updated is None:
+        raise AccountKeyNotFoundError("API key not found")
+
+    await supabase_client.record_audit_event(
+        customer_id=customer_id,
+        api_key_id=key_id,
+        action="account.key_rotated",
+        metadata={"prefix": match["prefix"]},
+    )
+    enriched = await _with_usage_today(supabase_client, updated)
+    return enriched, full_key

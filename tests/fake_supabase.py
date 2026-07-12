@@ -23,7 +23,10 @@ class FakeSupabaseBackend:
         self.customers: list[dict[str, Any]] = []
         self.keys: list[dict[str, Any]] = []
         self.audit_events: list[dict[str, Any]] = []
+        self.usage_events: list[dict[str, Any]] = []
         self.otp_requests: list[dict[str, Any]] = []
+        # (subject_id, quota_window) -> request_count
+        self.quota_counters: dict[tuple[str, str], int] = {}
         self._counter = 0
 
     def register_login_code(
@@ -116,6 +119,14 @@ class FakeSupabaseBackend:
             return httpx.Response(201, json=[record])
 
         if path == "/rest/v1/api_keys" and method == "GET":
+            # Two distinct callers share this endpoint: the machine X-API-Key
+            # auth path looks up by prefix (SupabaseClient.get_api_key_by_prefix),
+            # while the self-service account routes list by customer_id.
+            prefix_filter = request.url.params.get("prefix")
+            if prefix_filter is not None:
+                prefix = prefix_filter.removeprefix("eq.")
+                matches = [k for k in self.keys if k["prefix"] == prefix]
+                return httpx.Response(200, json=matches[:1])
             customer_id = request.url.params.get("customer_id", "").removeprefix("eq.")
             matches = [k for k in self.keys if k["customer_id"] == customer_id]
             return httpx.Response(200, json=matches)
@@ -139,14 +150,57 @@ class FakeSupabaseBackend:
             return httpx.Response(201, json=[record])
 
         if path == "/rest/v1/api_keys" and method == "PATCH":
+            # `id` is always present. `customer_id`/`revoked` filters are only
+            # sent by the self-service routes (list/revoke/rotate) -- the
+            # machine-auth path's mark_key_used() PATCHes by `id` alone.
             key_id = request.url.params.get("id", "").removeprefix("eq.")
-            customer_id = request.url.params.get("customer_id", "").removeprefix("eq.")
-            matches = [
-                k for k in self.keys if k["id"] == key_id and k["customer_id"] == customer_id
-            ]
+            matches = [k for k in self.keys if k["id"] == key_id]
+            customer_filter = request.url.params.get("customer_id")
+            if customer_filter is not None:
+                customer_id = customer_filter.removeprefix("eq.")
+                matches = [k for k in matches if k["customer_id"] == customer_id]
+            revoked_filter = request.url.params.get("revoked")
+            if revoked_filter is not None:
+                wanted = revoked_filter.removeprefix("eq.") == "true"
+                matches = [k for k in matches if k["revoked"] == wanted]
+            body = json.loads(request.content)
             for k in matches:
-                k["revoked"] = True
+                k.update(body)
             return httpx.Response(200, json=matches)
+
+        if path == "/rest/v1/rpc/consume_daily_quota" and method == "POST":
+            body = json.loads(request.content)
+            subject_id = body["p_subject_id"]
+            limit = int(body["p_limit"])
+            window = body["p_window"]
+            key = (subject_id, window)
+            count = self.quota_counters.get(key, 0) + 1
+            self.quota_counters[key] = count
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "allowed": count <= limit,
+                        "limit": limit,
+                        "remaining": max(limit - count, 0),
+                        "reset_epoch": 9_999_999_999,
+                        "retry_after": 1,
+                    }
+                ],
+            )
+
+        if path == "/rest/v1/rpc/record_usage_event" and method == "POST":
+            body = json.loads(request.content)
+            self.usage_events.append(body.get("p_event", {}))
+            return httpx.Response(200, json={})
+
+        if path == "/rest/v1/daily_quota_counters" and method == "GET":
+            subject_id = request.url.params.get("subject_id", "").removeprefix("eq.")
+            window = request.url.params.get("quota_window", "").removeprefix("eq.")
+            count = self.quota_counters.get((subject_id, window))
+            if count is None:
+                return httpx.Response(200, json=[])
+            return httpx.Response(200, json=[{"request_count": count}])
 
         if path == "/rest/v1/audit_events" and method == "POST":
             self.audit_events.append(json.loads(request.content))

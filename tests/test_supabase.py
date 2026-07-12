@@ -291,3 +291,52 @@ def test_supabase_client_customer_and_key_error_paths():
             await client.aclose()
 
     _run(exercise())
+
+
+def test_get_daily_quota_usage_returns_zero_when_no_counter_row_exists():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=[])
+
+    async def exercise() -> None:
+        client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+        try:
+            assert await client.get_daily_quota_usage(subject_id="k1", window="2026-07-12") == 0
+        finally:
+            await client.aclose()
+
+    _run(exercise())
+
+
+def test_get_daily_quota_usage_returns_the_stored_count():
+    async def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.params["subject_id"] == "eq.k1"
+        assert request.url.params["quota_window"] == "eq.2026-07-12"
+        return httpx.Response(200, json=[{"request_count": 42}])
+
+    async def exercise() -> None:
+        client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+        try:
+            assert await client.get_daily_quota_usage(subject_id="k1", window="2026-07-12") == 42
+        finally:
+            await client.aclose()
+
+    _run(exercise())
+
+
+def test_get_daily_quota_usage_raises_on_error_or_malformed_payload():
+    async def error_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500)
+
+    async def malformed_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"not": "a list"})
+
+    async def exercise() -> None:
+        for handler in (error_handler, malformed_handler):
+            client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+            try:
+                with pytest.raises(SupabaseError):
+                    await client.get_daily_quota_usage(subject_id="k1", window="2026-07-12")
+            finally:
+                await client.aclose()
+
+    _run(exercise())

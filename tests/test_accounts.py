@@ -6,6 +6,7 @@ tests/test_api.py alongside the other HTTP-layer tests.
 import asyncio
 import base64
 import hashlib
+from datetime import UTC, datetime
 
 import pytest
 from starlette.requests import Request
@@ -25,7 +26,9 @@ from app.accounts import (
     list_keys,
     request_email_login,
     revoke_key,
+    rotate_key,
 )
+from app.auth import APIKeyAuthenticator
 from app.supabase import SupabaseAuthClient, SupabaseClient, SupabaseConfig
 from tests.fake_supabase import FakeSupabaseBackend
 
@@ -181,6 +184,81 @@ def test_revoke_key_rejects_wrong_customer():
     _run(exercise())
 
 
+def test_rotate_key_issues_a_new_secret_that_invalidates_the_old_one():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, old_key = await create_key(client, customer_id="cust-1", label="my key")
+        old_hash = APIKeyAuthenticator.hash_secret(old_key)
+
+        updated, new_key = await rotate_key(client, customer_id="cust-1", key_id=record["id"])
+
+        assert new_key != old_key
+        assert new_key.startswith(f"dcf_{record['prefix']}_")  # same prefix, same key id
+        assert updated["id"] == record["id"]
+        assert updated["label"] == "my key"  # unrelated fields preserved
+
+        stored = backend.keys[0]
+        assert stored["secret_hash"] != old_hash
+        assert stored["secret_hash"] == APIKeyAuthenticator.hash_secret(new_key)
+
+        assert any(e["action"] == "account.key_rotated" for e in backend.audit_events)
+
+    _run(exercise())
+
+
+def test_rotate_key_rejects_wrong_customer():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-a", "name": "alice", "email": None, "auth_user_id": "gh-a"}
+    )
+    backend.customers.append({"id": "cust-b", "name": "bob", "email": None, "auth_user_id": "gh-b"})
+
+    async def exercise():
+        record, old_key = await create_key(client, customer_id="cust-a", label=None)
+        with pytest.raises(AccountKeyNotFoundError):
+            await rotate_key(client, customer_id="cust-b", key_id=record["id"])
+        # unaffected by the failed cross-customer attempt
+        assert backend.keys[0]["secret_hash"] == APIKeyAuthenticator.hash_secret(old_key)
+
+    _run(exercise())
+
+
+def test_rotate_key_rejects_revoked_key():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label=None)
+        await revoke_key(client, customer_id="cust-1", key_id=record["id"])
+        with pytest.raises(AccountKeyNotFoundError):
+            await rotate_key(client, customer_id="cust-1", key_id=record["id"])
+
+    _run(exercise())
+
+
+def test_rotate_key_rejects_nonexistent_key():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        with pytest.raises(AccountKeyNotFoundError):
+            await rotate_key(client, customer_id="cust-1", key_id="does-not-exist")
+
+    _run(exercise())
+
+
 def test_list_keys_returns_only_that_customers_rows():
     backend = FakeSupabaseBackend()
     client = SupabaseClient(_config(), transport=backend.transport())
@@ -195,6 +273,62 @@ def test_list_keys_returns_only_that_customers_rows():
         rows_a = await list_keys(client, customer_id="cust-a")
         assert len(rows_a) == 1
         assert rows_a[0]["label"] == "a-key"
+
+    _run(exercise())
+
+
+def test_create_key_returns_zero_requests_used_today_without_a_quota_lookup():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label=None)
+        assert record["requests_used_today"] == 0
+        # freshly created -- no quota-usage lookup should have happened at all
+        assert backend.quota_counters == {}
+
+    _run(exercise())
+
+
+def test_list_keys_enriches_active_keys_with_todays_usage():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label=None)
+        today = datetime.now(UTC).date().isoformat()
+        backend.quota_counters[(record["id"], today)] = 7
+
+        rows = await list_keys(client, customer_id="cust-1")
+        assert len(rows) == 1
+        assert rows[0]["requests_used_today"] == 7
+
+    _run(exercise())
+
+
+def test_list_keys_does_not_look_up_usage_for_revoked_keys():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label=None)
+        await revoke_key(client, customer_id="cust-1", key_id=record["id"])
+
+        rows = await list_keys(client, customer_id="cust-1")
+        assert len(rows) == 1
+        assert rows[0]["revoked"] is True
+        assert rows[0]["requests_used_today"] is None
+        # no counter row was ever created/queried for the revoked key
+        assert backend.quota_counters == {}
 
     _run(exercise())
 
