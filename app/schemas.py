@@ -149,6 +149,50 @@ class ErrorResponse(BaseModel):
     error: ErrorBody
 
 
+class MeOut(BaseModel):
+    customer_id: str
+    email: str | None
+    name: str
+
+
+class CreateKeyRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=64)
+
+
+class ApiKeySummaryOut(BaseModel):
+    id: str
+    prefix: str
+    label: str | None
+    scopes: list[str]
+    daily_quota: int
+    revoked: bool
+    expires_at: datetime | None
+    created_at: datetime
+    last_used_at: datetime | None
+
+
+class ApiKeyCreatedOut(ApiKeySummaryOut):
+    api_key: str
+
+
+class AccountKeysOut(BaseModel):
+    keys: list[ApiKeySummaryOut]
+
+
+def build_api_key_summary(row: dict[str, Any]) -> ApiKeySummaryOut:
+    return ApiKeySummaryOut(
+        id=str(row["id"]),
+        prefix=str(row["prefix"]),
+        label=row.get("label"),
+        scopes=[str(scope) for scope in (row.get("scopes") or [])],
+        daily_quota=int(row["daily_quota"]),
+        revoked=bool(row.get("revoked")),
+        expires_at=row.get("expires_at"),
+        created_at=row["created_at"],
+        last_used_at=row.get("last_used_at"),
+    )
+
+
 def build_valuation_response(
     base: BaseFinancials,
     assumptions: Assumptions,

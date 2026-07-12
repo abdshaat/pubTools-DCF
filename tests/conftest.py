@@ -3,6 +3,19 @@ import pytest
 from app.models import BaseFinancials
 
 
+@pytest.fixture(autouse=True)
+def _no_ambient_supabase_env(monkeypatch):
+    """Tests must not depend on the developer's local .env Supabase credentials.
+
+    Without this, real SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY values in .env
+    silently flip create_app() into real-auth mode for every test that doesn't
+    explicitly configure Supabase, breaking assumptions baked into those tests.
+    """
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("PUBLIC_BASE_URL", raising=False)
+
+
 def make_base_financials() -> BaseFinancials:
     """Round-number base case, easy to hand-verify in a spreadsheet.
 

@@ -5,7 +5,9 @@ full stack (routing, validation, fetch, normalization, engine, response
 shaping, error mapping) is exercised without network or API key.
 """
 
+import json
 from datetime import UTC, datetime, timedelta
+from urllib.parse import parse_qs, urlparse
 from uuid import UUID
 
 import httpx
@@ -13,9 +15,17 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import MODEL_VERSION
+from app.accounts import LOGIN_ATTEMPTS_DAILY_LIMIT
 from app.api import _default_raw_sink, create_app
 from app.auth import APIKeyAuthenticator
 from app.providers.fmp import FileRawSink, FMPClient
+from app.supabase import (
+    SupabaseAPIKeyAuthenticator,
+    SupabaseAuthClient,
+    SupabaseClient,
+    SupabaseConfig,
+)
+from tests.fake_supabase import FakeSupabaseBackend
 from tests.test_data_layer import fixture_transport, load_fixture
 
 VALID_QUERY = (
@@ -530,6 +540,116 @@ def test_valuation_requests_are_limited_per_day():
     assert blocked.json()["error"]["request_id"] == blocked.headers["X-Request-ID"]
 
 
+def test_authenticated_keys_have_independent_daily_limits():
+    first_key = "dcf_first_testsecret"
+    second_key = "dcf_second_testsecret"
+    auth = APIKeyAuthenticator(
+        [
+            APIKeyAuthenticator.record_from_secret(
+                key_id="key-1", customer_id="customer-1", prefix="first", secret=first_key
+            ),
+            APIKeyAuthenticator.record_from_secret(
+                key_id="key-2", customer_id="customer-2", prefix="second", secret=second_key
+            ),
+        ],
+        required=True,
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(
+        create_app(fmp_client=fmp, authenticator=auth, daily_rate_limit=1)
+    ) as test_client:
+        first_allowed = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": first_key}
+        )
+        first_blocked = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": first_key}
+        )
+        second_allowed = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": second_key}
+        )
+
+    assert first_allowed.status_code == 200
+    assert first_blocked.status_code == 429
+    assert second_allowed.status_code == 200
+    assert second_allowed.headers["X-RateLimit-Remaining"] == "0"
+
+
+def test_supabase_auth_quota_and_usage_metering_are_used():
+    key = "dcf_live_testsecret"
+    calls: list[tuple[str, dict]] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/v1/api_keys" and request.method == "GET":
+            calls.append(("lookup", dict(request.url.params)))
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "key-1",
+                        "customer_id": "customer-1",
+                        "prefix": "live",
+                        "secret_hash": APIKeyAuthenticator.hash_secret(key),
+                        "scopes": ["valuation:read"],
+                        "revoked": False,
+                        "expires_at": None,
+                        "daily_quota": 100,
+                    }
+                ],
+            )
+        if request.url.path == "/rest/v1/api_keys" and request.method == "PATCH":
+            calls.append(("last_used", json.loads(request.content)))
+            return httpx.Response(204)
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota":
+            calls.append(("quota", json.loads(request.content)))
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "allowed": True,
+                        "limit": 100,
+                        "remaining": 99,
+                        "reset_epoch": 1_800_000_000,
+                        "retry_after": 3600,
+                    }
+                ],
+            )
+        if request.url.path == "/rest/v1/rpc/record_usage_event":
+            calls.append(("usage", json.loads(request.content)))
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(f"unexpected Supabase request: {request.method} {request.url}")
+
+    supabase = SupabaseClient(
+        SupabaseConfig(
+            url="https://example.supabase.co",
+            service_role_key="service-role-test-key",
+        ),
+        transport=httpx.MockTransport(handler),
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(
+        create_app(
+            fmp_client=fmp,
+            supabase_client=supabase,
+            authenticator=SupabaseAPIKeyAuthenticator(supabase),
+        )
+    ) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 200
+    assert response.headers["X-RateLimit-Remaining"] == "99"
+    assert [name for name, _ in calls] == ["lookup", "last_used", "quota", "usage"]
+    quota_payload = calls[2][1]
+    assert quota_payload["p_subject_id"] == "key-1"
+    assert quota_payload["p_limit"] == 100
+    usage_payload = calls[3][1]["p_event"]
+    assert usage_payload["customer_id"] == "customer-1"
+    assert usage_payload["api_key_id"] == "key-1"
+    assert usage_payload["ticker"] == "AAPL"
+    assert usage_payload["status_code"] == 200
+    assert usage_payload["quota_consumed"] is True
+    assert key not in str(calls)
+
+
 def test_website_and_health_do_not_consume_valuation_limit():
     fmp = FMPClient(api_key="test-key", transport=fixture_transport())
     with TestClient(create_app(fmp_client=fmp, daily_rate_limit=1)) as test_client:
@@ -579,3 +699,282 @@ def test_root_serves_customer_landing_page():
     assert "connect-src 'self'" in csp
     assert "Run valuation" in response.text
     assert "/v1/valuations/" in response.text
+
+
+# --- customer login (GitHub via Supabase Auth) and self-service keys ---
+
+
+def _supabase_config() -> SupabaseConfig:
+    return SupabaseConfig(url="https://example.supabase.co", service_role_key="service-key")
+
+
+def _accounts_app(backend: FakeSupabaseBackend):
+    config = _supabase_config()
+    auth_client = SupabaseAuthClient(config, transport=backend.transport())
+    supabase_client = SupabaseClient(config, transport=backend.transport())
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    return create_app(fmp_client=fmp, supabase_client=supabase_client, auth_client=auth_client)
+
+
+def _login(test_client: TestClient, *, code: str) -> None:
+    """Drives the full login redirect + callback; session cookies land in
+    `test_client`'s own cookie jar, same as a real browser."""
+    login_resp = test_client.get("/v1/auth/github/login", follow_redirects=False)
+    assert login_resp.status_code == 302
+    state = parse_qs(urlparse(login_resp.headers["location"]).query)["state"][0]
+
+    callback_resp = test_client.get(
+        f"/v1/auth/callback?code={code}&state={state}", follow_redirects=False
+    )
+    assert callback_resp.status_code == 302
+
+
+def test_github_login_returns_503_when_supabase_not_configured():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/v1/auth/github/login", follow_redirects=False)
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "auth_not_configured"
+
+
+def test_github_login_redirects_with_pkce_and_state_cookies():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.get("/v1/auth/github/login", follow_redirects=False)
+
+    assert response.status_code == 302
+    location = response.headers["location"]
+    assert location.startswith("https://example.supabase.co/auth/v1/authorize?")
+    query = parse_qs(urlparse(location).query)
+    assert query["provider"] == ["github"]
+    assert query["code_challenge_method"] == ["s256"]
+    assert "pt_oauth_state" in response.cookies
+    assert "pt_oauth_verifier" in response.cookies
+
+
+def test_github_login_is_rate_limited_per_ip():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        for _ in range(LOGIN_ATTEMPTS_DAILY_LIMIT):
+            response = test_client.get("/v1/auth/github/login", follow_redirects=False)
+            assert response.status_code == 302
+        blocked = test_client.get("/v1/auth/github/login", follow_redirects=False)
+    assert blocked.status_code == 429
+    assert blocked.json()["error"]["code"] == "login_rate_limited"
+
+
+def test_github_callback_rejects_state_mismatch():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        test_client.get("/v1/auth/github/login", follow_redirects=False)
+        response = test_client.get(
+            "/v1/auth/callback?code=good-code&state=not-the-real-state",
+            follow_redirects=False,
+        )
+        assert response.status_code == 302
+        assert "login_error=invalid_state" in response.headers["location"]
+        me = test_client.get("/v1/auth/me")
+    assert me.status_code == 401
+
+
+def test_github_callback_redirects_on_access_denied():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.get("/v1/auth/callback?error=access_denied", follow_redirects=False)
+    assert response.status_code == 302
+    assert "login_error=access_denied" in response.headers["location"]
+
+
+def test_github_callback_returns_error_when_supabase_not_configured():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/v1/auth/callback?code=x&state=y", follow_redirects=False)
+    assert response.status_code == 302
+    assert "login_error=auth_not_configured" in response.headers["location"]
+
+
+def test_github_callback_signin_failure_redirects_on_supabase_error():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    config = _supabase_config()
+    auth_client = SupabaseAuthClient(config, transport=backend.transport())
+
+    async def broken_handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path == "/rest/v1/api_customers":
+            return httpx.Response(200, json=[])
+        if request.method == "POST" and request.url.path == "/rest/v1/api_customers":
+            return httpx.Response(500)
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    broken_supabase_client = SupabaseClient(config, transport=httpx.MockTransport(broken_handler))
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    app = create_app(
+        fmp_client=fmp, supabase_client=broken_supabase_client, auth_client=auth_client
+    )
+
+    with TestClient(app) as test_client:
+        login_resp = test_client.get("/v1/auth/github/login", follow_redirects=False)
+        state = parse_qs(urlparse(login_resp.headers["location"]).query)["state"][0]
+        response = test_client.get(
+            f"/v1/auth/callback?code=good-code&state={state}", follow_redirects=False
+        )
+    assert response.status_code == 302
+    assert "login_error=signin_failed" in response.headers["location"]
+
+
+def test_auth_me_returns_401_when_supabase_not_configured():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/v1/auth/me")
+    assert response.status_code == 401
+
+
+def test_auth_me_sets_refreshed_session_cookie_after_upstream_access_token_expiry():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        old_access_token = test_client.cookies["pt_session"]
+        del backend.sessions[old_access_token]  # simulate upstream access-token expiry
+
+        response = test_client.get("/v1/auth/me")
+
+    assert response.status_code == 200
+    assert response.json()["name"] == "octocat"
+    assert test_client.cookies["pt_session"] != old_access_token
+
+
+def test_github_callback_completes_login_and_creates_customer():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="octo@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        me = test_client.get("/v1/auth/me")
+
+    assert me.status_code == 200
+    body = me.json()
+    assert body["name"] == "octocat"
+    assert body["email"] == "octo@example.com"
+    assert len(backend.customers) == 1
+    assert backend.customers[0]["auth_user_id"] == "gh-1"
+    actions = [event["action"] for event in backend.audit_events]
+    assert "account.signup" in actions
+    assert "account.login" in actions
+
+
+def test_github_callback_second_login_reuses_existing_customer():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-1", user_id="gh-1", email="octo@example.com", user_name="octocat"
+    )
+    backend.register_login_code(
+        "code-2", user_id="gh-1", email="octo@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="code-1")
+        backend.audit_events.clear()
+        _login(test_client, code="code-2")
+
+    assert len(backend.customers) == 1
+    actions = [event["action"] for event in backend.audit_events]
+    assert "account.signup" not in actions
+    assert "account.login" in actions
+
+
+def test_auth_me_requires_session():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.get("/v1/auth/me")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "not_signed_in"
+
+
+def test_logout_clears_session_cookies():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        logout_resp = test_client.post("/v1/auth/logout")
+        me_after = test_client.get("/v1/auth/me")
+
+    assert logout_resp.status_code == 200
+    assert logout_resp.json()["signed_out"] is True
+    assert me_after.status_code == 401
+    assert any(event["action"] == "account.logout" for event in backend.audit_events)
+
+
+def test_self_service_key_endpoints_require_session():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        assert test_client.get("/v1/account/keys").status_code == 401
+        assert test_client.post("/v1/account/keys", json={}).status_code == 401
+        assert test_client.post("/v1/account/keys/some-id/revoke").status_code == 401
+
+
+def test_self_service_keys_are_isolated_between_customers():
+    """A logged-in customer must never see, create against, or revoke another
+    customer's keys -- the core ownership guarantee for self-service keys.
+
+    Alice and Bob are simulated as two independent browser sessions (two
+    TestClient instances, each with its own cookie jar) against the same
+    running app, the same way two real browsers would hit one server.
+    """
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-alice", user_id="gh-alice", email="alice@example.com", user_name="alice"
+    )
+    backend.register_login_code(
+        "code-bob", user_id="gh-bob", email="bob@example.com", user_name="bob"
+    )
+    app = _accounts_app(backend)
+
+    with TestClient(app) as alice, TestClient(app) as bob:
+        _login(alice, code="code-alice")
+        _login(bob, code="code-bob")
+
+        create_resp = alice.post("/v1/account/keys", json={"label": "alice-key"})
+        assert create_resp.status_code == 201
+        alice_key = create_resp.json()
+        assert alice_key["api_key"].startswith("dcf_")
+
+        bob_list = bob.get("/v1/account/keys")
+        assert bob_list.json()["keys"] == []
+
+        bob_revoke = bob.post(f"/v1/account/keys/{alice_key['id']}/revoke")
+        assert bob_revoke.status_code == 404
+
+        alice_list = alice.get("/v1/account/keys")
+        assert len(alice_list.json()["keys"]) == 1
+        assert alice_list.json()["keys"][0]["revoked"] is False
+        assert "api_key" not in alice_list.json()["keys"][0]
+
+        own_revoke = alice.post(f"/v1/account/keys/{alice_key['id']}/revoke")
+        assert own_revoke.status_code == 200
+        alice_list_after = alice.get("/v1/account/keys")
+        assert alice_list_after.json()["keys"][0]["revoked"] is True
+
+
+def test_self_service_key_creation_enforces_active_key_limit():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        for _ in range(5):
+            assert test_client.post("/v1/account/keys", json={}).status_code == 201
+        blocked = test_client.post("/v1/account/keys", json={})
+
+    assert blocked.status_code == 422
+    assert blocked.json()["error"]["code"] == "account_key_limit"

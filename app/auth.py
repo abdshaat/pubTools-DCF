@@ -32,18 +32,22 @@ class AuthFailure(Exception):
 @dataclass(frozen=True)
 class APIKeyRecord:
     key_id: str
+    customer_id: str
     prefix: str
     secret_hash: str
     scopes: frozenset[str] = field(default_factory=lambda: frozenset({VALUATION_SCOPE}))
     revoked: bool = False
     expires_at: datetime | None = None
+    daily_quota: int | None = None
 
 
 @dataclass(frozen=True)
 class AuthenticatedPrincipal:
     key_id: str
+    customer_id: str
     prefix: str
     scopes: frozenset[str]
+    daily_quota: int | None = None
 
 
 class APIKeyAuthenticator:
@@ -65,24 +69,39 @@ class APIKeyAuthenticator:
         cls,
         *,
         key_id: str,
+        customer_id: str | None = None,
         prefix: str,
         secret: str,
         scopes: set[str] | frozenset[str] | None = None,
         revoked: bool = False,
         expires_at: datetime | None = None,
+        daily_quota: int | None = None,
     ) -> APIKeyRecord:
         return APIKeyRecord(
             key_id=key_id,
+            customer_id=customer_id or key_id,
             prefix=prefix,
             secret_hash=cls.hash_secret(secret),
             scopes=frozenset(scopes or {VALUATION_SCOPE}),
             revoked=revoked,
             expires_at=expires_at,
+            daily_quota=daily_quota,
         )
 
     @property
     def enabled(self) -> bool:
         return self.required
+
+    @staticmethod
+    def parse_presented_key(presented_key: str | None) -> tuple[str, str]:
+        if presented_key is None or not presented_key.strip():
+            raise AuthFailure(AuthFailureReason.MISSING)
+
+        stripped = presented_key.strip()
+        parts = stripped.split("_", 2)
+        if len(parts) != 3 or parts[0] != "dcf" or not parts[1] or not parts[2]:
+            raise AuthFailure(AuthFailureReason.MALFORMED)
+        return parts[1], stripped
 
     def authenticate(
         self,
@@ -93,16 +112,10 @@ class APIKeyAuthenticator:
     ) -> AuthenticatedPrincipal | None:
         if not self.required:
             return None
-        if presented_key is None or not presented_key.strip():
-            raise AuthFailure(AuthFailureReason.MISSING)
 
-        parts = presented_key.strip().split("_", 2)
-        if len(parts) != 3 or parts[0] != "dcf" or not parts[1] or not parts[2]:
-            raise AuthFailure(AuthFailureReason.MALFORMED)
-
-        prefix = parts[1]
+        prefix, stripped = self.parse_presented_key(presented_key)
         record = self._records.get(prefix)
-        presented_hash = self.hash_secret(presented_key.strip())
+        presented_hash = self.hash_secret(stripped)
         if record is None or not hmac.compare_digest(presented_hash, record.secret_hash):
             raise AuthFailure(AuthFailureReason.INVALID)
         if record.revoked:
@@ -114,6 +127,8 @@ class APIKeyAuthenticator:
             raise AuthFailure(AuthFailureReason.INSUFFICIENT_SCOPE)
         return AuthenticatedPrincipal(
             key_id=record.key_id,
+            customer_id=record.customer_id,
             prefix=record.prefix,
             scopes=record.scopes,
+            daily_quota=record.daily_quota,
         )

@@ -66,6 +66,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
+# --- Supabase CLI local state (migrations/ itself stays tracked) ---
+supabase/.branches/
+supabase/.temp/
+supabase/.env
+supabase/.env.*
+
 # --- Logs, temporary files, and local backups ---
 *.log
 *.tmp

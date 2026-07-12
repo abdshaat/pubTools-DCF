@@ -481,6 +481,7 @@
   <div class="group">Get started</div>
   <a href="#quickstart">Quickstart</a>
   <a href="#authentication">Authentication</a>
+  <a href="#account">Your account</a>
   <div class="group">Tools</div>
   <a href="#builder">Endpoint builder</a>
   <div class="group">API reference</div>
@@ -736,13 +737,47 @@ FMP_API_KEY=your-key-here</code></pre>
   <h2>Authentication</h2>
   <p>Requests are authenticated with an API key sent in the <code>X-API-Key</code> header:</p>
   <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> <span class="s">"https://api.example.com/v1/valuations/AAPL?..."</span></code></pre>
-  <div class="note"><strong>Preview:</strong> per-customer API keys and usage metering are not yet
-  enforced in the current release. The header is accepted and will become mandatory before
+  <div class="note"><strong>Production:</strong> Supabase-backed deployments require API keys and usage metering is
+  enforced for valuation requests. Public landing, health, and OpenAPI endpoints remain public.</div><!--
   general availability — include it now so your integration doesn't break later.</div>
-  <div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per UTC
-  day. Calls made from this website use the same API endpoint and count toward the same limit.
+  --><div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per API key
+  per UTC day by default. Calls made from this website use the same API endpoint and count toward the same key limit.
   Responses include <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
   <code>X-RateLimit-Reset</code>, and, after exhaustion, <code>Retry-After</code>.</div>
+</section>
+
+<section id="account">
+  <h2>Your account</h2>
+  <p>Sign in with GitHub to generate your own API key instantly — no waiting on an
+  operator. Keys you create here are scoped to your account only, and you can label,
+  list, and revoke them at any time.</p>
+
+  <div id="account-error" class="note" hidden></div>
+
+  <div id="account-signed-out">
+    <a id="account-signin" class="run" href="/v1/auth/github/login">Sign in with GitHub</a>
+  </div>
+
+  <div id="account-signed-in" class="builder" hidden>
+    <h3>Signed in as <span id="account-name"></span></h3>
+    <p class="hint" id="account-email"></p>
+
+    <h3>Your API keys</h3>
+    <div id="account-keys"></div>
+    <div id="account-new-key" class="note tip" hidden></div>
+
+    <div class="grid" style="margin-top: 14px;">
+      <div class="field">
+        <label for="account-key-label">Label <span class="hint">optional</span></label>
+        <input id="account-key-label" type="text" maxlength="64" placeholder="e.g. staging">
+      </div>
+    </div>
+    <p>
+      <button id="account-create-key" type="button" class="run">Create new key</button>
+      <button id="account-signout" type="button" class="run"
+        style="background: var(--panel); color: var(--ink); border: 1px solid var(--line);">Sign out</button>
+    </p>
+  </div>
 </section>
 
 <section id="builder">
@@ -759,6 +794,10 @@ FMP_API_KEY=your-key-here</code></pre>
       <div class="field">
         <label for="b-base">Base URL</label>
         <input id="b-base" type="text" value="" placeholder="Same origin" spellcheck="false">
+      </div>
+      <div class="field">
+        <label for="b-api-key">API key <span class="hint">optional for local demo</span></label>
+        <input id="b-api-key" type="password" value="" placeholder="dcf_..." spellcheck="false" autocomplete="off">
       </div>
       <div class="field">
         <label for="b-ticker">Ticker</label>
@@ -1329,7 +1368,10 @@ FMP_API_KEY=your-key-here</code></pre>
     button.textContent = "Running...";
     showResult("Valuation result", "Loading", { status: "loading", url: currentUrl });
     try {
-      var response = await fetch(currentUrl, { headers: { "Accept": "application/json" } });
+      var headers = { "Accept": "application/json" };
+      var apiKey = $("b-api-key").value.trim();
+      if (apiKey) headers["X-API-Key"] = apiKey;
+      var response = await fetch(currentUrl, { headers: headers });
       var text = await response.text();
       var body;
       try {
@@ -1402,5 +1444,147 @@ FMP_API_KEY=your-key-here</code></pre>
   renderGrowthInputs();
   $("b-base").value = defaultBaseUrl();
   update();
+})();
+</script>
+
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  function showError(message) {
+    var box = $("account-error");
+    box.textContent = message;
+    box.hidden = false;
+  }
+
+  function friendlyLoginError(code) {
+    var messages = {
+      access_denied: "GitHub sign-in was cancelled.",
+      invalid_request: "Sign-in request was incomplete. Please try again.",
+      invalid_state: "That sign-in link expired or was already used. Please try again.",
+      signin_failed: "Sign-in failed. Please try again.",
+      auth_not_configured: "Sign-in isn't available on this deployment yet.",
+      login_rate_limited: "Too many sign-in attempts. Please try again later."
+    };
+    return messages[code] || "Sign-in failed. Please try again.";
+  }
+
+  function renderKeys(keys) {
+    var box = $("account-keys");
+    box.textContent = "";
+    if (!keys.length) {
+      var empty = document.createElement("p");
+      empty.className = "hint";
+      empty.textContent = "No API keys yet.";
+      box.appendChild(empty);
+      return;
+    }
+    keys.forEach(function (key) {
+      var row = document.createElement("div");
+      row.className = "metric";
+      row.style.marginBottom = "8px";
+
+      var label = document.createElement("span");
+      label.className = "label";
+      label.textContent = (key.label ? key.label + " — " : "") + "dcf_" + key.prefix + "_...";
+
+      var value = document.createElement("span");
+      value.className = "value";
+      value.textContent = key.revoked
+        ? "revoked"
+        : "quota " + key.daily_quota + "/day" +
+          (key.last_used_at ? ", last used " + key.last_used_at : ", never used");
+
+      row.appendChild(label);
+      row.appendChild(value);
+
+      if (!key.revoked) {
+        var revokeBtn = document.createElement("button");
+        revokeBtn.type = "button";
+        revokeBtn.className = "run";
+        revokeBtn.style.marginLeft = "12px";
+        revokeBtn.textContent = "Revoke";
+        revokeBtn.addEventListener("click", function () { revokeKey(key.id); });
+        row.appendChild(revokeBtn);
+      }
+      box.appendChild(row);
+    });
+  }
+
+  async function loadKeys() {
+    var response = await fetch("/v1/account/keys", { credentials: "same-origin" });
+    if (!response.ok) return;
+    var body = await response.json();
+    renderKeys(body.keys || []);
+  }
+
+  async function createKey() {
+    var label = $("account-key-label").value.trim();
+    var response = await fetch("/v1/account/keys", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ label: label || null })
+    });
+    if (!response.ok) {
+      showError("Could not create a new key. You may have reached the account limit.");
+      return;
+    }
+    var body = await response.json();
+    var box = $("account-new-key");
+    box.hidden = false;
+    box.textContent = "";
+    var strong = document.createElement("strong");
+    strong.textContent = "New key (copy it now, shown once): ";
+    var code = document.createElement("code");
+    code.textContent = body.api_key;
+    box.appendChild(strong);
+    box.appendChild(code);
+    $("account-key-label").value = "";
+    loadKeys();
+  }
+
+  async function revokeKey(id) {
+    await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/revoke", {
+      method: "POST",
+      credentials: "same-origin"
+    });
+    loadKeys();
+  }
+
+  async function signOut() {
+    await fetch("/v1/auth/logout", { method: "POST", credentials: "same-origin" });
+    window.location.reload();
+  }
+
+  async function init() {
+    var params = new URLSearchParams(window.location.search);
+    var loginError = params.get("login_error");
+    if (loginError) {
+      showError(friendlyLoginError(loginError));
+      params.delete("login_error");
+      var query = params.toString();
+      var next = window.location.pathname + (query ? "?" + query : "") + window.location.hash;
+      window.history.replaceState(null, "", next);
+    }
+
+    var response = await fetch("/v1/auth/me", { credentials: "same-origin" });
+    if (!response.ok) {
+      $("account-signed-out").hidden = false;
+      $("account-signed-in").hidden = true;
+      return;
+    }
+    var me = await response.json();
+    $("account-signed-out").hidden = true;
+    $("account-signed-in").hidden = false;
+    $("account-name").textContent = me.name;
+    $("account-email").textContent = me.email || "";
+    loadKeys();
+  }
+
+  $("account-create-key").addEventListener("click", createKey);
+  $("account-signout").addEventListener("click", signOut);
+  init();
 })();
 </script>

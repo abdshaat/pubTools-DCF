@@ -47,15 +47,18 @@ math (e.g. `terminal_growth >= wacc`) return 422 with per-field messages.
 
 ### Rate limit
 
-Valuation requests are capped at **100 per UTC day**. Calls made through the
-website use the same `/v1/valuations/{ticker}` endpoint and count toward the
-same limit. Responses include `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and
-`X-RateLimit-Reset`; exhausted callers receive `429` with `Retry-After`.
+Valuation requests are capped at **100 per API key per UTC day** by default.
+Calls made through the website use the same `/v1/valuations/{ticker}` endpoint
+and count toward the same key quota. Responses include `X-RateLimit-Limit`,
+`X-RateLimit-Remaining`, and `X-RateLimit-Reset`; exhausted callers receive
+`429` with `Retry-After`.
 
-This first guard is intentionally in-process for the current Vercel deployment,
-so it is reliable per warm function instance. A strict global customer quota
-will move to Redis/Postgres with API keys and metering in the planned storage
-phase.
+Production deployments should set `SUPABASE_URL` and
+`SUPABASE_SERVICE_ROLE_KEY`. When both are present, `/v1/valuations/{ticker}`
+requires `X-API-Key`, validates hashed key records from Supabase, consumes a
+shared atomic daily quota, and records usage events. Without Supabase
+configuration, the app falls back to the in-process limiter for local
+development and tests only.
 
 The fundamentals service also **negative-caches** these definitive rejections,
 so a client repeatedly requesting a bad or uncovered ticker doesn't spend an
@@ -91,7 +94,7 @@ the selected data auditable.
 | Fundamentals service — fetch + normalize + TTL cache | `app/fundamentals.py` | ✅ done |
 | API layer — FastAPI routes, validation, error mapping | `app/api.py`, `app/schemas.py` | ✅ done |
 | Customer website — landing page, API reference, and live valuation UI | `docs/index.html` served at `/` | ✅ done |
-| Postgres / Redis storage, per-key metering | — | planned |
+| Supabase auth/quota/metering | `app/supabase.py`, `supabase/migrations/` | code ready; DB setup required |
 
 The engine is a pure function — `compute_dcf(base_financials, assumptions) ->
 valuation` — so it's unit-tested in isolation against hand-computed spreadsheet
@@ -102,6 +105,10 @@ rise with terminal growth, and enterprise value must always reconcile to
 ## Getting started
 
 Requires Python 3.11+.
+
+Runtime dependencies are intentionally small for open-source and Vercel use:
+FastAPI for the HTTP surface and httpx for provider calls. Local conveniences
+such as `uvicorn` and `.env` loading live in the `dev` extra.
 
 ```bash
 python -m venv .venv
@@ -131,8 +138,67 @@ supports Python 3.13, and the project declares its supported range in
 python -m pytest -q
 ```
 
-All 63 tests — engine, data layer, and API — run against recorded fixture
-payloads (`tests/fixtures/fmp/`) via a mock transport. No network required.
+The test suite — engine, data layer, API, auth, quota, and Supabase integration
+contracts — runs against recorded fixture payloads (`tests/fixtures/fmp/`) and
+mock transports. No network required.
+
+### Configure Supabase auth and quotas
+
+Run `supabase/migrations/001_phase5_auth_usage.sql` in your Supabase project,
+then set these Vercel server-side environment variables:
+
+```bash
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+```
+
+Create an API key from a trusted terminal:
+
+```bash
+python scripts/create_api_key.py --customer-name "Example Customer"
+```
+
+Report recent usage events:
+
+```bash
+python scripts/report_usage.py --limit 50
+```
+
+Only the generated key hash is stored. The full key is printed once and should
+be copied into the customer's secret manager.
+
+### Customer sign-in with GitHub (self-service API keys)
+
+Phase 6 lets a customer sign in with GitHub and generate/manage their own API
+keys from the website, instead of only through the admin script above. Human
+login sessions are a separate credential class from `X-API-Key` machine auth —
+a login session is never usable as an API key.
+
+1. Run `supabase/migrations/002_phase6_customer_login.sql` (after `001`).
+2. Create a GitHub OAuth App at
+   [github.com/settings/developers](https://github.com/settings/developers) →
+   New OAuth App. Set **Authorization callback URL** to:
+   ```
+   https://YOUR-PROJECT-REF.supabase.co/auth/v1/callback
+   ```
+3. In the Supabase dashboard: **Authentication → Providers → GitHub** — enable
+   it and paste the GitHub OAuth App's Client ID and Client Secret.
+4. In the Supabase dashboard: **Authentication → URL Configuration → Redirect
+   URLs** — add `{PUBLIC_BASE_URL}/v1/auth/callback` for every environment
+   (e.g. `http://127.0.0.1:8000/v1/auth/callback` for local dev, and your
+   production URL).
+5. Set `PUBLIC_BASE_URL` (see `.env.example`) to this deployment's own public
+   URL, with no trailing slash, matching step 4 exactly.
+
+No `SUPABASE_ANON_KEY` or GitHub client secret is needed in this app's own
+environment — GitHub OAuth App credentials live only in the Supabase
+dashboard, and the existing `SUPABASE_SERVICE_ROLE_KEY` doubles as the
+`apikey` header Supabase Auth requires; it never reaches the browser.
+
+Once configured, a customer visits `/`, opens **Your account**, signs in with
+GitHub, and can create/label/revoke up to 5 active keys — each fixed to the
+`valuation:read` scope and a 100/day quota. The admin script remains the path
+for support-issued keys needing a custom quota or scope.
 
 ### Run the API server
 
