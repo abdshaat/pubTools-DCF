@@ -163,6 +163,10 @@ class CreateKeyRequest(BaseModel):
     label: str | None = Field(default=None, max_length=64)
 
 
+class RenameKeyRequest(BaseModel):
+    label: str | None = Field(default=None, max_length=64)
+
+
 class ApiKeySummaryOut(BaseModel):
     id: str
     prefix: str

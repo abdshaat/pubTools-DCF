@@ -302,6 +302,28 @@ class SupabaseClient:
             raise SupabaseError("Supabase key rotation returned a non-list payload")
         return payload[0] if payload else None
 
+    async def rename_customer_key(
+        self, *, customer_id: str, key_id: str, label: str | None
+    ) -> dict[str, Any] | None:
+        """Updates a key's label only. Scoped to non-revoked keys owned by
+        `customer_id`, same ownership-check pattern as rotate/revoke."""
+        response = await self._client.patch(
+            "/rest/v1/api_keys",
+            params={
+                "id": f"eq.{key_id}",
+                "customer_id": f"eq.{customer_id}",
+                "revoked": "eq.false",
+            },
+            headers={"Prefer": "return=representation"},
+            json={"label": label},
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase key rename failed")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise SupabaseError("Supabase key rename returned a non-list payload")
+        return payload[0] if payload else None
+
     async def record_audit_event(
         self,
         *,

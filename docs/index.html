@@ -775,7 +775,7 @@ FMP_API_KEY=your-key-here</code></pre>
   <h2>Your account</h2>
   <p>Sign in to generate your own API key instantly — no waiting on an
   operator. Keys you create here are scoped to your account only, and you can label,
-  list, and revoke them at any time.</p>
+  rename, rotate, and revoke them at any time.</p>
 
   <div id="account-error" class="note" hidden></div>
   <div id="account-email-sent" class="note tip" hidden></div>
@@ -1568,10 +1568,22 @@ FMP_API_KEY=your-key-here</code></pre>
       row.appendChild(value);
 
       if (!key.revoked) {
+        var renameBtn = document.createElement("button");
+        renameBtn.type = "button";
+        renameBtn.className = "run";
+        renameBtn.style.marginLeft = "12px";
+        renameBtn.style.background = "var(--panel)";
+        renameBtn.style.color = "var(--ink)";
+        renameBtn.style.border = "1px solid var(--line)";
+        renameBtn.textContent = "Rename";
+        renameBtn.title = "Change this key's label. Does not affect the secret or quota.";
+        renameBtn.addEventListener("click", function () { renameKey(key.id, key.label); });
+        row.appendChild(renameBtn);
+
         var rotateBtn = document.createElement("button");
         rotateBtn.type = "button";
         rotateBtn.className = "run";
-        rotateBtn.style.marginLeft = "12px";
+        rotateBtn.style.marginLeft = "8px";
         rotateBtn.style.background = "var(--panel)";
         rotateBtn.style.color = "var(--ink)";
         rotateBtn.style.border = "1px solid var(--line)";
@@ -1626,6 +1638,22 @@ FMP_API_KEY=your-key-here</code></pre>
     var body = await response.json();
     showNewKey(body.api_key);
     $("account-key-label").value = "";
+    loadKeys();
+  }
+
+  async function renameKey(id, currentLabel) {
+    var next = window.prompt("New label for this key (blank to clear):", currentLabel || "");
+    if (next === null) return; // cancelled
+    var response = await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/rename", {
+      method: "POST",
+      credentials: "same-origin",
+      headers: csrfHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ label: next.trim() || null })
+    });
+    if (!response.ok) {
+      showError("Could not rename that key. Try reloading the page.");
+      return;
+    }
     loadKeys();
   }
 

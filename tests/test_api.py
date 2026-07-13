@@ -1283,6 +1283,122 @@ def test_rotate_account_key_requires_session():
     assert response.status_code == 401
 
 
+def test_rename_account_key_changes_label_without_touching_the_secret():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        created = test_client.post(
+            "/v1/account/keys",
+            json={"label": "old label"},
+            headers=_csrf_headers(test_client),
+        ).json()
+
+        rename_resp = test_client.post(
+            f"/v1/account/keys/{created['id']}/rename",
+            json={"label": "new label"},
+            headers=_csrf_headers(test_client),
+        )
+        assert rename_resp.status_code == 200
+        renamed = rename_resp.json()
+        assert renamed["id"] == created["id"]
+        assert renamed["label"] == "new label"
+        assert "api_key" not in renamed  # rename never returns a secret
+
+        # the original secret still authenticates -- rename never touches it
+        valuation = test_client.get(
+            f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": created["api_key"]}
+        )
+        assert valuation.status_code == 200
+
+
+def test_rename_account_key_returns_404_for_revoked_key():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        created = test_client.post(
+            "/v1/account/keys", json={}, headers=_csrf_headers(test_client)
+        ).json()
+        assert (
+            test_client.post(
+                f"/v1/account/keys/{created['id']}/revoke",
+                headers=_csrf_headers(test_client),
+            ).status_code
+            == 200
+        )
+
+        rename_resp = test_client.post(
+            f"/v1/account/keys/{created['id']}/rename",
+            json={"label": "x"},
+            headers=_csrf_headers(test_client),
+        )
+
+    assert rename_resp.status_code == 404
+    assert rename_resp.json()["error"]["code"] == "account_key_not_found"
+
+
+def test_rename_account_key_rejects_wrong_customer():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-alice", user_id="gh-alice", email="alice@example.com", user_name="alice"
+    )
+    backend.register_login_code(
+        "code-bob", user_id="gh-bob", email="bob@example.com", user_name="bob"
+    )
+    app = _accounts_app(backend)
+
+    with TestClient(app) as alice, TestClient(app) as bob:
+        _login(alice, code="code-alice")
+        _login(bob, code="code-bob")
+
+        alice_key = alice.post(
+            "/v1/account/keys", json={"label": "mine"}, headers=_csrf_headers(alice)
+        ).json()
+
+        bob_rename = bob.post(
+            f"/v1/account/keys/{alice_key['id']}/rename",
+            json={"label": "stolen"},
+            headers=_csrf_headers(bob),
+        )
+        assert bob_rename.status_code == 404
+
+        # unaffected: alice's key keeps its original label
+        alice_keys = alice.get("/v1/account/keys").json()["keys"]
+        assert next(k for k in alice_keys if k["id"] == alice_key["id"])["label"] == "mine"
+
+
+def test_rename_account_key_requires_session():
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.post("/v1/account/keys/some-id/rename", json={"label": "x"})
+    assert response.status_code == 401
+
+
+def test_rename_account_key_requires_csrf_token():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        created = test_client.post(
+            "/v1/account/keys", json={}, headers=_csrf_headers(test_client)
+        ).json()
+
+        rejected = test_client.post(
+            f"/v1/account/keys/{created['id']}/rename",
+            json={"label": "x"},
+            headers={CSRF_HEADER: "wrong-token"},
+        )
+    assert rejected.status_code == 403
+    assert rejected.json()["error"]["code"] == "csrf_failed"
+
+
 def test_self_service_key_creation_enforces_active_key_limit():
     backend = FakeSupabaseBackend()
     backend.register_login_code(

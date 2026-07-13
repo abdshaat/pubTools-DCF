@@ -48,6 +48,7 @@ from .accounts import (
     get_current_customer,
     list_keys,
     public_base_url,
+    rename_key,
     request_email_login,
     revoke_key,
     rotate_key,
@@ -79,10 +80,12 @@ from .rate_limit import DailyRequestLimiter, RateLimitResult
 from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
+    ApiKeySummaryOut,
     CreateKeyRequest,
     EmailLoginRequest,
     ErrorResponse,
     MeOut,
+    RenameKeyRequest,
     ValuationResponse,
     build_api_key_summary,
     build_valuation_response,
@@ -825,6 +828,33 @@ def create_app(
                 mode="json"
             )
         )
+        return _with_refreshed_session(request, response, refreshed)
+
+    @app.post(
+        "/v1/account/keys/{key_id}/rename",
+        response_model=ApiKeySummaryOut,
+        include_in_schema=False,
+    )
+    async def rename_account_key(
+        request: Request, key_id: str, payload: RenameKeyRequest
+    ) -> JSONResponse:
+        context = await _account_context(request)
+        if isinstance(context, JSONResponse):
+            return context
+        csrf_error = _require_csrf(request)
+        if csrf_error is not None:
+            return csrf_error
+        account, supabase_client, refreshed = context
+        try:
+            record = await rename_key(
+                supabase_client,
+                customer_id=account.customer_id,
+                key_id=key_id,
+                label=payload.label,
+            )
+        except AccountKeyNotFoundError:
+            return _account_key_not_found(request)
+        response = JSONResponse(content=build_api_key_summary(record).model_dump(mode="json"))
         return _with_refreshed_session(request, response, refreshed)
 
     @app.get(

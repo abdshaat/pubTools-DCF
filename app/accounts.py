@@ -423,3 +423,24 @@ async def rotate_key(
     )
     enriched = await _with_usage_today(supabase_client, updated)
     return enriched, full_key
+
+
+async def rename_key(
+    supabase_client: SupabaseClient, *, customer_id: str, key_id: str, label: str | None
+) -> dict[str, Any]:
+    """Changes a key's label only -- never its secret, scope, or quota.
+    Revoked keys can't be renamed (same not-found-shaped rejection as
+    rotating one), consistent with the UI hiding all actions on revoked rows.
+    """
+    updated = await supabase_client.rename_customer_key(
+        customer_id=customer_id, key_id=key_id, label=label
+    )
+    if updated is None:
+        raise AccountKeyNotFoundError("API key not found")
+    await supabase_client.record_audit_event(
+        customer_id=customer_id,
+        api_key_id=key_id,
+        action="account.key_renamed",
+        metadata={"label": label},
+    )
+    return await _with_usage_today(supabase_client, updated)

@@ -24,6 +24,7 @@ from app.accounts import (
     get_current_customer,
     is_valid_email,
     list_keys,
+    rename_key,
     request_email_login,
     revoke_key,
     rotate_key,
@@ -255,6 +256,93 @@ def test_rotate_key_rejects_nonexistent_key():
     async def exercise():
         with pytest.raises(AccountKeyNotFoundError):
             await rotate_key(client, customer_id="cust-1", key_id="does-not-exist")
+
+    _run(exercise())
+
+
+def test_rename_key_changes_label_only():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, full_key = await create_key(client, customer_id="cust-1", label="old label")
+        old_hash = APIKeyAuthenticator.hash_secret(full_key)
+
+        updated = await rename_key(
+            client, customer_id="cust-1", key_id=record["id"], label="new label"
+        )
+
+        assert updated["id"] == record["id"]
+        assert updated["label"] == "new label"
+        stored = backend.keys[0]
+        assert stored["prefix"] == record["prefix"]  # unrelated fields preserved
+        assert stored["secret_hash"] == old_hash  # secret untouched
+        assert any(e["action"] == "account.key_renamed" for e in backend.audit_events)
+
+    _run(exercise())
+
+
+def test_rename_key_can_clear_the_label():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label="old label")
+        updated = await rename_key(client, customer_id="cust-1", key_id=record["id"], label=None)
+        assert updated["label"] is None
+
+    _run(exercise())
+
+
+def test_rename_key_rejects_wrong_customer():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-a", "name": "alice", "email": None, "auth_user_id": "gh-a"}
+    )
+    backend.customers.append({"id": "cust-b", "name": "bob", "email": None, "auth_user_id": "gh-b"})
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-a", label="mine")
+        with pytest.raises(AccountKeyNotFoundError):
+            await rename_key(client, customer_id="cust-b", key_id=record["id"], label="stolen")
+        assert backend.keys[0]["label"] == "mine"
+
+    _run(exercise())
+
+
+def test_rename_key_rejects_revoked_key():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        record, _ = await create_key(client, customer_id="cust-1", label=None)
+        await revoke_key(client, customer_id="cust-1", key_id=record["id"])
+        with pytest.raises(AccountKeyNotFoundError):
+            await rename_key(client, customer_id="cust-1", key_id=record["id"], label="x")
+
+    _run(exercise())
+
+
+def test_rename_key_rejects_nonexistent_key():
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        with pytest.raises(AccountKeyNotFoundError):
+            await rename_key(client, customer_id="cust-1", key_id="does-not-exist", label="x")
 
     _run(exercise())
 
