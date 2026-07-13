@@ -168,6 +168,30 @@ def _rate_limit_headers(result: RateLimitResult) -> dict[str, str]:
     return headers
 
 
+def _over_quota_response(request: Request, result: RateLimitResult) -> JSONResponse:
+    response = JSONResponse(
+        status_code=429,
+        content={
+            "detail": "daily valuation request limit exceeded",
+            "error": {
+                "version": "1",
+                "code": "rate_limit_exceeded",
+                "message": "Daily valuation request limit exceeded.",
+                "request_id": request.state.request_id,
+                "fields": [],
+            },
+        },
+        # Rate-limit headers stay ONLY on the 429 (never cached); they are
+        # deliberately absent from cacheable valuation responses so a shared
+        # cache can't leak one caller's quota state to another.
+        headers=_rate_limit_headers(result),
+    )
+    response.headers["Cache-Control"] = NO_STORE
+    response.headers["X-Request-ID"] = request.state.request_id
+    response.headers.update(_SECURITY_HEADERS)
+    return response
+
+
 def _auth_error_response(
     request: Request,
     *,
@@ -190,6 +214,7 @@ def _auth_error_response(
         },
         headers=headers,
     )
+    response.headers["Cache-Control"] = NO_STORE
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers.update(_SECURITY_HEADERS)
     return response
@@ -209,6 +234,7 @@ def _storage_error_response(request: Request) -> JSONResponse:
             },
         },
     )
+    response.headers["Cache-Control"] = NO_STORE
     response.headers["X-Request-ID"] = request.state.request_id
     response.headers.update(_SECURITY_HEADERS)
     return response
@@ -356,27 +382,7 @@ def create_app(
             except SupabaseError:
                 return _storage_error_response(request)
             if not peek.allowed:
-                response = JSONResponse(
-                    status_code=429,
-                    content={
-                        "detail": "daily valuation request limit exceeded",
-                        "error": {
-                            "version": "1",
-                            "code": "rate_limit_exceeded",
-                            "message": "Daily valuation request limit exceeded.",
-                            "request_id": request.state.request_id,
-                            "fields": [],
-                        },
-                    },
-                    # Rate-limit headers stay ONLY on the 429 (never cached);
-                    # they are deliberately absent from cacheable valuation
-                    # responses so a shared cache can't leak one caller's quota
-                    # state to another.
-                    headers=_rate_limit_headers(peek),
-                )
-                response.headers["Cache-Control"] = NO_STORE
-                response.headers["X-Request-ID"] = request.state.request_id
-                response.headers.update(_SECURITY_HEADERS)
+                response = _over_quota_response(request, peek)
                 if request.app.state.usage_meter is not None:
                     with suppress(SupabaseError):
                         await request.app.state.usage_meter.record(
@@ -401,7 +407,7 @@ def create_app(
         # "invalid requests count against the limit" behavior.
         if is_valuation and not request.state.is_not_modified:
             try:
-                await _resolve(
+                consumed = await _resolve(
                     request.app.state.rate_limiter.check_and_increment(
                         identity=identity, limit=limit
                     )
@@ -409,6 +415,26 @@ def create_app(
             except SupabaseError:
                 # Fail closed: never serve a valuation we couldn't meter.
                 return _storage_error_response(request)
+            if not consumed.allowed:
+                # The Phase A peek passed (possibly stale under a concurrent
+                # burst), but the atomic consume itself refused: this caller
+                # is genuinely at/over the limit. Never serve the
+                # already-computed response in that case -- replace it with
+                # the same 429 the pre-flight gate would have returned.
+                response = _over_quota_response(request, consumed)
+                if request.app.state.usage_meter is not None:
+                    with suppress(SupabaseError):
+                        await request.app.state.usage_meter.record(
+                            request_id=request.state.request_id,
+                            principal=principal,
+                            method=request.method,
+                            path=request.url.path,
+                            status_code=429,
+                            ticker=valuation_ticker,
+                            quota_consumed=False,
+                            rate_limited=True,
+                        )
+                return response
             # Error responses on the valuation path must never be cached.
             if response.status_code not in (200, 304):
                 response.headers["Cache-Control"] = NO_STORE

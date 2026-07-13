@@ -7,6 +7,7 @@ shaping, error mapping) is exercised without network or API key.
 
 import hashlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
@@ -21,6 +22,7 @@ from app.api import _default_raw_sink, create_app
 from app.auth import APIKeyAuthenticator, APIKeyRecord
 from app.http_cache import VALUATION_CACHE_CONTROL
 from app.providers.fmp import FileRawSink, FMPClient
+from app.rate_limit import DailyRequestLimiter
 from app.supabase import (
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
@@ -489,6 +491,9 @@ def test_missing_malformed_or_unknown_api_key_returns_401(header_value: str | No
     assert unauthorized.headers["WWW-Authenticate"] == "ApiKey"
     assert unauthorized.json()["error"]["code"] == "invalid_api_key"
     assert key not in unauthorized.text
+    # A pre-flight auth failure must never be shared-cacheable: it's
+    # per-caller and runs before quota/compute, unlike the metered 200/304.
+    assert unauthorized.headers["Cache-Control"] == "no-store"
     assert authorized.status_code == 200
     # Phase 7: cacheable valuation responses carry an ETag and never leak the
     # caller's per-key quota state via X-RateLimit-* headers.
@@ -1465,3 +1470,41 @@ def test_over_quota_blocks_even_a_would_be_304():
         )
     assert response.status_code == 429
     assert response.headers["Cache-Control"] == "no-store"
+
+
+class _StalePeekRateLimiter:
+    """Simulates the accepted Phase 7 race: the pre-flight peek() reports a
+    stale "under limit" view (as it would under a concurrent burst, since
+    peek doesn't reserve a slot), but the atomic check_and_increment() --
+    the real datastore's serialized consume -- correctly refuses once the
+    limit is reached. Wraps a real DailyRequestLimiter so consume semantics
+    (exact, non-overshooting) match production; only peek() is forced."""
+
+    def __init__(self, limit: int):
+        self._real = DailyRequestLimiter(limit)
+
+    async def peek(self, *, identity: str = "anonymous", limit: int | None = None):
+        real_result = self._real.peek(identity=identity, limit=limit)
+        return replace(real_result, allowed=True, remaining=max(real_result.remaining, 1))
+
+    async def check_and_increment(self, *, identity: str = "anonymous", limit: int | None = None):
+        return self._real.check_and_increment(identity=identity, limit=limit)
+
+
+def test_stale_peek_does_not_let_an_over_limit_consume_serve_a_200():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    limiter = _StalePeekRateLimiter(limit=1)
+    with TestClient(
+        create_app(fmp_client=fmp, rate_limiter=limiter, daily_rate_limit=1)
+    ) as test_client:
+        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        assert first.status_code == 200  # fills the real quota to 1/1
+
+        # peek() is forced to report "allowed" again (the race), but the
+        # real consume must still refuse and the caller must get a 429, not
+        # the already-computed 200 body.
+        second = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert second.status_code == 429
+    assert second.headers["Cache-Control"] == "no-store"
+    assert "X-RateLimit-Remaining" in second.headers
