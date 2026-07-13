@@ -1229,19 +1229,6 @@ FMP_API_KEY=your-key-here</code></pre>
 
   var $ = function (id) { return document.getElementById(id); };
 
-  function cookieValue(name) {
-    return document.cookie
-      .split(";")
-      .map(function (part) { return part.trim(); })
-      .filter(function (part) { return part.indexOf(name + "=") === 0; })
-      .map(function (part) { return decodeURIComponent(part.slice(name.length + 1)); })[0] || "";
-  }
-
-  function csrfHeaders(extra) {
-    var headers = extra || {};
-    headers["X-CSRF-Token"] = cookieValue("pt_csrf");
-    return headers;
-  }
   var mode = "single";
   var currentUrl = "";
 
@@ -1501,6 +1488,20 @@ FMP_API_KEY=your-key-here</code></pre>
   "use strict";
   var $ = function (id) { return document.getElementById(id); };
 
+  function cookieValue(name) {
+    return document.cookie
+      .split(";")
+      .map(function (part) { return part.trim(); })
+      .filter(function (part) { return part.indexOf(name + "=") === 0; })
+      .map(function (part) { return decodeURIComponent(part.slice(name.length + 1)); })[0] || "";
+  }
+
+  function csrfHeaders(extra) {
+    var headers = extra || {};
+    headers["X-CSRF-Token"] = cookieValue("pt_csrf");
+    return headers;
+  }
+
   function showError(message) {
     var box = $("account-error");
     box.textContent = message;
@@ -1629,11 +1630,15 @@ FMP_API_KEY=your-key-here</code></pre>
   }
 
   async function revokeKey(id) {
-    await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/revoke", {
+    var response = await fetch("/v1/account/keys/" + encodeURIComponent(id) + "/revoke", {
       method: "POST",
       credentials: "same-origin",
       headers: csrfHeaders()
     });
+    if (!response.ok) {
+      showError("Could not revoke that key. Try reloading the page.");
+      return;
+    }
     loadKeys();
   }
 
@@ -1653,11 +1658,15 @@ FMP_API_KEY=your-key-here</code></pre>
   }
 
   async function signOut() {
-    await fetch("/v1/auth/logout", {
+    var response = await fetch("/v1/auth/logout", {
       method: "POST",
       credentials: "same-origin",
       headers: csrfHeaders()
     });
+    if (!response.ok) {
+      showError("Could not sign out. Try reloading the page.");
+      return;
+    }
     window.location.reload();
   }
 
