@@ -736,11 +736,10 @@ FMP_API_KEY=your-key-here</code></pre>
 <section id="authentication">
   <h2>Authentication</h2>
   <p>Requests are authenticated with an API key sent in the <code>X-API-Key</code> header:</p>
-  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> <span class="s">"https://api.example.com/v1/valuations/AAPL?..."</span></code></pre>
+  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> <span class="s">"https://pub-tools-dcf-nu.vercel.app/v1/valuations/AAPL?..."</span></code></pre>
   <div class="note"><strong>Production:</strong> Supabase-backed deployments require API keys and usage metering is
-  enforced for valuation requests. Public landing, health, and OpenAPI endpoints remain public.</div><!--
-  general availability — include it now so your integration doesn't break later.</div>
-  --><div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per API key
+  enforced for valuation requests. Public landing, health, and OpenAPI endpoints remain public.</div>
+  <div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per API key
   per UTC day by default. Calls made from this website use the same API endpoint and count toward the same key limit.
   A <code>429</code> response carries <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
   <code>X-RateLimit-Reset</code>, and <code>Retry-After</code>. Successful (<code>200</code>) valuation responses
@@ -750,7 +749,7 @@ FMP_API_KEY=your-key-here</code></pre>
   <p>Valuation responses are safely HTTP-cacheable. Each carries a strong
   <code>ETag</code> and <code>Cache-Control: public</code>, so you (and any shared CDN in front of the API)
   can reuse a result and revalidate cheaply with a conditional request:</p>
-  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> -H <span class="s">'If-None-Match: "&lt;etag&gt;"'</span> <span class="s">"https://api.example.com/v1/valuations/AAPL?..."</span></code></pre>
+  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> -H <span class="s">'If-None-Match: "&lt;etag&gt;"'</span> <span class="s">"https://pub-tools-dcf-nu.vercel.app/v1/valuations/AAPL?..."</span></code></pre>
   <p>If the valuation is unchanged you get a <code>304 Not Modified</code> with no body. <strong>A 304 is
   free</strong> — it does not count against your daily quota. The <code>ETag</code> changes automatically whenever
   anything you can observe changes (the price, the underlying financials, or the model version), so a matching
