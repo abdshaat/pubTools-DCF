@@ -4,7 +4,7 @@ The GET valuation endpoint is designed to be HTTP-cacheable. This module holds
 the pure, I/O-free pieces of that: a deterministic ETag over a response's
 *content*, and conditional-request (`If-None-Match`) matching.
 
-Caching-audience decision (see IMPLEMENTATION_PLAN.md Phase 7): valuation
+Caching-audience decision (see project-docs/IMPLEMENTATION_PLAN.md Phase 7): valuation
 responses are `Cache-Control: public`, so a shared CDN/edge cache may serve a
 cached valuation to any caller of the same URL. A cache hit never reaches this
 app's origin, so it never runs auth/quota -- accepted because a valuation is a

@@ -229,7 +229,7 @@ sign-in for real customers, configure a custom SMTP provider under
 **Note:** a customer who signs in with GitHub and later with email (or vice
 versa) using the same address currently gets **two separate accounts** —
 Supabase identity linking across providers isn't wired up yet (tracked in
-`IMPLEMENTATION_PLAN.md` Phase 6).
+`project-docs/IMPLEMENTATION_PLAN.md` Phase 6).
 
 ### Run the API server
 
@@ -319,3 +319,7 @@ tests/
   documented there (FMP reports capex negative; `changeInWorkingCapital` is
   cash impact and gets sign-flipped). Don't "fix" these.
 - `CLAUDE.md` holds the full design spec and decisions already made.
+- `project-docs/` holds everything else non-README: the implementation plan,
+  session progress log, architecture decisions, the frontend design skill
+  notes, and open issues. None of it is tracked in git (see `.gitignore`'s
+  markdown rule) — it's local working context, not published documentation.

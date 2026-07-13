@@ -21,7 +21,7 @@ distinct from an `api_keys` row. v1 scope: one login owns exactly one customer
 record (enforced by a unique constraint on `api_customers.auth_user_id`); a
 customer who signs in with both GitHub and email gets two separate accounts
 today -- Supabase identity linking across providers is not wired up (deferred,
-see IMPLEMENTATION_PLAN.md Phase 6).
+see project-docs/IMPLEMENTATION_PLAN.md Phase 6).
 """
 
 import asyncio

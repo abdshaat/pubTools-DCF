@@ -83,7 +83,8 @@ supabase/.env.*
 *~
 
 # --- Local notes / editor ---
-# Ignore Markdown planning/instruction files. Keep the public repository README.
+# Ignore Markdown planning/instruction files (mostly under project-docs/, plus
+# root-level CLAUDE.md). Keep the public repository README.
 *.md
 *.MD
 !README.md
