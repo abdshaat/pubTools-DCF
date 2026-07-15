@@ -338,5 +338,6 @@ tests/
 - `CLAUDE.md` holds the full design spec and decisions already made.
 - `project-docs/` holds everything else non-README: the implementation plan,
   session progress log, architecture decisions, the frontend design skill
-  notes, and open issues. None of it is tracked in git (see `.gitignore`'s
-  markdown rule) — it's local working context, not published documentation.
+  notes, request-flow reference, and open issues. These files are tracked and
+  published so contributors can review the roadmap, current state, and design
+  rationale.
