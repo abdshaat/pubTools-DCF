@@ -27,6 +27,7 @@ from app.fundamentals import FundamentalsService
 from app.models import Assumptions
 from app.normalization import normalize_fmp_fundamentals, normalize_fmp_quote
 from app.providers.fmp import FMPClient, FMPFundamentals
+from app.redis_cache import InMemoryRedisBackend
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fmp"
 
@@ -662,6 +663,174 @@ def test_same_ticker_cold_burst_uses_one_provider_load():
     results = asyncio.run(scenario())
     assert {result.ticker for result in results} == {"AAPL"}
     assert len(call_log) == 5
+
+
+def test_two_service_instances_share_redis_and_one_provider_load():
+    call_log = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        symbol = request.url.params.get("symbol", "")
+        call_log.append((endpoint, symbol))
+        await asyncio.sleep(0.01)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def scenario():
+        redis = InMemoryRedisBackend()
+        async with (
+            make_client(transport=httpx.MockTransport(handler)) as first_client,
+            make_client(transport=httpx.MockTransport(handler)) as second_client,
+        ):
+            first = FundamentalsService(
+                first_client,
+                redis=redis,
+                redis_poll_seconds=1,
+                redis_poll_interval_seconds=0.005,
+            )
+            second = FundamentalsService(
+                second_client,
+                redis=redis,
+                redis_poll_seconds=1,
+                redis_poll_interval_seconds=0.005,
+            )
+            first_task = asyncio.create_task(first.get_base_financials("AAPL"))
+            await asyncio.sleep(0)
+            second_task = asyncio.create_task(second.get_base_financials("AAPL"))
+            return await asyncio.gather(first_task, second_task)
+
+    first, second = asyncio.run(scenario())
+    assert first == second
+    assert len(call_log) == 5
+
+
+def test_corrupt_distributed_fundamentals_entry_is_replaced_not_surfaced():
+    call_log = []
+
+    async def scenario():
+        redis = InMemoryRedisBackend()
+        await redis.set("dcf:v1:fund:AAPL", '{"v":1,"t":1,"d":{"bad":true}}', ex=3600)
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            result = await FundamentalsService(client, redis=redis).get_base_financials("AAPL")
+        return result, await redis.get("dcf:v1:fund:AAPL")
+
+    result, stored = asyncio.run(scenario())
+    assert result.ticker == "AAPL"
+    assert len(call_log) == 5
+    assert stored is not None and '"ticker":"AAPL"' in stored
+
+
+def test_redis_outage_fails_open_to_provider_fetch():
+    class UnavailableRedis(InMemoryRedisBackend):
+        async def get(self, key: str) -> str | None:
+            raise OSError("redis unavailable")
+
+        async def set(self, key: str, value: str, **kwargs) -> bool:
+            raise OSError("redis unavailable")
+
+    call_log = []
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            return await FundamentalsService(client, redis=UnavailableRedis()).get_base_financials(
+                "AAPL"
+            )
+
+    result = asyncio.run(scenario())
+    assert result.ticker == "AAPL"
+    assert len(call_log) == 5
+
+
+def test_crashed_distributed_lock_holder_never_blocks_provider_fallback():
+    call_log = []
+
+    async def scenario():
+        redis = InMemoryRedisBackend()
+        assert await redis.set("dcf:v1:lock:fund:AAPL", "crashed", px=45_000, nx=True)
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            return await FundamentalsService(
+                client,
+                redis=redis,
+                redis_poll_seconds=0,
+            ).get_base_financials("AAPL")
+
+    result = asyncio.run(scenario())
+    assert result.ticker == "AAPL"
+    assert len(call_log) == 5
+
+
+def test_negative_result_is_shared_between_service_instances():
+    call_log = []
+
+    async def scenario():
+        redis = InMemoryRedisBackend()
+        async with make_client(transport=fixture_transport(call_log)) as first_client:
+            first = FundamentalsService(first_client, redis=redis)
+            with pytest.raises(TickerNotFoundError):
+                await first.get_base_financials("UNKNOWN")
+        calls_after_first = len(call_log)
+        async with make_client(transport=fixture_transport(call_log)) as second_client:
+            second = FundamentalsService(second_client, redis=redis)
+            with pytest.raises(TickerNotFoundError):
+                await second.get_base_financials("UNKNOWN")
+        return calls_after_first
+
+    calls_after_first = asyncio.run(scenario())
+    assert calls_after_first == 5
+    assert len(call_log) == calls_after_first
+
+
+def test_distributed_stale_statement_is_used_only_after_refresh_failure():
+    clock = {"t": 0.0}
+    initial_calls = []
+    refresh_calls = []
+
+    def failing_handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        refresh_calls.append(endpoint)
+        if endpoint == "income-statement":
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    async def no_sleep(seconds: float) -> None:
+        pass
+
+    async def scenario():
+        redis = InMemoryRedisBackend(now=lambda: clock["t"])
+        async with make_client(transport=fixture_transport(initial_calls)) as first_client:
+            first = FundamentalsService(
+                first_client,
+                ttl_seconds=60,
+                quote_ttl_seconds=3600,
+                max_statement_staleness_seconds=3600,
+                now=lambda: clock["t"],
+                wall_now=lambda: clock["t"],
+                redis=redis,
+            )
+            await first.get_base_financials("AAPL")
+
+        clock["t"] = 61
+        async with make_client(
+            transport=httpx.MockTransport(failing_handler), max_retries=0, sleep=no_sleep
+        ) as second_client:
+            second = FundamentalsService(
+                second_client,
+                ttl_seconds=60,
+                quote_ttl_seconds=3600,
+                max_statement_staleness_seconds=3600,
+                now=lambda: clock["t"],
+                wall_now=lambda: clock["t"],
+                redis=redis,
+            )
+            return await second.get_base_financials("AAPL")
+
+    result = asyncio.run(scenario())
+    assert len(initial_calls) == 5
+    assert set(refresh_calls) == {
+        "income-statement",
+        "balance-sheet-statement",
+        "cash-flow-statement",
+    }
+    assert any("bounded stale statement" in warning for warning in result.data_quality_warnings)
 
 
 def test_waiter_cancellation_does_not_cancel_shared_provider_load():

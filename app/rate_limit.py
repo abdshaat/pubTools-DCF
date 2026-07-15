@@ -1,14 +1,19 @@
-"""Small in-process daily request limiter.
+"""Daily request limiters.
 
-This protects the current unauthenticated valuation endpoint from casual
-overuse. On Vercel it is intentionally only a warm-instance guard; Phase 5/8
-will replace it with Redis/Postgres-backed counters for a strict global quota.
+`DailyRequestLimiter` is the small in-process counter: on Vercel it is only a
+warm-instance guard. The API-key valuation quota outgrew it in Phase 5
+(Supabase RPC, durable and atomic). `RedisLoginRateLimiter` (Phase 8 Slice B)
+gives the per-IP login limiter real cross-instance enforcement via Redis,
+falling back to the in-process limiter whenever Redis is unavailable —
+abuse control degrades, logins keep working.
 """
 
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+
+from .redis_cache import REDIS_KEY_PREFIX, RedisBackend
 
 
 @dataclass(frozen=True)
@@ -108,4 +113,71 @@ class DailyRequestLimiter:
             remaining=effective_limit - count,
             reset_epoch=reset_epoch,
             retry_after=retry_after,
+        )
+
+
+class RedisLoginRateLimiter:
+    """Cross-instance daily counter for login attempts (Phase 8 Slice B).
+
+    One `INCR` + `EXPIRE` per attempt against `dcf:v1:login:{identity}:{date}`.
+    The key embeds the UTC date, so unconditionally refreshing the TTL on
+    every increment is safe (the key is never consulted after its day ends)
+    and removes the classic "INCR succeeded but EXPIRE never ran" leak — a
+    later attempt on the same key repairs the TTL.
+
+    Fail-open by design: any Redis failure delegates the decision to the
+    in-process fallback limiter, so a Redis outage can never block sign-in.
+    """
+
+    # Keys outlive their day by this much so a clock-skewed instance can't
+    # expire a counter another instance still considers current.
+    _TTL_SLACK_SECONDS = 60
+
+    def __init__(
+        self,
+        backend: RedisBackend,
+        *,
+        limit: int,
+        fallback: DailyRequestLimiter | None = None,
+        now: Callable[[], float] = time.time,
+    ):
+        if limit < 1:
+            raise ValueError("daily rate limit must be at least 1")
+        self._backend = backend
+        self._limit = limit
+        self._fallback = fallback or DailyRequestLimiter(limit, now=now)
+        self._now = now
+
+    async def check_and_increment(
+        self,
+        *,
+        identity: str = "anonymous",
+        limit: int | None = None,
+    ) -> RateLimitResult:
+        effective_limit = limit or self._limit
+        if effective_limit < 1:
+            raise ValueError("daily rate limit must be at least 1")
+        now = self._now()
+        day = datetime.fromtimestamp(now, tz=UTC).date()
+        reset = datetime.combine(day + timedelta(days=1), datetime.min.time(), tzinfo=UTC)
+        reset_epoch = int(reset.timestamp())
+        key = f"{REDIS_KEY_PREFIX}login:{identity}:{day.isoformat()}"
+        ttl = max(1, reset_epoch - int(now)) + self._TTL_SLACK_SECONDS
+
+        try:
+            results = await self._backend.pipeline(
+                [["INCR", key], ["EXPIRE", key, ttl]],
+            )
+            count = int(results[0])
+        except Exception:
+            # Same broad fail-open as the other Redis paths: abuse control
+            # degrades to the per-instance limiter, sign-in keeps working.
+            return self._fallback.check_and_increment(identity=identity, limit=effective_limit)
+
+        return RateLimitResult(
+            allowed=count <= effective_limit,
+            limit=effective_limit,
+            remaining=max(effective_limit - count, 0),
+            reset_epoch=reset_epoch,
+            retry_after=max(1, reset_epoch - int(now)),
         )

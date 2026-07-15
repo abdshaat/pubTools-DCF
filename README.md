@@ -100,7 +100,7 @@ the selected data auditable.
 | Data models (canonical schema) | `app/models.py` | ✅ done |
 | Ingestion — Financial Modeling Prep client with retries/backoff | `app/providers/fmp.py` | ✅ done |
 | Normalization — provider payloads → canonical `BaseFinancials` | `app/normalization.py` | ✅ done |
-| Fundamentals service — fetch + normalize + TTL cache | `app/fundamentals.py` | ✅ done |
+| Fundamentals service — fetch + normalize + L1/L2 TTL cache | `app/fundamentals.py`, `app/redis_cache.py` | ✅ done |
 | API layer — FastAPI routes, validation, error mapping | `app/api.py`, `app/schemas.py` | ✅ done |
 | Customer website — landing page, API reference, and live valuation UI | `docs/index.html` served at `/` | ✅ done |
 | Supabase auth/quota/metering | `app/supabase.py`, `supabase/migrations/` | code ready; DB setup required |
@@ -178,6 +178,23 @@ Only the generated key hash is stored. If `API_KEY_HASH_PEPPER` is set, newly
 created and rotated keys use a peppered, versioned HMAC-SHA256 hash; legacy
 unprefixed SHA-256 hashes still verify so existing keys keep working. The full
 key is printed once and should be copied into the customer's secret manager.
+
+### Configure distributed caching (optional)
+
+Connect an Upstash Redis database through the Vercel Marketplace. Vercel
+normally injects these variables automatically:
+
+```bash
+UPSTASH_REDIS_REST_URL=https://your-database.upstash.io
+UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
+```
+
+Legacy Marketplace integrations may instead provide `KV_REST_API_URL` and
+`KV_REST_API_TOKEN`; the app accepts either pair. When configured, Redis shares
+fundamentals, profiles, quotes, negative results, and single-flight coordination
+across Vercel instances. When it is absent or unavailable, the API falls back to
+the provider and its existing in-process cache. Redis is never used as the
+billing, quota, identity, or API-key system of record.
 
 ### Customer sign-in with GitHub or email (self-service API keys)
 

@@ -19,6 +19,7 @@ callers handle one shape.
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 from inspect import isawaitable
 from pathlib import Path as FilePath
 from typing import Any
@@ -28,6 +29,7 @@ from fastapi import FastAPI, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from pydantic import ValidationError
 
 from . import MODEL_VERSION
 from .accounts import (
@@ -76,7 +78,9 @@ from .http_cache import (
 )
 from .models import Assumptions
 from .providers.fmp import FileRawSink, FMPClient
-from .rate_limit import DailyRequestLimiter, RateLimitResult
+from .rate_limit import DailyRequestLimiter, RateLimitResult, RedisLoginRateLimiter
+from .redis_cache import RedisBackend, RedisConfig, UpstashRedisClient
+from .response_cache import assumption_fingerprint, get_cached_response, store_response
 from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
@@ -277,6 +281,7 @@ def create_app(
     usage_meter: Any | None = None,
     supabase_client: SupabaseClient | None = None,
     auth_client: SupabaseAuthClient | None = None,
+    redis_backend: RedisBackend | None = None,
 ) -> FastAPI:
     supabase_config = SupabaseConfig.from_env()
     configured_supabase_client = supabase_client or (
@@ -285,17 +290,31 @@ def create_app(
     configured_auth_client = auth_client or (
         SupabaseAuthClient(supabase_config) if supabase_config is not None else None
     )
+    redis_config = RedisConfig.from_env()
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_client = fmp_client is None
         client = fmp_client or FMPClient(raw_sink=_default_raw_sink())
+        owns_redis = redis_backend is None and redis_config is not None
+        configured_redis = redis_backend or (
+            UpstashRedisClient(redis_config) if redis_config is not None else None
+        )
+        app.state.redis = configured_redis
         app.state.fundamentals = FundamentalsService(
             client,
             ttl_seconds=ttl_seconds,
             profile_ttl_seconds=profile_ttl_seconds,
             quote_ttl_seconds=quote_ttl_seconds,
+            redis=configured_redis,
         )
+        if configured_redis is not None:
+            # Cross-instance login limiting (Phase 8 Slice B); falls back to
+            # the in-process limiter set below whenever Redis is down.
+            app.state.login_rate_limiter = RedisLoginRateLimiter(
+                configured_redis,
+                limit=LOGIN_ATTEMPTS_DAILY_LIMIT,
+            )
         try:
             yield
         finally:
@@ -305,6 +324,8 @@ def create_app(
                 await configured_supabase_client.aclose()
             if configured_auth_client is not None and auth_client is None:
                 await configured_auth_client.aclose()
+            if owns_redis and configured_redis is not None:
+                await configured_redis.aclose()
 
     app = FastAPI(
         title="DCF Valuation API",
@@ -923,16 +944,48 @@ def create_app(
             revenue_growth=growth_values[0] if len(growth_values) == 1 else growth_values,
         )
 
-        base = await request.app.state.fundamentals.get_base_financials(ticker)
-        valuation = compute_dcf(base, assumptions)
-        grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
-        payload = build_valuation_response(
-            base,
-            assumptions,
-            valuation,
-            grid,
-            request_id=request.state.request_id,
+        # Distributed response cache (Phase 8 Slice B): a hit skips the
+        # provider fetch AND the DCF recompute. Fail-open — any Redis issue
+        # falls through to the normal compute path. Metering is unaffected
+        # (the middleware consumes quota for every non-304 regardless).
+        symbol = ticker.upper()
+        fingerprint = assumption_fingerprint(assumptions, sensitivity=sensitivity)
+        payload: ValuationResponse | None = None
+        cached_content = await get_cached_response(
+            request.app.state.redis, ticker=symbol, fingerprint=fingerprint
         )
+        if cached_content is not None:
+            try:
+                payload = ValuationResponse.model_validate(
+                    {
+                        **cached_content,
+                        "request_id": request.state.request_id,
+                        "computed_at": datetime.now(UTC),
+                    }
+                )
+            except ValidationError:
+                # Schema drift within a model version shouldn't happen, but a
+                # stale entry must degrade to a recompute, never a 500.
+                payload = None
+
+        if payload is None:
+            base = await request.app.state.fundamentals.get_base_financials(ticker)
+            valuation = compute_dcf(base, assumptions)
+            grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
+            payload = build_valuation_response(
+                base,
+                assumptions,
+                valuation,
+                grid,
+                request_id=request.state.request_id,
+            )
+            await store_response(
+                request.app.state.redis,
+                ticker=symbol,
+                fingerprint=fingerprint,
+                content=payload.model_dump(mode="json", exclude={"request_id", "computed_at"}),
+                stored_at=datetime.now(UTC).timestamp(),
+            )
 
         # HTTP caching (Phase 7): the ETag is derived from response *content*
         # only (request_id/computed_at excluded), so equivalent requests share
