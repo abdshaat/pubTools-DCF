@@ -149,6 +149,9 @@ _SECURITY_HEADERS = {
     "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=(), usb=()",
 }
 
+_DOCS_DIR = FilePath(__file__).parent.parent / "docs"
+_PICS_DIR = (_DOCS_DIR / "Pics").resolve()
+
 _LANDING_PAGE_CSP = "; ".join(
     [
         "default-src 'self'",
@@ -639,15 +642,46 @@ def create_app(
             message="Too many sign-in attempts. Try again later.",
         )
 
+    # --- public site (Phase 9): portfolio at /, API directory at /apis, and the
+    # DCF product at /dcf. The API surface below is unaffected by the split.
+
     @app.get("/", include_in_schema=False)
-    async def landing_page(request: Request) -> FileResponse:
+    async def portfolio_page() -> FileResponse:
+        return FileResponse(
+            _DOCS_DIR / "portfolio.html",
+            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+        )
+
+    @app.get("/apis", include_in_schema=False)
+    async def api_directory_page() -> FileResponse:
+        return FileResponse(
+            _DOCS_DIR / "apis.html",
+            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+        )
+
+    @app.get("/dcf", include_in_schema=False)
+    async def dcf_page(request: Request) -> FileResponse:
+        # The account UI lives on this page, so this is where the CSRF token is
+        # minted (it moved from `/` when the portfolio took that route over).
         response = FileResponse(
-            FilePath(__file__).parent.parent / "docs" / "index.html",
+            _DOCS_DIR / "index.html",
             headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
         )
         if not request.cookies.get(CSRF_COOKIE):
             set_csrf_cookie(response)
         return response
+
+    @app.get("/Pics/{filename}", include_in_schema=False)
+    async def portfolio_image(filename: str) -> Response:
+        # Served through the function rather than Vercel's static hosting, so
+        # the immutable cache header is what keeps repeat loads off the origin.
+        target = (_PICS_DIR / filename).resolve()
+        if _PICS_DIR not in target.parents or not target.is_file():
+            return Response(status_code=404)
+        return FileResponse(
+            target,
+            headers={"Cache-Control": "public, max-age=31536000, immutable"},
+        )
 
     # --- customer login (GitHub via Supabase Auth) and self-service keys ---
     # Human browser sessions here are a distinct credential class from the
@@ -700,7 +734,9 @@ def create_app(
         base = public_base_url()
 
         def error_redirect(reason: str) -> RedirectResponse:
-            resp = RedirectResponse(url=f"{base}/?login_error={reason}", status_code=302)
+            # Phase 9: land on /dcf, not /. The portfolio owns `/` now and has
+            # no account UI or `login_error` handler to render this.
+            resp = RedirectResponse(url=f"{base}/dcf?login_error={reason}", status_code=302)
             resp.delete_cookie("pt_oauth_verifier")
             return resp
 
@@ -711,7 +747,7 @@ def create_app(
         if error or not code:
             return error_redirect("access_denied" if error else "invalid_request")
 
-        response = RedirectResponse(url=f"{base}/", status_code=302)
+        response = RedirectResponse(url=f"{base}/dcf", status_code=302)
         try:
             await complete_login(
                 auth_client=auth_client,

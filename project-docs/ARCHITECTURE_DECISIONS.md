@@ -188,3 +188,61 @@ customer request volume, but grows with database ticker count and each refresh
 cycle may contain several FMP endpoint calls/retries. Quotes become daily rather
 than intraday. Existing data can be up to roughly one cycle behind a filing
 (longer after provider/job failure), and customers see that tradeoff explicitly.
+
+**Superseded in part by ADR-008 (2026-07-16):** the daily refresh cycle no
+longer fetches or stores a quote. The current market price is served live from
+Finnhub on every request and is never cached. This ADR's statements/profile
+daily-refresh policy is otherwise unchanged; only the price/quote portion moves
+to ADR-008.
+
+## ADR-008 — Real-time market price from Finnhub, never cached
+
+Date: 2026-07-16
+
+Context: ADR-007 made the market price a daily-refreshed value fetched from FMP
+alongside statements and profile. The `current_price` is the only market-derived
+input in a valuation, and it is independent of the DCF math: it feeds only
+`upside_pct` and the echoed `current_price`/`price_as_of` fields, not intrinsic
+value, enterprise value, equity value, or the projections. The user requires the
+response to always show a live market price.
+
+Decision:
+
+- The current price is fetched live from **Finnhub** (`/quote`) on **every**
+  valuation request. It is **never** read from, or written to, any cache — not
+  the in-process quote cache, not Redis (`quote:` is removed), not the valuation
+  response cache, not the CDN/edge, and not the ADR-007 daily snapshot.
+- FMP remains the source for slow-moving statements and profile; those keep
+  ADR-006's cache-aside read-through and ADR-007's daily refresh. Finnhub is the
+  sole source of the market price.
+- The valuation request/response and the DCF math are **not** cached. The only
+  caching kept is the **financial statements** (ADR-006's fundamentals
+  read-through: in-process L1 → Redis `fund:`/`profile:` → DB → FMP, plus
+  single-flight). That is the sole caching the product wants: multiple valuations
+  of the same ticker with different assumptions reuse **one** FMP statement fetch
+  instead of N, which benefits widely-used tickers directly. The DCF math is
+  recomputed on every request from the cached statements + the live price — it is
+  pure, deterministic, and cheap, so caching it adds no value here.
+- The Phase 8 Slice B valuation **response cache (`dcf:v1:resp:`) is retired**,
+  and so is the Phase 7 ETag/conditional-304 handling for `/v1/valuations/*` —
+  both cache the response, which the product explicitly does not want and which a
+  live price makes incorrect anyway.
+- Because the HTTP response body carries a live, uncacheable price,
+  `/v1/valuations/*` responses are `Cache-Control: no-store`.
+- Finnhub is behind the same injectable-client, env-var auto-enable pattern as
+  FMP/Supabase/Redis (`FINNHUB_API_KEY` absent → price feature off). The DCF
+  engine stays pure and I/O-free; price injection happens in the API layer.
+- Finnhub failure must never serve a cached/stale price. On a Finnhub outage the
+  response returns the DCF math with `current_price`/`price_as_of`/`upside_pct`
+  as `null` plus a data-quality warning; the intrinsic value (the core product)
+  is still returned. (Alternative considered: fail the whole request 502. Chosen
+  the null-price degrade so a provider blip doesn't deny the price-independent
+  valuation.)
+
+Consequences: every response shows a real-time price, at the cost of one Finnhub
+call per valuation request (re-coupling request volume to Finnhub's rate limit —
+60 req/min on the free tier) and the loss of response/edge caching for the
+valuation endpoint. The financial-statement cache still absorbs repeated
+same-ticker traffic, so N differently-assumed valuations of one ticker cost one
+FMP statement fetch. `upside_pct` now reflects the live market, not a value up to
+a day old.

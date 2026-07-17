@@ -1,5 +1,114 @@
 # Progress Log
 
+## 2026-07-16 — Phase 9 created and Slices 1–2 implemented: public site (portfolio + API directory)
+
+User asked (urgent) to merge their standalone HTML/CSS portfolio into this
+deployment, make it the front page, and give visitors a button to a list of
+their developed APIs — then move their domain here. Chosen shape: **one repo/
+Vercel project** (over a two-project proxy/rewrite split), portfolio at `/`, DCF
+at `/dcf`.
+
+**Plan:** inserted a new **Phase 9 — Public site: portfolio front end, API
+directory, and domain migration** immediately after Phase 8 per the user's
+request; renumbered old Phases 9–14 → 10–15 (same precedent as the Phase 6
+insertion), including cross-references and the delivery-milestone ranges.
+
+**Conflict surfaced and recorded:** new Phase 9 is the direct opposite of old
+Phase 14 (now **Phase 15**, "Separate UI/UX from the microservice"), which plans
+to strip all bundled UI out and make this headless. Phase 9 supersedes it in
+practice; Phase 15 is marked **on hold — must be re-scoped or dropped**, and the
+delivery milestones note it. The pubTools multi-product goal survives as the
+`/apis` directory (one card per future product).
+
+**Implemented (Slices 1–2):**
+
+- **Routes** (`app/api.py`): `GET /` → `docs/portfolio.html`; `GET /apis` →
+  new `docs/apis.html`; `GET /dcf` → `docs/index.html`; `GET /Pics/{filename}`
+  → images with `Cache-Control: public, max-age=31536000, immutable` and an
+  explicit traversal guard (`_PICS_DIR not in target.parents` → 404). New
+  `_DOCS_DIR`/`_PICS_DIR` constants. All three pages keep the existing CSP.
+- **CSRF bootstrap moved from `/` to `/dcf`** — the account UI lives there and
+  the portfolio has no state-changing calls.
+- **Auth callback retargeted** `{base}/` → `{base}/dcf` (success) and
+  `{base}/?login_error=` → `{base}/dcf?login_error=`. Caught by tracing, not
+  testing: `/` is the portfolio now, which has no account UI and no
+  `login_error` handler, so a signed-in user would have silently landed on the
+  wrong page. `docs/index.html`'s handler uses relative
+  `window.location.pathname`, so it needed no change.
+- **`docs/portfolio.html`** restyled earlier this session to `index.html`'s
+  design system (verbatim token block, sidebar+main layout, shared components,
+  light/dark); now has the **"View my APIs"** CTA → `/apis` plus sidebar links.
+- **`docs/apis.html`** (new): same design system; DCF card (live, `GET
+  /v1/valuations/{ticker}`, links to `/dcf`) plus a "more tools in progress"
+  card framing the shared account/key system.
+- **`docs/Pics/`**: copied the 7 referenced images from the source portfolio repo
+  (they were never actually added — only `portfolio.html` was). 4 unreferenced
+  images deliberately skipped to keep the function bundle lean.
+- **Tests:** `_seed_csrf` now seeds from `/dcf` (would have broken every account
+  test). Replaced `test_root_serves_customer_landing_page` with a parametrized
+  security-header test across `/`, `/apis`, `/dcf`, plus tests for the portfolio
+  CTA, the API directory listing DCF, `/dcf` minting the CSRF cookie, and images
+  being immutable + traversal-safe. **292 → 298 passing, 94.07% coverage**;
+  ruff/format/mypy clean.
+- **Live-verified against real uvicorn** (not just TestClient): `/` portfolio
+  200, `/apis` 200 linking to `/dcf`, `/dcf` 200 setting `pt_csrf`,
+  `/Pics/blob.png` 200 `image/png` 85679 bytes with the immutable header,
+  `/health` 200.
+
+**Next / blocked on the user (Slice 3, `issues.MD`):** the domain migration is
+dashboard work — move the domain off the portfolio project, attach it to
+`pub-tools-dcf`, update Production `PUBLIC_BASE_URL`, add
+`https://{new-domain}/v1/auth/callback` to Supabase's redirect allowlist, and
+update the hardcoded base URL in `docs/index.html`. **Skipping any of those
+breaks sign-in** — the same failure mode as the 2026-07-13 `PUBLIC_BASE_URL`
+incident.
+
+## 2026-07-16 — Planning only: real-time current price from Finnhub (ADR-008)
+
+Design/documentation only, no code. User decided the response must always show a
+**live** market price fetched from Finnhub, and that **no current price may be
+cached anywhere** (not the quote cache, not Redis `quote:`, not the `resp:`
+response cache, not the CDN/edge, not the ADR-007 daily snapshot). Grounded the
+plan in a fresh read of the actual price flow: `FundamentalsService._get_quote`
+(60s L1 / Redis `quote:`), the whole-response `dcf:v1:resp:` cache, and
+`compute_dcf`'s internal `current_price > 0` precondition + upside calc.
+
+**User clarified the caching scope (same session):** the *only* caching wanted is
+the **financial statements** for widely-used tickers — three different discounts
+on AAPL must hit FMP for statements once, not three times. The request/response
+and the DCF math are **not** cached; the math is recomputed per request (pure and
+cheap) from the cached statements + the live price. This **retires the Phase 8
+Slice B response cache (`dcf:v1:resp:`)** and the Phase 7 ETag/304 handling for
+this endpoint; the Slice A `fund:`/`profile:` statement cache + single-flight are
+kept as exactly the "reuse the statements" mechanism.
+
+Necessary consequences documented and accepted: `/v1/valuations/*` becomes
+`Cache-Control: no-store`; one Finnhub call per request (re-couples volume to
+Finnhub's 60/min free-tier limit); the cached statement snapshot becomes
+price-free; and a Finnhub-outage degrade to null price + warning (never a stale
+price).
+
+Wrote: **ADR-008** in `ARCHITECTURE_DECISIONS.md` (with an ADR-007 supersession
+note that the daily cycle no longer fetches a quote); a full feature definition
++ 4-slice implementation plan in `project-docs/issues.MD`; and a Phase 8
+supersession note in `IMPLEMENTATION_PLAN.md` so Slice C doesn't re-introduce a
+cached quote. No application code, config, migrations, or tests changed.
+
+**Read-path affirmed (same session):** user confirmed the statement read order is
+cache → database → FMP, computing/returning at the first layer that has the data,
+and chose "serve DB copy; scheduled job refreshes" for stale existing tickers —
+i.e. a customer request never refreshes an existing ticker from FMP (only the
+ADR-007 daily job does); FMP is hit only for a genuinely cold ticker absent from
+cache and DB. This is exactly ADR-006 + ADR-007 (no design change). Reconciled the
+Phase 8 "Authoritative cache-aside read/write flow", the daily-refresh scope, and
+the Slice C task to drop the retired `quote:`/`resp:` caches and state the
+cache → DB → FMP path explicitly; added a "Customer-request read path" section to
+the `issues.MD` feature. The DB step remains Phase 8 Slice C (unimplemented);
+the Finnhub feature can ship before it.
+
+**Next:** implement Slice 1 (Finnhub client + `normalize_finnhub_quote` + unit
+tests) once the plan is approved.
+
 ## 2026-07-15 — Published project documentation in the repository
 
 User chose to publish `project-docs/`. Updated `.gitignore` so the repository

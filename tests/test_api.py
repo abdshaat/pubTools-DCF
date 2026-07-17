@@ -744,10 +744,11 @@ def test_health_endpoint():
     assert response.json()["model_version"] == MODEL_VERSION
 
 
-def test_root_serves_customer_landing_page():
+@pytest.mark.parametrize("path", ["/", "/apis", "/dcf"])
+def test_public_site_pages_serve_html_with_security_headers(path):
     fmp = FMPClient(api_key="test-key", transport=fixture_transport())
     with TestClient(create_app(fmp_client=fmp)) as test_client:
-        response = test_client.get("/")
+        response = test_client.get(path)
     assert response.status_code == 200
     assert "text/html" in response.headers["content-type"]
     assert response.headers["X-Content-Type-Options"] == "nosniff"
@@ -756,12 +757,51 @@ def test_root_serves_customer_landing_page():
     assert "geolocation=()" in response.headers["Permissions-Policy"]
     csp = response.headers["Content-Security-Policy"]
     assert "default-src 'self'" in csp
+    assert "connect-src 'self'" in csp
     assert "frame-ancestors 'none'" in csp
     assert "object-src 'none'" in csp
-    assert "connect-src 'self'" in csp
+
+
+def test_root_serves_the_portfolio_and_links_to_the_api_directory():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/")
+    assert response.status_code == 200
+    assert "Abdelruhman Shaat" in response.text
+    # The CTA the portfolio exists to offer: a route into the API directory.
+    assert 'href="/apis"' in response.text
+
+
+def test_api_directory_lists_the_dcf_api():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/apis")
+    assert response.status_code == 200
+    assert "DCF Valuation API" in response.text
+    assert 'href="/dcf"' in response.text
+
+
+def test_dcf_page_serves_the_docs_and_mints_the_csrf_cookie():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        response = test_client.get("/dcf")
+    assert response.status_code == 200
     assert "Run valuation" in response.text
     assert "/v1/valuations/" in response.text
+    # The account UI lives here, so this page -- not / -- mints the CSRF token.
     assert CSRF_COOKIE in response.cookies
+
+
+def test_portfolio_images_are_served_immutably_and_reject_traversal():
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp)) as test_client:
+        ok = test_client.get("/Pics/blob.png")
+        missing = test_client.get("/Pics/does-not-exist.png")
+        traversal = test_client.get("/Pics/..%2F..%2Fapp%2Fapi.py")
+    assert ok.status_code == 200
+    assert "immutable" in ok.headers["Cache-Control"]
+    assert missing.status_code == 404
+    assert traversal.status_code == 404
 
 
 # --- customer login (GitHub via Supabase Auth) and self-service keys ---
@@ -794,7 +834,9 @@ def _csrf_headers(test_client: TestClient) -> dict[str, str]:
 
 
 def _seed_csrf(test_client: TestClient) -> dict[str, str]:
-    response = test_client.get("/")
+    # Phase 9: the CSRF cookie is minted by /dcf (the page carrying the account
+    # UI), not by / -- which now serves the portfolio.
+    response = test_client.get("/dcf")
     assert response.status_code == 200
     return _csrf_headers(test_client)
 

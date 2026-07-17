@@ -426,7 +426,7 @@ system per product).
   `/v1/account/keys/{id}/rotate`, `/v1/auth/logout`, and email-login POSTs.
   Implement a double-submit or server-issued CSRF token (`pt_csrf` plus
   `X-CSRF-Token`), reject missing/mismatched tokens with 403, and add tests.
-  This becomes mandatory before any Phase 14 cross-origin frontend or
+  This becomes mandatory before any Phase 15 cross-origin frontend or
   `SameSite=None` cookie setup. Completed 2026-07-12 — `app/accounts.py`
   now issues/validates `pt_csrf`, `app/api.py` requires `X-CSRF-Token` on
   cookie-backed POSTs, `docs/index.html` sends the header for account/email
@@ -672,12 +672,15 @@ email magic link and confirmed both work end to end.** Two UI issues found
 during that live testing (frozen-looking quota display, raw `last_used_at`
 timestamp) are fixed above. **Still outstanding:**
 - Verify after the latest Vercel redeployment that Supabase's redirect
-  allowlist contains exactly
-  `https://pub-tools-dcf-nu.vercel.app/v1/auth/callback` (the real production
-  domain — the previously allow-listed `pubtools-dcf.vercel.app` is dead),
-  that login returns to the production domain without a redirect loop, and
-  that returning after a browser restart restores the account through the
-  refresh cookie.
+  allowlist contains the callback for whichever host `PUBLIC_BASE_URL` names,
+  that login returns there without a redirect loop, and that returning after a
+  browser restart restores the account through the refresh cookie.
+  **Superseded in part by Phase 9 (2026-07-16):** the production host is moving
+  to `https://ashaat.dev`, so the allowlist entry to verify is
+  `https://ashaat.dev/v1/auth/callback`, not the
+  `pub-tools-dcf-nu.vercel.app` one this item originally named. Sign-in also now
+  returns to `/dcf` rather than `/`. Do this as part of Phase 9 Slice 3 rather
+  than separately — see `issues.MD`.
 - ~~`SUPABASE_URL`/`SUPABASE_SERVICE_ROLE_KEY` in Vercel remain unconfirmed
   from Phase 5.~~ Confirmed present 2026-07-13 via `vercel env ls`
   (Production only — Preview has neither, so preview deployments run with
@@ -941,6 +944,18 @@ Exit criteria:
 
 Goal: share state across workers, restarts, and serverless instances.
 
+> **Superseded in part by ADR-008 (2026-07-16) — real-time price from Finnhub;
+> statements-only caching.** The only caching kept for the valuation path is the
+> **financial-statement** cache (Slice A `fund:`/`profile:` + single-flight): N
+> differently-assumed valuations of one ticker cost one FMP statement fetch. The
+> valuation **response cache (`dcf:v1:resp:`, Slice B) is retired**, along with
+> the `dcf:v1:quote:` key and the Phase 7 ETag/304 handling for this endpoint.
+> The current market price is fetched live from Finnhub on every request and
+> cached nowhere; the daily refresh (ADR-007) no longer fetches a quote.
+> `/v1/valuations/*` responses become `Cache-Control: no-store`. Slice C must not
+> re-introduce a cached quote or response. See the "real-time current price from
+> Finnhub" feature section in `project-docs/issues.MD` for the full plan.
+
 **Design fully specified 2026-07-13 (planning session, no code). Decisions
 made by the user that day: Redis provider is Upstash provisioned through the
 Vercel Marketplace; Postgres remains the existing Supabase project (no new
@@ -1022,30 +1037,36 @@ with an explicit warning but must not be re-cached as current. Successful
 per-ticker promotion publishes the new generation after the DB commit. This is
 how a warm Vercel instance learns that the daily job replaced its old data.
 
-### Authoritative cache-aside read/write flow (added 2026-07-13)
+### Authoritative cache-aside read/write flow (added 2026-07-13; price/response scope updated 2026-07-16 per ADR-008)
 
-For a valuation request that reaches the fundamentals layer, the lookup order
-is fixed and must not be reordered:
+This layer resolves **financial statements only**. The market price is fetched
+live from Finnhub on every request (ADR-008) and is not part of this flow; the
+DCF math is then computed fresh from the resolved statements + the live price and
+is **not** cached (there is no valuation response cache). The statement lookup
+order below is the exact customer-request read path — **cache → database → FMP**,
+computing and returning as soon as one layer has the statements — and is fixed and
+must not be reordered:
 
-1. Check the in-process L1 cache.
-2. On an L1 miss, check the Redis L2 `fund:` entry.
+1. Check the in-process L1 cache. On a hit, compute the math (with the live
+   price) and return.
+2. On an L1 miss, check the Redis L2 `fund:`/`profile:` entries. On a hit,
+   hydrate L1, compute, and return.
 3. On an L2 miss, enter distributed single-flight. The lock winner queries
    Supabase for the ticker's latest verified normalized snapshot; lock losers
    poll Redis as already designed and then fall through if necessary.
 4. A database hit hydrates `BaseFinancials`, repopulates L1 and Redis (writing
    `fund:` last as the commit marker), and is returned with the durable
-   statement/profile/price timestamps and daily-refresh status. A customer
-   request never refreshes the quote or other data from FMP for an existing
-   ticker.
-5. A missing database head may trigger the one-time cold-ticker bootstrap
-   provider fetch. A stale existing head is served with explicit freshness
-   metadata and waits for the next scheduled all-data refresh; customer traffic
-   does not refresh any existing-ticker data from FMP.
+   statement/profile timestamps and daily-refresh status. A customer request
+   never refreshes an existing ticker's statements from FMP.
+5. Only a genuinely cold ticker — absent from L1, Redis, **and** the database —
+   triggers the one-time bootstrap FMP fetch. A stale existing head is served
+   with explicit freshness metadata and waits for the next scheduled refresh;
+   customer traffic never refreshes existing-ticker statements from FMP.
 6. After a successful bootstrap or scheduled provider fetch and normalization,
-   synchronously await the Supabase snapshot/head write, then populate
-   profile/quote/`fund:` caches, then return or complete the job. Cache
-   publication happens after the DB write and `fund:` remains the final cache
-   commit marker.
+   synchronously await the Supabase snapshot/head write, then populate the
+   `profile:`/`fund:` caches (there is no `quote:` cache — price is never
+   cached), then return or complete the job. Cache publication happens after the
+   DB write and `fund:` remains the final cache commit marker.
 
 "Before returning" means a cold bootstrap's DB/cache operations are awaited on
 the Vercel request path. A database error is not a confirmed miss and therefore
@@ -1062,10 +1083,11 @@ the immutable snapshot unchanged while the head records the new verification.
 ### Daily all-database-ticker FMP refresh at 6 PM Eastern (final decision 2026-07-13)
 
 Every ticker present in `ticker_snapshot_heads` is refreshed once during each
-Eastern calendar day's 6 PM refresh window. The cycle fetches the complete FMP
-input set used by a valuation—statements, profile, and quote. Existing tickers
-must not call FMP from customer requests; those requests receive the newest
-stored complete dataset with its exact timestamps and refresh status.
+Eastern calendar day's 6 PM refresh window. The cycle fetches the FMP input set
+used by a valuation—**statements and profile** (the market price is live from
+Finnhub per ADR-008 and is no longer part of the refresh or the snapshot).
+Existing tickers must not call FMP from customer requests; those requests receive
+the newest stored statements with their exact timestamps and refresh status.
 
 - Vercel cron expressions are UTC-only. Configure the same guarded endpoint at
   both `0 22 * * *` and `0 23 * * *`; the endpoint converts the current instant
@@ -1259,16 +1281,16 @@ as the fallback when Redis is unconfigured or down.
   work). Failure leaves the prior head active and fails that bootstrap/claim.
 - The daily cycle updates `last_quote` and `quote_verified_at` on the head in the
   same provider-backed promotion. It does not create quote-history rows. This
-  permits Redis-loss recovery while retaining the Phase 11 deferral of durable
+  permits Redis-loss recovery while retaining the Phase 12 deferral of durable
   quote history.
 - The public response's existing `data_version` currently hashes the combined
   fundamentals and quote. It is deliberately distinct from internal
   `snapshot_version`. Phase 8 guarantees durable normalized financial
   documents, not full historical reproduction of every transient quote-backed
-  response; durable quote history remains Phase 11.
+  response; durable quote history remains Phase 12.
 - Deliberately **out of scope for 003**: a durable quote-history table (revisit
-  in Phase 11 when historical analysis needs it) and raw-capture storage
-  (Phase 9).
+  in Phase 12 when historical analysis needs it) and raw-capture storage
+  (Phase 10).
 - Rollback: drop `financial_refresh_claims`, then `financial_refresh_runs`, then
   `ticker_snapshot_heads`, then `normalized_snapshots`
   (documented in the migration header). Retention: snapshots are a few KB per
@@ -1321,20 +1343,23 @@ as the fallback when Redis is unconfigured or down.
   cross-instance login limiting, UTC-day reset, limiter fail-open.
   Suite: 276 → 292 passing, 94.04% coverage; ruff/format/mypy clean.
 - [ ] **Slice C — migration 003 + DB read-through/snapshot writes.** SQL
-  migration for immutable snapshots and mutable ticker heads; quote-free
-  snapshot fingerprint; typed Supabase read/write methods; L1 → Redis → DB
-  → provider orchestration; DB-hit cache repopulation; transactional
-  insert+head-upsert path; durable daily run/claim manifest; secured dual
-  `0 22 * * *`/`0 23 * * *` Vercel Cron configuration with Eastern-hour/date
-  guard; bounded-concurrency processing of every database ticker; response-cache
-  generation rotation; customer freshness/price-age metadata; fake-Supabase
-  handlers; freshness, cold-bootstrap, no-request-time-FMP (including quotes),
-  duplicate-cron, EST/EDT guard, complete-manifest reconciliation, partial-run,
-  6-PM L1 cutoff/generation invalidation, malformed-row, DB-down, immutability,
-  conflict, and
-  write-before-cache-before-response ordering tests. User applies migration 003
-  to the live project after local verification (same flow as 001/002) and sets
-  `CRON_SECRET` before deploying the cron configuration.
+  migration for immutable snapshots and mutable ticker heads; quote-free,
+  price-free snapshot fingerprint; typed Supabase read/write methods;
+  **L1 → Redis → DB → FMP(cold only)** orchestration (the customer-request read
+  path); DB-hit cache repopulation; transactional insert+head-upsert path;
+  durable daily run/claim manifest; secured dual `0 22 * * *`/`0 23 * * *`
+  Vercel Cron configuration with Eastern-hour/date guard; bounded-concurrency
+  processing of every database ticker; customer freshness metadata;
+  fake-Supabase handlers; freshness, cold-bootstrap, no-request-time-FMP for
+  existing tickers, duplicate-cron, EST/EDT guard, complete-manifest
+  reconciliation, partial-run, 6-PM L1 cutoff, malformed-row, DB-down,
+  immutability, conflict, and write-before-cache-before-response ordering tests.
+  **Per ADR-008 this slice must NOT include a `quote:` cache, a `resp:` response
+  cache, or response-cache generation rotation** (those are removed by the
+  Finnhub feature; see `issues.MD`); the daily cycle refreshes statements/profile
+  only. User applies migration 003 to the live project after local verification
+  (same flow as 001/002) and sets `CRON_SECRET` before deploying the cron
+  configuration.
 - [ ] **Live verification** on a real deployment once the user provisions
   Upstash: two-instance cache sharing observed (second request after a cold
   hit performs zero FMP calls from a different instance), Redis-down
@@ -1369,7 +1394,7 @@ Exit criteria:
   provider exists as exactly one immutable `normalized_snapshots` row; the
   ticker head points to the latest verified snapshot, and a cold cache/redeploy
   reads it before making FMP calls. Full quote-backed response
-  reproduction remains explicitly deferred to Phase 11.
+  reproduction remains explicitly deferred to Phase 12.
 - [ ] An existing stored ticker never triggers any FMP call from a customer
   request, including quote retrieval; durable claims prove at most one complete
   refresh cycle per ticker per Eastern date despite duplicate cron delivery or
@@ -1390,7 +1415,117 @@ Exit criteria:
   cleaned up, never surfaced as errors. Verified 2026-07-13 by envelope and
   end-to-end fundamentals-cache tests.
 
-## Phase 9 — Raw-data audit storage
+## Phase 9 — Public site: portfolio front end, API directory, and domain migration
+
+Goal: this deployment becomes the public website. The portfolio is the front
+page, an API directory lists the products built on this platform, and the DCF
+product moves to its own path. The owner's custom domain is repointed from the
+standalone portfolio Vercel project to this one.
+
+**User decisions (2026-07-16):** merge into one repo/Vercel project (explicitly
+chosen over a two-project proxy/rewrite split); portfolio at `/`; DCF at the
+`/dcf` subpath; the domain moves here afterwards. Marked **urgent** and
+scheduled immediately after Phase 8 at the user's request; old Phases 9–14 were
+renumbered to 10–15 to make room (same precedent as the Phase 6 insertion).
+
+> **Conflicts with Phase 15 (formerly Phase 14, "Separate UI/UX from the
+> microservice") — read before touching either.** Phase 15 plans to strip all
+> bundled UI out of this deployment and serve it from a separate frontend,
+> replacing `GET /` with a headless banner/redirect. This phase does the exact
+> opposite by design: it merges *more* UI in and makes this deployment the
+> website, with the custom domain pointed at it. **Phase 9 supersedes Phase 15
+> in practice.** Phase 15 is on hold and must be re-scoped or dropped; do not
+> implement it without an explicit decision to reverse Phase 9. The pubTools
+> multi-product goal is not abandoned — the `/apis` directory added here is the
+> shared shell that future products get listed in.
+
+### Route map (end state)
+
+| Route | Serves | Notes |
+|---|---|---|
+| `GET /` | `docs/portfolio.html` | portfolio front page; CTA button → `/apis` |
+| `GET /apis` | `docs/apis.html` (new) | directory of developed APIs; DCF card → `/dcf`; one card per future pubTools product |
+| `GET /dcf` | `docs/index.html` | DCF docs/tool/account UI; **the CSRF cookie bootstrap moves here from `/`** |
+| `GET /Pics/*` | static images | immutable long-lived cache headers so the CDN absorbs them |
+| `/v1/*`, `/health`, `/docs`, `/openapi.json` | unchanged | API surface is untouched by this phase |
+
+### Known consequences (accept explicitly)
+
+1. **Sign-in breaks unless the domain move is completed in full.** The OAuth /
+   magic-link `redirect_to` is built from `PUBLIC_BASE_URL`, and Supabase only
+   honors allow-listed redirect URLs. Moving the domain without updating both
+   reproduces exactly the 2026-07-13 production outage (`issues.MD`: wrong
+   `PUBLIC_BASE_URL` → sign-in only worked with a local server running).
+2. **The auth callback must retarget to `/dcf`.** It currently redirects to
+   `{base}/` on success and `{base}/?login_error=` on failure; once `/` is the
+   portfolio, a signed-in user would land on the portfolio and the
+   `login_error` banner would render on a page that cannot display it (the
+   handler lives in `docs/index.html`).
+3. **`/` is no longer the DCF docs.** Existing links/bookmarks to `/` now reach
+   the portfolio. Accepted — the product is pre-launch with no external
+   consumers; `/dcf` is the new canonical docs URL.
+4. **Function bundle grows by the portfolio images** (~540 KB in `docs/Pics/`),
+   served through the Python function. Mitigated with immutable cache headers so
+   the edge serves repeat requests. Revisit if bundle size becomes a gate
+   (Phase 0's Vercel bundle rule).
+
+### Slice 1 — Routing and static assets
+
+- [ ] `GET /` serves `docs/portfolio.html`; `GET /dcf` serves `docs/index.html`.
+- [ ] Move the CSRF cookie bootstrap from `/` to `/dcf` (the account UI lives
+  there; the portfolio has no state-changing calls and needs no token).
+- [ ] Serve `docs/Pics/*` at `/Pics/*` with `Cache-Control: public, max-age=31536000, immutable`.
+- [ ] Apply the existing landing-page CSP to every HTML page; confirm
+  `img-src 'self'` covers the portfolio images and that no external
+  font/script/style host is introduced (all three pages stay self-contained).
+- [ ] Retarget the auth callback: `{base}/` → `{base}/dcf`, and
+  `{base}/?login_error=` → `{base}/dcf?login_error=`.
+- [ ] Update the four tests asserting `GET /` serves the DCF page
+  (`test_root_serves_customer_landing_page` and three others).
+
+### Slice 2 — API directory (`/apis`)
+
+- [ ] New `docs/apis.html` using the same design system as `docs/index.html`
+  (identical tokens/sidebar/components; self-contained inline `<style>`).
+- [ ] Lists the DCF Valuation API as a live product linking to `/dcf`, with the
+  page structured so each future pubTools product is one additional card.
+- [ ] Portfolio gets a primary CTA button → `/apis` plus a sidebar link.
+- [ ] Route + tests (200, links resolve, CSP header present).
+
+### Slice 3 — Domain migration (owner actions, in this order)
+
+**Target domain: `ashaat.dev`** (owner-confirmed 2026-07-16). Full checklist and
+failure notes live in `issues.MD`.
+
+- [ ] Remove `ashaat.dev` from the standalone portfolio Vercel project.
+- [ ] Add it to the `pub-tools-dcf` project and verify DNS (decide on `www`).
+- [ ] Update Production `PUBLIC_BASE_URL` to `https://ashaat.dev` and redeploy.
+- [ ] Add `https://ashaat.dev/v1/auth/callback` to Supabase → Authentication →
+  URL Configuration → Redirect URLs; review the Site URL.
+- [x] Update the hardcoded base URL in `docs/index.html` → `https://ashaat.dev`.
+  Completed 2026-07-16 — both curl examples; the endpoint builder derives its
+  base from `window.location.origin` and needed no change.
+- [ ] Retire/delete the old portfolio Vercel project once `ashaat.dev` resolves
+  here.
+
+### Slice 4 — Verification
+
+- [ ] Full suite, ruff, ruff format, mypy clean; coverage floor held.
+- [ ] Live on the deployed domain: `/` renders the portfolio; `/apis` lists the
+  DCF API; `/dcf` renders the tool; `/Pics/*` return 200 with the immutable
+  cache header; a full GitHub **and** email sign-in round-trip completes and
+  lands on `/dcf` with the local server stopped; `/v1/valuations/*` and
+  `/health` are unaffected.
+
+Exit criteria:
+
+- [ ] A visitor to the domain lands on the portfolio and can reach a directory
+  of developed APIs in one click, then reach the DCF tool from there.
+- [ ] Sign-in works end to end on the new domain with no local server running.
+- [ ] The DCF API surface (`/v1/*`, `/health`, `/docs`) is behaviorally
+  unchanged by the site merge.
+
+## Phase 10 — Raw-data audit storage
 
 Goal: retain provider evidence safely without blocking requests or overwriting
 captures.
@@ -1411,7 +1546,7 @@ Exit criteria:
 - [ ] Every normalized snapshot traces to immutable provider evidence.
 - [ ] Audit storage cannot block the event loop or overwrite another capture.
 
-## Phase 10 — Configuration, observability, and operations
+## Phase 11 — Configuration, observability, and operations
 
 Goal: make behavior configurable, diagnosable, and supportable.
 
@@ -1443,7 +1578,7 @@ Exit criteria:
 - [ ] Operators can distinguish traffic, provider, storage, normalization, data,
   and calculation incidents.
 
-## Phase 11 — Historical analysis and richer assumptions
+## Phase 12 — Historical analysis and richer assumptions
 
 Goal: replace single-year extrapolation with transparent operating drivers while
 preserving a simple mode.
@@ -1467,7 +1602,7 @@ Exit criteria:
 - [ ] Every operating assumption is explicit and independently variable.
 - [ ] Simple-mode compatibility or versioned migration is documented and tested.
 
-## Phase 12 — Terminal value and expanded sensitivity
+## Phase 13 — Terminal value and expanded sensitivity
 
 Goal: make perpetual-growth assumptions explicit and economically coherent.
 
@@ -1489,7 +1624,7 @@ Exit criteria:
 - [ ] Terminal growth, profitability, and reinvestment reconcile.
 - [ ] Every terminal strategy is explicit, independently tested, and versioned.
 
-## Phase 13 — Security, performance, and release readiness
+## Phase 14 — Security, performance, and release readiness
 
 Goal: verify the complete service under realistic traffic and failures.
 
@@ -1521,7 +1656,7 @@ Exit criteria:
 - [ ] The release meets documented correctness, security, availability, latency,
   auditability, and compatibility targets.
 
-## Phase 14 — Separate UI/UX from the microservice
+## Phase 15 — Separate UI/UX from the microservice
 
 Goal: the DCF API becomes a pure, headless JSON microservice with no bundled
 marketing/docs/UI, and a separately deployable frontend serves the website,
@@ -1586,10 +1721,11 @@ Exit criteria:
 ## Delivery milestones
 
 1. **Safe private beta:** Phases 0–4.
-2. **Controlled public beta:** Phases 5–10.
-3. **Advanced valuation API:** Phases 11–12.
-4. **Production release:** Phase 13 plus all earlier exit criteria.
-5. **Platform decoupling (pubTools multi-product readiness):** Phase 14.
+2. **Controlled public beta:** Phases 5–11 (includes Phase 9, the public site).
+3. **Advanced valuation API:** Phases 12–13.
+4. **Production release:** Phase 14 plus all earlier exit criteria.
+5. **Platform decoupling (pubTools multi-product readiness):** Phase 15 —
+   **on hold; conflicts with Phase 9.** See the note in Phase 9.
 
 Do not combine a public API contract migration and a model-methodology change in
 one release. Version and measure them separately so calculation changes can be

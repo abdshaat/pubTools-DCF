@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>APIs — Abdelruhman Shaat</title>
+<style>
+  :root {
+    --paper: #faf9f5;
+    --ink: #17211c;
+    --muted: #55605a;
+    --faint: #8a938c;
+    --line: #e3e6df;
+    --accent: #0b7a55;
+    --accent-ink: #ffffff;
+    --gold: #a9781f;
+    --panel: #f0f2ec;
+    --code-bg: #1b2226;
+    --code-ink: #d7e0da;
+    --code-accent: #3ecf9a;
+    --warn: #b45309;
+    --warn-bg: #fdf3e4;
+    --err: #b3261e;
+    --ok-bg: #e7f2ec;
+    --sidebar-bg: #14181a;
+    --sidebar-ink: #aeb8b2;
+    --sidebar-active: #3ecf9a;
+    --method-bg: #0b7a55;
+    --font-display: "Palatino Linotype", "Book Antiqua", "Iowan Old Style", Palatino, Georgia, serif;
+    --font-body: -apple-system, "Segoe UI", system-ui, Roboto, sans-serif;
+    --font-mono: "Cascadia Code", Consolas, "SF Mono", Menlo, monospace;
+    color-scheme: light dark;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0e1312;
+      --ink: #dde4df;
+      --muted: #93a09a;
+      --faint: #6b7772;
+      --line: #263029;
+      --accent: #3ecf9a;
+      --accent-ink: #08130e;
+      --gold: #d6a24a;
+      --panel: #171d1a;
+      --code-bg: #161c1f;
+      --code-ink: #cfd9d3;
+      --warn: #e8a04c;
+      --warn-bg: #2a2118;
+      --err: #ef8b84;
+      --ok-bg: #14241d;
+      --sidebar-bg: #0b0e0d;
+      --method-bg: #0f8f65;
+    }
+  }
+  :root[data-theme="dark"] {
+    --paper: #0e1312;
+    --ink: #dde4df;
+    --muted: #93a09a;
+    --faint: #6b7772;
+    --line: #263029;
+    --accent: #3ecf9a;
+    --accent-ink: #08130e;
+    --gold: #d6a24a;
+    --panel: #171d1a;
+    --code-bg: #161c1f;
+    --code-ink: #cfd9d3;
+    --warn: #e8a04c;
+    --warn-bg: #2a2118;
+    --err: #ef8b84;
+    --ok-bg: #14241d;
+    --sidebar-bg: #0b0e0d;
+    --method-bg: #0f8f65;
+  }
+  :root[data-theme="light"] {
+    --paper: #faf9f5;
+    --ink: #17211c;
+    --muted: #55605a;
+    --faint: #8a938c;
+    --line: #e3e6df;
+    --accent: #0b7a55;
+    --accent-ink: #ffffff;
+    --gold: #a9781f;
+    --panel: #f0f2ec;
+    --code-bg: #1b2226;
+    --code-ink: #d7e0da;
+    --warn: #b45309;
+    --warn-bg: #fdf3e4;
+    --err: #b3261e;
+    --ok-bg: #e7f2ec;
+    --sidebar-bg: #14181a;
+    --method-bg: #0b7a55;
+  }
+
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font: 16px/1.65 var(--font-body);
+  }
+  code, pre, .mono { font-family: var(--font-mono); }
+
+  .layout { display: flex; min-height: 100vh; }
+
+  /* ---------- sidebar ---------- */
+  nav {
+    width: 256px;
+    flex-shrink: 0;
+    background: var(--sidebar-bg);
+    color: var(--sidebar-ink);
+    padding: 28px 0;
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
+  }
+  nav .brand {
+    padding: 0 24px 20px;
+    border-bottom: 1px solid rgba(255,255,255,0.08);
+    margin-bottom: 8px;
+  }
+  nav .brand .name {
+    color: #fff;
+    font-family: var(--font-display);
+    font-weight: 600;
+    font-size: 18px;
+    letter-spacing: 0.01em;
+  }
+  nav .brand .ver {
+    font-size: 12px;
+    color: var(--sidebar-active);
+    font-family: var(--font-mono);
+    margin-top: 2px;
+  }
+  nav .group {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: #6b7772;
+    padding: 18px 24px 6px;
+  }
+  nav a {
+    display: block;
+    padding: 6px 24px;
+    color: var(--sidebar-ink);
+    text-decoration: none;
+    font-size: 13.5px;
+    border-left: 2px solid transparent;
+  }
+  nav a:hover { color: #fff; }
+  nav a:focus-visible { outline: 2px solid var(--sidebar-active); outline-offset: -2px; }
+  nav a.active { color: var(--sidebar-active); border-left-color: var(--sidebar-active); }
+
+  /* ---------- main ---------- */
+  main { flex: 1; min-width: 0; padding: 52px 56px 120px; }
+  .content { max-width: 780px; }
+
+  h1, h2, h3 { font-family: var(--font-display); }
+  h2 {
+    font-size: 24px;
+    font-weight: 600;
+    margin: 0 0 14px;
+    padding-top: 58px;
+    letter-spacing: -0.005em;
+    text-wrap: balance;
+  }
+  h3 { font-size: 17px; margin: 0; }
+  h4 { font-family: var(--font-body); }
+  p { max-width: 68ch; margin: 0 0 14px; }
+  .lede { font-size: 18px; line-height: 1.6; color: var(--muted); max-width: 60ch; }
+  section { border-bottom: 1px solid var(--line); padding-bottom: 44px; }
+  section:last-child { border-bottom: none; }
+  a { color: var(--accent); }
+  b, strong { font-weight: 640; color: var(--ink); }
+
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.16em;
+    color: var(--accent);
+    margin: 0 0 12px;
+  }
+
+  .hero-title {
+    font-family: var(--font-display);
+    font-size: 38px;
+    line-height: 1.12;
+    font-weight: 600;
+    letter-spacing: -0.015em;
+    margin: 0 0 16px;
+    max-width: 17ch;
+    text-wrap: balance;
+  }
+  .hero-title em { font-style: italic; color: var(--accent); }
+
+  /* ---------- buttons ---------- */
+  .btn-row { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 20px; }
+  .btn {
+    display: inline-flex; align-items: center; gap: 9px;
+    border: 1px solid var(--accent);
+    background: var(--accent); color: var(--accent-ink);
+    border-radius: 6px; padding: 10px 16px;
+    font-size: 14px; font-weight: 650; font-family: inherit;
+    text-decoration: none; cursor: pointer;
+  }
+  .btn:hover { filter: brightness(0.96); }
+  .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .btn.secondary { background: transparent; color: var(--accent); border-color: var(--line); }
+  .btn.secondary:hover { border-color: var(--accent); filter: none; }
+
+  /* ---------- API product cards ---------- */
+  .api-list { display: grid; gap: 16px; margin: 22px 0 6px; }
+  .api-card {
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 20px 22px; background: var(--panel);
+  }
+  .api-card.live { border-color: color-mix(in srgb, var(--accent) 42%, var(--line)); }
+  .api-head {
+    display: flex; align-items: baseline; gap: 12px;
+    flex-wrap: wrap; margin-bottom: 4px;
+  }
+  .api-head h3 { font-size: 18px; }
+  .status-chip {
+    font-family: var(--font-mono); font-size: 11px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: 0.08em;
+    border-radius: 20px; padding: 3px 10px;
+  }
+  .status-chip.live { color: var(--accent); background: var(--ok-bg); }
+  .status-chip.planned { color: var(--faint); background: transparent; border: 1px solid var(--line); }
+  .api-card p { margin: 8px 0 0; font-size: 14.5px; color: var(--muted); }
+
+  .endpoint {
+    display: flex; align-items: center; gap: 10px;
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 6px; padding: 10px 14px; margin: 14px 0 0; overflow-x: auto;
+  }
+  .endpoint .method {
+    background: var(--method-bg); color: var(--accent-ink);
+    font-family: var(--font-mono); font-size: 12px; font-weight: 700;
+    padding: 3px 9px; border-radius: 4px; letter-spacing: 0.04em;
+  }
+  .endpoint code {
+    font-size: 13px; white-space: nowrap;
+    background: none; border: none; padding: 0;
+  }
+
+  .tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+  .tag {
+    font-family: var(--font-mono); font-size: 11.5px; font-weight: 600;
+    color: var(--accent); background: var(--ok-bg);
+    border-radius: 20px; padding: 3px 11px; max-width: 100%;
+  }
+
+  code {
+    background: var(--paper); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px; font-size: 0.86em;
+  }
+
+  .note {
+    background: var(--ok-bg); border-left: 3px solid var(--accent);
+    border-radius: 0 6px 6px 0; padding: 12px 16px; margin: 16px 0;
+    font-size: 14.5px; max-width: 68ch;
+  }
+  .note strong { color: var(--accent); }
+
+  footer {
+    margin-top: 64px; padding-top: 20px; border-top: 1px solid var(--line);
+    font-size: 13px; color: var(--faint); max-width: 68ch;
+  }
+
+  @media (max-width: 860px) {
+    nav { display: none; }
+    main { padding: 32px 20px 80px; }
+    .hero-title { font-size: 30px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="layout">
+<nav aria-label="APIs">
+  <div class="brand">
+    <div class="name">Abdelruhman Shaat</div>
+    <div class="ver">APIs &amp; developer tools</div>
+  </div>
+  <div class="group">Site</div>
+  <a href="/">Portfolio</a>
+  <a href="/apis" class="active">APIs</a>
+  <div class="group">Live APIs</div>
+  <a href="/dcf">DCF Valuation API</a>
+  <div class="group">Reference</div>
+  <a href="/docs">OpenAPI explorer</a>
+  <a href="/health">Service health</a>
+</nav>
+
+<main>
+<div class="content">
+
+<section id="overview">
+  <p class="eyebrow">Developer Platform</p>
+  <h1 class="hero-title">APIs I've <em>built</em>.</h1>
+  <p class="lede">Production-minded HTTP APIs I design, build, and operate end to end —
+  from the data layer and caching to authentication, quotas, and documentation.
+  Each one is live, versioned, and documented.</p>
+
+  <div class="btn-row">
+    <a href="/dcf" class="btn">Open the DCF API</a>
+    <a href="/" class="btn secondary">Back to portfolio</a>
+  </div>
+</section>
+
+<section id="apis">
+  <h2>Available APIs</h2>
+
+  <div class="api-list">
+
+    <div class="api-card live">
+      <div class="api-head">
+        <h3>DCF Valuation API</h3>
+        <span class="status-chip live">Live</span>
+      </div>
+      <p>Computes a discounted cash flow valuation for a single stock ticker from
+      customer-supplied assumptions. Fetches the company's financials, runs the model, and returns
+      the intrinsic value per share with the full year-by-year projection, so every number is
+      auditable to the dollar. Includes a sensitivity grid, a versioned error envelope, API-key
+      authentication, and per-key daily quotas.</p>
+
+      <div class="endpoint">
+        <span class="method">GET</span>
+        <code>/v1/valuations/{ticker}</code>
+      </div>
+
+      <div class="tags">
+        <span class="tag">Python</span><span class="tag">FastAPI</span><span class="tag">Supabase</span><span class="tag">Redis</span><span class="tag">Vercel</span>
+      </div>
+
+      <div class="btn-row">
+        <a href="/dcf" class="btn">Documentation &amp; live builder</a>
+      </div>
+    </div>
+
+    <div class="api-card">
+      <div class="api-head">
+        <h3>More tools in progress</h3>
+        <span class="status-chip planned">Planned</span>
+      </div>
+      <p>The DCF API is the first of several planned financial calculators sharing one account
+      and API-key system — a key issued here is scoped per product, so additional tools plug into
+      the same authentication, quota, and metering layer as they ship.</p>
+    </div>
+
+  </div>
+
+  <div class="note">
+    <strong>Getting access:</strong> sign in on the
+    <a href="/dcf">DCF API page</a> to generate a scoped API key for yourself — no operator
+    involvement needed. The same account will cover future APIs listed here.
+  </div>
+</section>
+
+<footer>
+  &copy; 2026 Abdelruhman Shaat. Model outputs are estimates for research and educational use,
+  not investment recommendations.
+</footer>
+
+</div>
+</main>
+</div>
+
+</body>
+</html>
