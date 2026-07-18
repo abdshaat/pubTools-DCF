@@ -6,6 +6,7 @@ unit-convention rule in CLAUDE.md.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import cast
 
 
@@ -38,6 +39,13 @@ class BaseFinancials:
     accepted_at: str | None = None
     statement_selection: str = "latest_complete_annual"
     data_quality_warnings: tuple[str, ...] = ()
+    # Mutable durable-head metadata. These fields travel with L1/Redis cache
+    # entries but are deliberately excluded from immutable snapshot content
+    # and its data_version fingerprint.
+    freshness_status: str | None = None
+    next_refresh_window_at: datetime | None = None
+    last_refresh_attempt_at: datetime | None = None
+    last_refresh_success_at: datetime | None = None
 
 
 @dataclass(frozen=True)

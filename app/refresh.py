@@ -19,12 +19,9 @@ import asyncio
 import time as time_module
 from datetime import UTC, datetime, time
 from typing import Any, Protocol
-from zoneinfo import ZoneInfo
 
 from .fundamentals import FundamentalsService
-
-EASTERN = ZoneInfo("America/New_York")
-REFRESH_HOUR_EASTERN = 18
+from .refresh_window import EASTERN, REFRESH_HOUR_EASTERN, eastern_now
 
 # Enough to move a small manifest quickly without stacking full FMP retry
 # ladders; the provider client's own three-slot semaphore bounds each cycle.
@@ -43,10 +40,6 @@ class RefreshLedger(Protocol):
     ) -> None: ...
 
     async def finish_refresh_run(self, *, refresh_date: str) -> dict[str, Any]: ...
-
-
-def eastern_now(wall_timestamp: float) -> datetime:
-    return datetime.fromtimestamp(wall_timestamp, tz=UTC).astimezone(EASTERN)
 
 
 class DailyRefreshRunner:

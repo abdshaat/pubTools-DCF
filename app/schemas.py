@@ -83,6 +83,22 @@ class ValuationResponse(BaseModel):
     currency: str | None
     monetary_unit: str
     fundamentals_as_of: str | None
+    freshness_status: str | None = Field(
+        description=(
+            "Durable statement refresh state: bootstrap_snapshot, "
+            "current_as_of_daily_refresh, daily_refresh_due, daily_refresh_running, "
+            "daily_refresh_partial_failed, or daily_refresh_failed."
+        )
+    )
+    next_refresh_window_at: datetime | None = Field(
+        description="Next scheduled 6 PM America/New_York statement refresh boundary."
+    )
+    last_refresh_attempt_at: datetime | None = Field(
+        description="When the latest scheduled statement refresh was attempted."
+    )
+    last_refresh_success_at: datetime | None = Field(
+        description="When statements were most recently verified and durably published."
+    )
     price_as_of: datetime | None
     price_fetched_at: datetime | None
     fiscal_year: str | None
@@ -223,7 +239,15 @@ def build_valuation_response(
 ) -> ValuationResponse:
     # data_version fingerprints the statement snapshot only — BaseFinancials
     # is price-free by construction, so the live quote never shifts it.
-    snapshot = json.dumps(asdict(base), sort_keys=True, separators=(",", ":"), default=str)
+    snapshot_values = asdict(base)
+    for field in (
+        "freshness_status",
+        "next_refresh_window_at",
+        "last_refresh_attempt_at",
+        "last_refresh_success_at",
+    ):
+        snapshot_values.pop(field, None)
+    snapshot = json.dumps(snapshot_values, sort_keys=True, separators=(",", ":"), default=str)
     data_version = f"sha256:{hashlib.sha256(snapshot.encode()).hexdigest()}"
     upside_pct = None
     if quote is not None:
@@ -246,6 +270,10 @@ def build_valuation_response(
         currency=base.currency,
         monetary_unit="raw_currency_units",
         fundamentals_as_of=base.fundamentals_as_of,
+        freshness_status=base.freshness_status,
+        next_refresh_window_at=base.next_refresh_window_at,
+        last_refresh_attempt_at=base.last_refresh_attempt_at,
+        last_refresh_success_at=base.last_refresh_success_at,
         price_as_of=quote.price_as_of if quote is not None else None,
         price_fetched_at=quote.fetched_at if quote is not None else None,
         fiscal_year=base.fiscal_year,

@@ -20,9 +20,10 @@ from app.api import create_app
 from app.fundamentals import FundamentalsService
 from app.redis_cache import InMemoryRedisBackend, get_envelope
 from app.refresh import DailyRefreshRunner
+from app.refresh_window import last_refresh_boundary, next_refresh_boundary
 from tests.fake_supabase import FakeSupabaseBackend
 from tests.test_data_layer import fixture_transport, load_fixture, make_client
-from tests.test_snapshots import CONFIG, fixture_base, make_store, snapshot_document
+from tests.test_snapshots import CONFIG, Clock, fixture_base, make_store, snapshot_document
 
 # 18:30 in New York on each date — inside the refresh window.
 EDT_WINDOW = datetime(2026, 7, 18, 22, 30, tzinfo=UTC).timestamp()  # 22 UTC cron
@@ -214,8 +215,10 @@ def test_one_failing_ticker_fails_its_claim_but_not_the_run():
     assert backend.refresh_claims[("GONE", "2026-07-18")]["status"] == "failed"
     assert backend.refresh_claims[("GONE", "2026-07-18")]["error_code"] == "TickerNotFoundError"
     assert backend.refresh_claims[("AAPL", "2026-07-18")]["status"] == "succeeded"
-    # The failed ticker's prior head stays active and untouched.
-    assert backend.snapshot_heads["GONE"]["refresh_status"] == "bootstrap_snapshot"
+    # The failed ticker's prior immutable snapshot/head pointer stays active,
+    # while mutable head metadata exposes the failed daily attempt.
+    assert backend.snapshot_heads["GONE"]["refresh_status"] == "daily_refresh_failed"
+    assert backend.snapshot_heads["GONE"]["last_refresh_attempt_at"] is not None
     assert backend.snapshot_heads["AAPL"]["refresh_status"] == "current_as_of_daily_refresh"
 
 
@@ -367,3 +370,150 @@ def test_cron_endpoint_end_to_end_with_supabase_wired(monkeypatch):
     assert payload["run"] == "completed"
     assert (payload["status"], payload["total"], payload["succeeded"]) == ("succeeded", 1, 1)
     assert backend.refresh_runs["2026-07-18"]["status"] == "succeeded"
+
+
+# ---------------------------------------------------------------------------
+# The 6 PM Eastern hard-expiry boundary (warm instances spanning the window)
+# ---------------------------------------------------------------------------
+
+
+def _utc_ts(*args: int) -> float:
+    return datetime(*args, tzinfo=UTC).timestamp()
+
+
+def test_last_refresh_boundary_in_edt_est_and_across_the_dst_switch():
+    # EDT: boundaries sit at 22:00 UTC (18:00-04:00).
+    assert last_refresh_boundary(_utc_ts(2026, 7, 18, 21, 0)) == _utc_ts(2026, 7, 17, 22, 0)
+    assert last_refresh_boundary(_utc_ts(2026, 7, 18, 22, 30)) == _utc_ts(2026, 7, 18, 22, 0)
+    # EST: boundaries sit at 23:00 UTC (18:00-05:00).
+    assert last_refresh_boundary(_utc_ts(2026, 1, 15, 22, 30)) == _utc_ts(2026, 1, 14, 23, 0)
+    assert last_refresh_boundary(_utc_ts(2026, 1, 15, 23, 30)) == _utc_ts(2026, 1, 15, 23, 0)
+    # Morning after 2026's spring-forward (2nd Sunday of March): yesterday's
+    # boundary was 18:00 EST = 23:00 UTC — wall-clock day arithmetic holds.
+    assert last_refresh_boundary(_utc_ts(2026, 3, 8, 12, 0)) == _utc_ts(2026, 3, 7, 23, 0)
+    assert next_refresh_boundary(_utc_ts(2026, 7, 18, 21, 0)).timestamp() == _utc_ts(
+        2026, 7, 18, 22, 0
+    )
+    assert next_refresh_boundary(_utc_ts(2026, 1, 15, 23, 30)).timestamp() == _utc_ts(
+        2026, 1, 16, 23, 0
+    )
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["daily_refresh_running", "daily_refresh_failed", "daily_refresh_partial_failed"],
+)
+def test_durable_noncurrent_refresh_status_is_not_collapsed_to_due(status):
+    backend = FakeSupabaseBackend()
+    backend.seed_snapshot(
+        ticker="AAPL",
+        snapshot=snapshot_document(fixture_base()),
+        verified_at="2026-07-18T20:30:00+00:00",
+        refresh_status=status,
+    )
+    clock = Clock(_utc_ts(2026, 7, 18, 22, 30))
+
+    async def scenario():
+        async with make_client(transport=fixture_transport()) as client:
+            service = FundamentalsService(
+                client, snapshots=make_store(backend), now=clock, wall_now=clock
+            )
+            return await service.get_base_financials("AAPL")
+
+    assert asyncio.run(scenario()).freshness_status == status
+
+
+def test_warm_instance_spanning_6pm_falls_back_to_db_until_refreshed():
+    backend = FakeSupabaseBackend()
+    backend.seed_snapshot(
+        ticker="AAPL",
+        snapshot=snapshot_document(fixture_base()),
+        verified_at="2026-07-18T20:30:00+00:00",  # 16:30 EDT — pre-window
+    )
+    call_log: list = []
+    clock = Clock(_utc_ts(2026, 7, 18, 21, 0))  # 17:00 EDT
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            service = FundamentalsService(
+                client, snapshots=make_store(backend), now=clock, wall_now=clock
+            )
+            before_boundary = await service.get_base_financials("AAPL")
+            reads_before = backend.snapshot_read_count
+            clock.advance(90 * 60)  # 18:30 EDT: the L1 entry is 1.5h old (< 4h TTL)
+            after_boundary = await service.get_base_financials("AAPL")
+            reads_after = backend.snapshot_read_count
+            # The daily job promotes the ticker; data becomes current again.
+            await service.refresh_from_provider("AAPL")
+            clock.advance(15 * 60)
+            refreshed = await service.get_base_financials("AAPL")
+            return before_boundary, after_boundary, refreshed, reads_before, reads_after
+
+    before_boundary, after_boundary, refreshed, reads_before, reads_after = asyncio.run(scenario())
+
+    def pending_refresh(base) -> bool:
+        return any("scheduled refresh pending" in w for w in base.data_quality_warnings)
+
+    assert reads_before == 1
+    assert not pending_refresh(before_boundary)  # pre-window data is current at 17:00
+    # Crossing 18:00 expired the young L1 entry: the DB was consulted again
+    # and the pre-window snapshot is served only with the explicit warning.
+    assert reads_after == 2
+    assert pending_refresh(after_boundary)
+    # After the scheduled promotion the warm L1 copy is current — no further
+    # DB reads and no freshness warning.
+    assert backend.snapshot_read_count == 2
+    assert not pending_refresh(refreshed)
+    assert len(call_log) == 4  # exactly the one scheduled provider cycle, no request-time FMP
+
+
+def test_pre_boundary_snapshot_rehydrated_into_redis_stays_pre_boundary():
+    backend = FakeSupabaseBackend()
+    backend.seed_snapshot(
+        ticker="AAPL",
+        snapshot=snapshot_document(fixture_base()),
+        verified_at="2026-07-18T20:30:00+00:00",
+    )
+    call_log: list = []
+    clock = Clock(_utc_ts(2026, 7, 18, 22, 30))  # 18:30 EDT, past the boundary
+
+    async def scenario():
+        redis = InMemoryRedisBackend()
+        async with (
+            make_client(transport=fixture_transport(call_log)) as first_client,
+            make_client(transport=fixture_transport(call_log)) as second_client,
+        ):
+            first = FundamentalsService(
+                first_client, redis=redis, snapshots=make_store(backend), now=clock, wall_now=clock
+            )
+            await first.get_base_financials("AAPL")
+            # A second instance sees the re-cached copy in Redis, but its
+            # stored-at is the head's verified_at — still pre-boundary, so it
+            # must consult the DB too instead of treating L2 as current.
+            second = FundamentalsService(
+                second_client, redis=redis, snapshots=make_store(backend), now=clock, wall_now=clock
+            )
+            served = await second.get_base_financials("AAPL")
+            return served
+
+    served = asyncio.run(scenario())
+    assert backend.snapshot_read_count == 2
+    assert call_log == []
+    assert any("scheduled refresh pending" in w for w in served.data_quality_warnings)
+
+
+def test_ttl_only_freshness_without_snapshot_store_ignores_the_boundary():
+    call_log: list = []
+    clock = Clock(_utc_ts(2026, 7, 18, 21, 0))
+
+    async def scenario():
+        async with make_client(transport=fixture_transport(call_log)) as client:
+            service = FundamentalsService(client, now=clock, wall_now=clock)  # no store
+            await service.get_base_financials("AAPL")
+            clock.advance(90 * 60)  # crosses 18:00 EDT
+            await service.get_base_financials("AAPL")
+
+    asyncio.run(scenario())
+    # Without the durable store the daily-refresh policy is not in force:
+    # the young L1 entry keeps serving and FMP is not re-consulted.
+    assert len(call_log) == 4

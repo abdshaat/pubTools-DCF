@@ -194,6 +194,7 @@ class SupabaseClient:
                 "ticker": f"eq.{ticker.upper()}",
                 "select": (
                     "ticker,snapshot_version,verified_at,refresh_status,"
+                    "last_refresh_attempt_at,last_refresh_success_at,"
                     "normalized_snapshots(snapshot)"
                 ),
                 "limit": "1",
@@ -213,6 +214,8 @@ class SupabaseClient:
         snapshot = embedded.get("snapshot") if isinstance(embedded, dict) else None
         try:
             verified_at = _parse_datetime(row.get("verified_at"))
+            last_refresh_attempt_at = _parse_datetime(row.get("last_refresh_attempt_at"))
+            last_refresh_success_at = _parse_datetime(row.get("last_refresh_success_at"))
         except (SupabaseError, ValueError):
             return None
         ticker_value = row.get("ticker")
@@ -230,6 +233,8 @@ class SupabaseClient:
             snapshot_version=snapshot_version,
             verified_at=verified_at,
             refresh_status=refresh_status if isinstance(refresh_status, str) else None,
+            last_refresh_attempt_at=last_refresh_attempt_at,
+            last_refresh_success_at=last_refresh_success_at,
             snapshot=snapshot,
         )
 
@@ -288,17 +293,13 @@ class SupabaseClient:
     async def complete_refresh_claim(
         self, *, ticker: str, refresh_date: str, status: str, error_code: str | None
     ) -> None:
-        response = await self._client.patch(
-            "/rest/v1/financial_refresh_claims",
-            params={
-                "ticker": f"eq.{ticker.upper()}",
-                "refresh_date": f"eq.{refresh_date}",
-            },
-            headers={"Prefer": "return=minimal"},
+        response = await self._client.post(
+            "/rest/v1/rpc/complete_financial_refresh_claim",
             json={
-                "status": status,
-                "completed_at": datetime.now(UTC).isoformat(),
-                "error_code": error_code,
+                "p_ticker": ticker.upper(),
+                "p_refresh_date": refresh_date,
+                "p_status": status,
+                "p_error_code": error_code,
             },
         )
         if response.status_code >= 400:

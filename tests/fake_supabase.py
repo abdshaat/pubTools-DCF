@@ -51,6 +51,8 @@ class FakeSupabaseBackend:
         snapshot_version: str = "sha256:seeded",
         verified_at: str = "2026-07-18T00:00:00+00:00",
         refresh_status: str = "bootstrap_snapshot",
+        last_refresh_attempt_at: str | None = None,
+        last_refresh_success_at: str | None = None,
     ) -> None:
         """Install a stored head + snapshot document as if a past bootstrap
         or daily refresh had committed it."""
@@ -64,6 +66,8 @@ class FakeSupabaseBackend:
             "snapshot_version": snapshot_version,
             "verified_at": verified_at,
             "refresh_status": refresh_status,
+            "last_refresh_attempt_at": last_refresh_attempt_at,
+            "last_refresh_success_at": last_refresh_success_at,
         }
 
     def register_login_code(
@@ -280,14 +284,21 @@ class FakeSupabaseBackend:
                 "total_tickers": len(tickers),
             }
             for ticker in tickers:
+                started_at = datetime.now(UTC).isoformat()
                 self.refresh_claims[(ticker, refresh_date)] = {
                     "ticker": ticker,
                     "refresh_date": refresh_date,
-                    "claimed_at": datetime.now(UTC).isoformat(),
+                    "claimed_at": started_at,
                     "completed_at": None,
                     "status": "pending",
                     "error_code": None,
                 }
+                self.snapshot_heads[ticker].update(
+                    {
+                        "last_refresh_attempt_at": started_at,
+                        "refresh_status": "daily_refresh_running",
+                    }
+                )
             return httpx.Response(
                 200,
                 json={
@@ -298,12 +309,26 @@ class FakeSupabaseBackend:
                 },
             )
 
-        if path == "/rest/v1/financial_refresh_claims" and method == "PATCH":
-            ticker = request.url.params.get("ticker", "").removeprefix("eq.")
-            refresh_date = request.url.params.get("refresh_date", "").removeprefix("eq.")
+        if path == "/rest/v1/rpc/complete_financial_refresh_claim" and method == "POST":
+            body = json.loads(request.content)
+            ticker = body["p_ticker"]
+            refresh_date = body["p_refresh_date"]
             claim = self.refresh_claims.get((ticker, refresh_date))
             if claim is not None:
-                claim.update(json.loads(request.content))
+                claim.update(
+                    {
+                        "status": body["p_status"],
+                        "completed_at": datetime.now(UTC).isoformat(),
+                        "error_code": body.get("p_error_code"),
+                    }
+                )
+                if body["p_status"] == "failed":
+                    self.snapshot_heads[ticker].update(
+                        {
+                            "last_refresh_attempt_at": datetime.now(UTC).isoformat(),
+                            "refresh_status": "daily_refresh_failed",
+                        }
+                    )
             return httpx.Response(204)
 
         if path == "/rest/v1/rpc/finish_financial_refresh_run" and method == "POST":
@@ -332,6 +357,13 @@ class FakeSupabaseBackend:
                         "failed_tickers": failed,
                     }
                 )
+            for claim in claims:
+                if claim["status"] != "succeeded":
+                    self.snapshot_heads[claim["ticker"]]["refresh_status"] = (
+                        "daily_refresh_failed"
+                        if claim["status"] == "failed"
+                        else "daily_refresh_partial_failed"
+                    )
             return httpx.Response(
                 200,
                 json={
@@ -361,6 +393,8 @@ class FakeSupabaseBackend:
                 "snapshot_version": version,
                 "verified_at": datetime.now(UTC).isoformat(),
                 "refresh_status": body.get("p_refresh_status") or "bootstrap_snapshot",
+                "last_refresh_attempt_at": datetime.now(UTC).isoformat(),
+                "last_refresh_success_at": datetime.now(UTC).isoformat(),
             }
             return httpx.Response(204)
 

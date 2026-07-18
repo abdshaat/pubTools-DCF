@@ -93,7 +93,9 @@ def test_db_hit_serves_statements_without_any_provider_call():
             return await service.get_base_financials("AAPL")
 
     base = asyncio.run(scenario())
-    assert base == seeded
+    assert snapshot_fingerprint(base) == snapshot_fingerprint(seeded)
+    assert base.freshness_status == "bootstrap_snapshot"
+    assert base.next_refresh_window_at is not None
     assert call_log == []  # zero FMP traffic for an existing DB ticker
     assert backend.snapshot_read_count == 1
 
@@ -130,7 +132,8 @@ def test_db_hit_hydrates_l1_and_redis_for_later_requests():
     reads_after_first, same_instance_reads, from_l2, fund, profile = asyncio.run(scenario())
     assert reads_after_first == 1
     assert same_instance_reads == 1
-    assert from_l2 == fixture_base()
+    assert snapshot_fingerprint(from_l2) == snapshot_fingerprint(fixture_base())
+    assert from_l2.freshness_status == "bootstrap_snapshot"
     assert backend.snapshot_read_count == 1
     assert call_log == []
     assert fund is not None and fund.data["ticker"] == "AAPL"
@@ -152,6 +155,8 @@ def test_stale_db_snapshot_served_with_pending_refresh_warning():
 
     base = asyncio.run(scenario())
     assert call_log == []  # stale is served as stored, never refreshed by a request
+    assert base.freshness_status == "daily_refresh_due"
+    assert base.next_refresh_window_at is not None
     assert any("scheduled refresh pending" in warning for warning in base.data_quality_warnings)
     assert any(old[:19] in warning for warning in base.data_quality_warnings)
 
@@ -210,7 +215,8 @@ def test_cold_ticker_bootstraps_once_and_persists_snapshot_and_head():
             return await service.get_base_financials("AAPL"), second_log
 
     from_db, second_log = asyncio.run(second_scenario())
-    assert from_db == base
+    assert snapshot_fingerprint(from_db) == snapshot_fingerprint(base)
+    assert from_db.freshness_status == base.freshness_status == "bootstrap_snapshot"
     assert second_log == []
 
 
@@ -392,6 +398,14 @@ def test_snapshot_fingerprint_is_stable_and_content_addressed():
     base = fixture_base()
     assert snapshot_fingerprint(base).startswith("sha256:")
     assert snapshot_fingerprint(base) == snapshot_fingerprint(fixture_base())
+    assert snapshot_fingerprint(base) == snapshot_fingerprint(
+        replace(
+            base,
+            freshness_status="daily_refresh_failed",
+            next_refresh_window_at=datetime.now(UTC),
+            last_refresh_attempt_at=datetime.now(UTC),
+        )
+    )
     assert snapshot_fingerprint(base) != snapshot_fingerprint(replace(base, revenue=1.0))
 
 
@@ -413,6 +427,8 @@ def test_get_ticker_snapshot_parses_typed_record():
         snapshot_version="sha256:abc",
         verified_at="2026-07-18T12:00:00+00:00",
         refresh_status="bootstrap_snapshot",
+        last_refresh_attempt_at="2026-07-18T11:59:00+00:00",
+        last_refresh_success_at="2026-07-18T12:00:00+00:00",
     )
 
     async def scenario():
@@ -424,6 +440,8 @@ def test_get_ticker_snapshot_parses_typed_record():
     assert record.snapshot_version == "sha256:abc"
     assert record.verified_at == datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
     assert record.refresh_status == "bootstrap_snapshot"
+    assert record.last_refresh_attempt_at == datetime(2026, 7, 18, 11, 59, tzinfo=UTC)
+    assert record.last_refresh_success_at == datetime(2026, 7, 18, 12, 0, tzinfo=UTC)
     # The HTTP round trip turns the warnings tuple into a JSON list, so
     # compare against the JSON-normalized form of the same document.
     assert record.snapshot == json.loads(json.dumps(document))
@@ -522,3 +540,35 @@ def test_snapshot_store_outage_maps_to_controlled_503():
     payload = response.json()
     assert payload["error"]["code"] == "snapshot_store_unavailable"
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_db_backed_route_exposes_structured_statement_freshness():
+    backend = FakeSupabaseBackend()
+    verified = datetime.now(UTC)
+    attempted = verified - timedelta(minutes=2)
+    backend.seed_snapshot(
+        ticker="AAPL",
+        snapshot=snapshot_document(fixture_base()),
+        verified_at=verified.isoformat(),
+        refresh_status="current_as_of_daily_refresh",
+        last_refresh_attempt_at=attempted.isoformat(),
+        last_refresh_success_at=verified.isoformat(),
+    )
+    app = create_app(fmp_client=make_client(), snapshot_store=make_store(backend))
+    with TestClient(app) as http:
+        response = http.get(
+            "/v1/valuations/AAPL",
+            params={
+                "wacc": 0.09,
+                "terminal_growth": 0.025,
+                "ebit_margin": 0.30,
+                "revenue_growth": "0.05",
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["freshness_status"] == "current_as_of_daily_refresh"
+    assert datetime.fromisoformat(payload["next_refresh_window_at"]) > verified
+    assert datetime.fromisoformat(payload["last_refresh_attempt_at"]) == attempted
+    assert datetime.fromisoformat(payload["last_refresh_success_at"]) == verified

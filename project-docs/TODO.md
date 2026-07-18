@@ -120,14 +120,17 @@ Eastern refresh job.
 - [ ] **4.2 — Generate a `CRON_SECRET`** (16+ random characters), add it to Vercel
   **Production**, and redeploy. This protects the internal refresh endpoint. Do
   **not** commit it or expose it to the browser.
-- [ ] **4.3 — Apply migration 003 to Supabase** — same flow as migrations
-  001/002 (paste the SQL into the Supabase SQL editor). It creates the
-  immutable snapshot table, ticker heads, the refresh run/claim ledger, and
-  the store/run RPCs. *(**Final as of 2026-07-18** —
-  `supabase/migrations/003_phase8_snapshots.sql`, now including the
-  run-manifest RPCs. Apply it **before** the Slice C code is committed and
-  deployed: with Supabase configured, a missing table is a storage error —
-  503 on cold tickers — not a cache miss.)*
+- [x] **4.3 — Apply migration 003 to Supabase.** Done 2026-07-18 (after the
+  Slice C push briefly left production 503ing keyed valuations — the code
+  deployed before the migration; applying it restored service). Verified
+  live same session: all four tables respond, both RPC guards fire, and a
+  real AAPL bootstrap wrote a durable head that a second instance then
+  served **with an invalid FMP key** (proof the statements came from the
+  database alone).
+- [x] **4.3b — Apply migration 004 to Supabase.** Done 2026-07-18. Live-verified
+  with a non-mutating invalid-status call to `complete_financial_refresh_claim`:
+  the deployed RPC returned its expected `invalid refresh claim status` guard.
+  The current working tree may now be deployed without an RPC ordering gap.
 - [ ] **4.4 — Confirm FMP plan capacity.** The daily job refreshes **every**
   ticker in the database, with several FMP endpoint calls each plus retries. Your
   current FMP tier is ~250 calls/day. Confirm the plan (or upgrade) before the
@@ -173,15 +176,20 @@ Eastern refresh job.
 
 - **Phase 9 is committed and live** (commit `2a3b66e`, deployed 2026-07-16): the
   portfolio, `/apis`, `/dcf`, and images are all serving on the domain.
-- **ADR-008 (live Finnhub price, model 0.2.0) is implemented and live-verified
-  locally but NOT yet committed/deployed** — the working tree holds the whole
-  feature (plus Slice 1 and the AWS card from 2026-07-17). Production still runs
-  the old cached-quote code until this is committed and pushed.
-- **Current state:** 325 tests passing, 93.58% coverage, ruff/format/mypy clean.
-  Phase 8 Slice C parts 1–2 (durable snapshots, DB read-through, and the daily
-  6 PM Eastern refresh scheduler with its cron endpoint) are implemented and
-  tested against fakes; remaining: the 6 PM L1 cutoff, structured freshness
-  response fields, and live wiring (§4).
+- **ADR-008 + Slice C parts 1–2 are committed and deployed** (commit
+  `8e30cf4`, pushed by the owner 2026-07-18; migration 003 applied the same
+  day). Production runs model 0.2.0 with the live Finnhub price and the
+  database read-through, live-verified against the real Supabase/FMP.
+- **⚠️ Tonight's cron will 401 until §4.2 (`CRON_SECRET`) is done** — the
+  refresh endpoint is deployed and scheduled (22:00 + 23:00 UTC) but has no
+  secret configured, so no daily refresh actually runs yet. Once the
+  6 PM-boundary code deploys, responses will carry "scheduled refresh
+  pending" warnings after each 6 PM Eastern until the cron works.
+- **Current state:** 333 tests passing, 93.70% coverage; ruff/format/mypy/build
+  clean. Uncommitted in the tree: Slice C parts 3a–3b — the 6 PM Eastern
+  L1/Redis hard-expiry boundary plus structured freshness response fields and
+  migration 004, which is now applied. Remaining: live wiring
+  (§4.1/4.2/4.4).
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

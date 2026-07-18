@@ -23,7 +23,7 @@ import time
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime
+from datetime import UTC, date, datetime
 from math import isfinite
 from typing import Any, Protocol
 from uuid import uuid4
@@ -40,6 +40,7 @@ from .models import BaseFinancials
 from .normalization import normalize_fmp_fundamentals
 from .providers.fmp import FMPClient, FMPFundamentals
 from .redis_cache import REDIS_KEY_PREFIX, RedisBackend, get_envelope, set_envelope
+from .refresh_window import last_refresh_boundary, next_refresh_boundary
 
 # Definitive per-ticker rejections worth caching: re-fetching within the TTL
 # would return the same answer and only burn API quota.
@@ -72,6 +73,8 @@ class TickerSnapshotRecord:
     snapshot_version: str
     verified_at: datetime
     refresh_status: str | None
+    last_refresh_attempt_at: datetime | None
+    last_refresh_success_at: datetime | None
     snapshot: dict[str, Any]
 
 
@@ -101,7 +104,7 @@ def snapshot_fingerprint(base: BaseFinancials) -> str:
     provider fetch that re-confirms an identical filing hashes identically
     and the store's ON CONFLICT DO NOTHING keeps exactly one row."""
     canonical = json.dumps(
-        _base_to_payload(base), sort_keys=True, separators=(",", ":"), default=str
+        _snapshot_base_payload(base), sort_keys=True, separators=(",", ":"), default=str
     )
     return f"sha256:{hashlib.sha256(canonical.encode()).hexdigest()}"
 
@@ -109,7 +112,7 @@ def snapshot_fingerprint(base: BaseFinancials) -> str:
 def _snapshot_document(base: BaseFinancials, profile: dict[str, Any] | None) -> dict[str, Any]:
     return {
         "v": _SNAPSHOT_DOCUMENT_VERSION,
-        "base": _base_to_payload(base),
+        "base": _snapshot_base_payload(base),
         "profile": profile,
     }
 
@@ -153,7 +156,29 @@ def _iso_date_or_none(value: str | None) -> str | None:
 def _base_to_payload(base: BaseFinancials) -> dict[str, Any]:
     # The snapshot is price-free by construction (ADR-008): BaseFinancials
     # has no price field, so nothing here can leak a market price into Redis.
-    return asdict(base)
+    payload = asdict(base)
+    for field in (
+        "next_refresh_window_at",
+        "last_refresh_attempt_at",
+        "last_refresh_success_at",
+    ):
+        value = payload.get(field)
+        if isinstance(value, datetime):
+            payload[field] = value.isoformat()
+    return payload
+
+
+def _snapshot_base_payload(base: BaseFinancials) -> dict[str, Any]:
+    """Immutable price-free statement content, excluding mutable head state."""
+    payload = _base_to_payload(base)
+    for field in (
+        "freshness_status",
+        "next_refresh_window_at",
+        "last_refresh_attempt_at",
+        "last_refresh_success_at",
+    ):
+        payload.pop(field, None)
+    return payload
 
 
 def _base_from_payload(payload: Any) -> BaseFinancials | None:
@@ -165,6 +190,16 @@ def _base_from_payload(payload: Any) -> BaseFinancials | None:
         if not all(isinstance(item, str) for item in warnings):
             return None
         values["data_quality_warnings"] = warnings
+        for field in (
+            "next_refresh_window_at",
+            "last_refresh_attempt_at",
+            "last_refresh_success_at",
+        ):
+            value = values.get(field)
+            if isinstance(value, str):
+                values[field] = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            elif value is not None and not isinstance(value, datetime):
+                return None
         base = BaseFinancials(**values)
         numbers = (
             base.revenue,
@@ -273,7 +308,12 @@ class FundamentalsService:
         with suppress(Exception):
             await self._redis.delete(self._redis_key(kind, ticker))
 
-    async def _remote_set(self, kind: str, ticker: str, data: Any, ttl: float) -> None:
+    async def _remote_set(
+        self, kind: str, ticker: str, data: Any, ttl: float, *, stored_at: float | None = None
+    ) -> None:
+        """`stored_at` defaults to now for freshly fetched data; DB-hit
+        hydration passes the head's verified_at instead, so a re-cached old
+        snapshot keeps its true age and can never masquerade as current."""
         if self._redis is None:
             return
         with suppress(Exception):
@@ -282,8 +322,19 @@ class FundamentalsService:
                 self._redis_key(kind, ticker),
                 data,
                 ttl_seconds=max(1, int(ttl)),
-                stored_at=self._wall_now(),
+                stored_at=self._wall_now() if stored_at is None else stored_at,
             )
+
+    def _is_current(self, age: float) -> bool:
+        """Fresh by TTL — and, when the durable store governs freshness, also
+        from after the most recent 6 PM Eastern refresh boundary (ADR-007: a
+        warm instance must not keep serving pre-window data as current)."""
+        if age >= self._statement_ttl:
+            return False
+        if self._snapshots is None:
+            return True
+        wall = self._wall_now()
+        return wall - age >= last_refresh_boundary(wall)
 
     async def _remote_base(self, ticker: str) -> tuple[float, BaseFinancials] | None:
         cached = await self._remote_get("fund", ticker)
@@ -343,7 +394,7 @@ class FundamentalsService:
         while self._now() < deadline:
             await self._sleep(self._redis_poll_interval)
             cached = await self._remote_base(ticker)
-            if cached is not None and cached[0] < self._statement_ttl:
+            if cached is not None and self._is_current(cached[0]):
                 age, base = cached
                 self._cache[ticker] = (self._now() - age, base)
                 return base
@@ -394,7 +445,26 @@ class FundamentalsService:
             return None
         base, profile = parsed
         age = max(0.0, age)
-        if age > self._max_statement_staleness:
+        verified_wall = record.verified_at.timestamp()
+        boundary = last_refresh_boundary(self._wall_now())
+        refresh_due = verified_wall < boundary
+        freshness_status = record.refresh_status
+        if refresh_due and freshness_status not in {
+            "daily_refresh_running",
+            "daily_refresh_partial_failed",
+            "daily_refresh_failed",
+        }:
+            freshness_status = "daily_refresh_due"
+        base = replace(
+            base,
+            freshness_status=freshness_status,
+            next_refresh_window_at=next_refresh_boundary(self._wall_now()),
+            last_refresh_attempt_at=record.last_refresh_attempt_at,
+            last_refresh_success_at=record.last_refresh_success_at,
+        )
+        if refresh_due:
+            # This head missed the most recent 6 PM Eastern window (refresh
+            # due, running, or failed) — served as stored, never refetched.
             base = replace(
                 base,
                 data_quality_warnings=(
@@ -405,12 +475,21 @@ class FundamentalsService:
                 ),
             )
         self._cache[ticker] = (self._now() - age, base)
+        # Hydrate Redis with the head's true verified time (not "now"), so a
+        # pre-boundary snapshot re-cached here still reads as pre-boundary on
+        # every instance and cannot masquerade as current (ADR-007).
         if profile is not None:
             self._profile_cache[ticker] = (self._now(), profile)
-            await self._remote_set("profile", ticker, profile, self._profile_ttl)
+            await self._remote_set(
+                "profile", ticker, profile, self._profile_ttl, stored_at=verified_wall
+            )
         # `fund:` last: it is the distributed commit marker lock losers poll.
         await self._remote_set(
-            "fund", ticker, _base_to_payload(base), self._max_statement_staleness
+            "fund",
+            ticker,
+            _base_to_payload(base),
+            self._max_statement_staleness,
+            stored_at=verified_wall,
         )
         if lock_token is not None:
             await self._release_distributed_lock(ticker, lock_token)
@@ -424,7 +503,7 @@ class FundamentalsService:
             fetched_at, value = cached
             stale_base = value
             stale_age = self._now() - fetched_at
-            if stale_age < self._statement_ttl:
+            if self._is_current(stale_age):
                 profile = self._profile_cache.get(ticker)
                 raw_cached = self._raw_cache.get(ticker)
                 if (
@@ -452,7 +531,7 @@ class FundamentalsService:
         if remote_base is not None and (stale_age is None or remote_base[0] < stale_age):
             stale_age, stale_base = remote_base
             self._cache[ticker] = (self._now() - stale_age, stale_base)
-        if stale_base is not None and stale_age is not None and stale_age < self._statement_ttl:
+        if stale_base is not None and stale_age is not None and self._is_current(stale_age):
             return stale_base
 
         negative = self._negative.get(ticker)
@@ -530,7 +609,9 @@ class FundamentalsService:
             # the database did not commit; Vercel allows no post-response
             # work). Failure fails the bootstrap — nothing is published.
             try:
-                await self._persist_snapshot(ticker, raw, normalized, "bootstrap_snapshot")
+                normalized = await self._persist_snapshot(
+                    ticker, raw, normalized, "bootstrap_snapshot"
+                )
             except Exception as exc:
                 if lock_token is not None:
                     await self._release_distributed_lock(ticker, lock_token)
@@ -555,8 +636,9 @@ class FundamentalsService:
         raw: FMPFundamentals,
         normalized: BaseFinancials,
         refresh_status: str,
-    ) -> None:
+    ) -> BaseFinancials:
         assert self._snapshots is not None
+        refreshed_at = datetime.fromtimestamp(self._wall_now(), tz=UTC)
         await self._snapshots.store_ticker_snapshot(
             ticker=ticker,
             snapshot_version=snapshot_fingerprint(normalized),
@@ -566,6 +648,16 @@ class FundamentalsService:
             statement_date=_iso_date_or_none(normalized.fundamentals_as_of),
             currency=normalized.currency,
             refresh_status=refresh_status,
+        )
+        # The RPC timestamps the durable head with its own `now()`. Use the
+        # same request instant for the just-published cache copy; a later DB
+        # read replaces these values with the authoritative database times.
+        return replace(
+            normalized,
+            freshness_status=refresh_status,
+            next_refresh_window_at=next_refresh_boundary(self._wall_now()),
+            last_refresh_attempt_at=refreshed_at,
+            last_refresh_success_at=refreshed_at,
         )
 
     async def refresh_from_provider(
@@ -581,7 +673,7 @@ class FundamentalsService:
         ticker = ticker.upper()
         raw = await self._client.fetch_fundamentals(ticker)
         normalized = normalize_fmp_fundamentals(raw)
-        await self._persist_snapshot(ticker, raw, normalized, refresh_status)
+        normalized = await self._persist_snapshot(ticker, raw, normalized, refresh_status)
         self._cache[ticker] = (self._now(), normalized)
         self._raw_cache[ticker] = (self._now(), raw)
         self._profile_cache[ticker] = (self._now(), raw.profile)

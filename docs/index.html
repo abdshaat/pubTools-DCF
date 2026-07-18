@@ -754,7 +754,9 @@ FMP_API_KEY=your-key-here</code></pre>
   Running several valuations of the same ticker with different assumptions reuses one statement snapshot instead of
   refetching it, so repeat requests stay fast; the DCF math itself is recomputed on every request from that
   snapshot plus the live price. <code>fundamentals_as_of</code> tells you which filing the statements come from,
-  and <code>price_as_of</code>/<code>price_fetched_at</code> timestamp the quote.</p>
+  while <code>freshness_status</code>, <code>next_refresh_window_at</code>,
+  <code>last_refresh_attempt_at</code>, and <code>last_refresh_success_at</code> expose the durable daily-refresh
+  state. <code>price_as_of</code>/<code>price_fetched_at</code> independently timestamp the live quote.</p>
   <div class="note"><strong>If the live price is unavailable</strong> (provider outage, or a symbol the quote
   provider doesn't recognize), the API still returns the full valuation — <code>current_price</code> and
   <code>upside_pct</code> come back <code>null</code> with a warning naming the cause. The intrinsic-value math
@@ -982,6 +984,10 @@ FMP_API_KEY=your-key-here</code></pre>
   <span class="k">"currency"</span>: <span class="s">"USD"</span>,
   <span class="k">"monetary_unit"</span>: <span class="s">"raw_currency_units"</span>,
   <span class="k">"fundamentals_as_of"</span>: <span class="s">"2025-09-27"</span>,
+  <span class="k">"freshness_status"</span>: <span class="s">"current_as_of_daily_refresh"</span>,
+  <span class="k">"next_refresh_window_at"</span>: <span class="s">"2026-07-18T22:00:00Z"</span>,
+  <span class="k">"last_refresh_attempt_at"</span>: <span class="s">"2026-07-17T22:00:03Z"</span>,
+  <span class="k">"last_refresh_success_at"</span>: <span class="s">"2026-07-17T22:00:08Z"</span>,
   <span class="k">"price_as_of"</span>: <span class="s">"2026-07-17T20:00:00Z"</span>,
   <span class="k">"price_fetched_at"</span>: <span class="s">"2026-07-11T18:29:59Z"</span>,
   <span class="k">"fiscal_year"</span>: <span class="s">"2025"</span>,

@@ -99,3 +99,5 @@ supabase/.env.*
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+.env*

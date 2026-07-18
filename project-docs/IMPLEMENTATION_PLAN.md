@@ -1373,21 +1373,35 @@ as the fallback when Redis is unconfigured or down.
   `GET /internal/cron/refresh-financials`, `vercel.json` crons at
   `0 22 * * *` + `0 23 * * *`, and 14 tests (EST/EDT guard, duplicate-cron
   no-op, complete-manifest reconciliation, partial-run isolation, endpoint
-  auth; suite 325). **Part 3 remains:** the 6-PM L1 hard-expiry cutoff
-  (warm instances must not serve pre-window L1 data as current),
-  structured customer freshness metadata beyond `data_quality_warnings`
-  (`freshness_status`, `next_refresh_window_at`, last attempt/success), and
-  live verification with the real Upstash/Supabase/cron wiring.
+  auth; suite 325). **Part 3a — the 6-PM hard-expiry boundary — implemented
+  2026-07-18** (`app/refresh_window.py`; `_is_current` = TTL AND
+  post-boundary at all three freshness sites; DB rehydration keeps the
+  head's true `verified_at` as the Redis stored-at so pre-window data can
+  never read as current anywhere; due-warning tied to the boundary; 4 tests
+  incl. DST switch and a warm instance spanning 18:00; suite 329; migration
+  003 applied + read-through live-verified against production Supabase/FMP
+  the same day). **Part 3b — structured customer freshness metadata —
+  implemented 2026-07-18:** durable head status/attempt/success now travel
+  through DB → Redis/L1 → response without entering the immutable statement
+  fingerprint; `next_refresh_window_at` is DST-safe; due/running/failed/
+  partial-failed states are explicit; migration 004 makes claim completion
+  plus failed-head publication atomic; OpenAPI/customer docs updated; suite
+  333 at 93.70% coverage, lint/format/mypy/build clean. Migration 004 was
+  applied and its new RPC guard live-verified 2026-07-18. **Remaining:** live
+  cron/Redis verification (needs `CRON_SECRET` + env pull + capacity gate).
   **Per ADR-008 this slice must NOT include a `quote:` cache, a `resp:` response
   cache, or response-cache generation rotation** (those are removed by the
   Finnhub feature; see `issues.MD`); the daily cycle refreshes statements/profile
   only. User applies migration 003 to the live project after local verification
   (same flow as 001/002) and sets `CRON_SECRET` before deploying the cron
   configuration.
-- [ ] **Live verification** on a real deployment once the user provisions
-  Upstash: two-instance cache sharing observed (second request after a cold
-  hit performs zero FMP calls from a different instance), Redis-down
-  fail-open exercised by pointing at a dead URL in a preview env.
+- [ ] **Live verification** on the real deployment. Done 2026-07-18: migration
+  003 confirmed applied (tables + RPC guards), production `/health` at 0.2.0,
+  and the DB read-through proven against real Supabase+FMP (cold AAPL
+  bootstrap persisted a head; a second instance with an invalid FMP key then
+  served it from the database alone). Still open: two-instance **Redis**
+  sharing on the deployment, Redis-down fail-open in a preview env, and
+  observing one real nightly cron run (blocked on `CRON_SECRET`).
 
 ### User actions required (provisioning — before Slice A can be live-verified)
 
@@ -1398,10 +1412,15 @@ as the fallback when Redis is unconfigured or down.
 2. [ ] `vercel env pull` (or copy the two REST vars into local `.env`) so local
    runs can hit the same instance.
 3. [x] Say the word when done — user authorized implementation 2026-07-13.
-4. [ ] Before Slice C is deployed, generate a random `CRON_SECRET` (at least
-   16 characters), add it to Vercel Production, and redeploy. Do not expose it
-   to the browser or commit it.
-5. [ ] Confirm the FMP plan and chosen runtime can finish
+4. [ ] Generate a random `CRON_SECRET` (at least 16 characters), add it to
+   Vercel Production, and redeploy. Do not expose it to the browser or commit
+   it. **Now urgent, not pre-deploy:** Slice C parts 1–2 deployed 2026-07-18
+   (`8e30cf4`) with the crons registered — until this secret exists, every
+   nightly invocation 401s and no daily refresh runs.
+5. [x] Apply `supabase/migrations/004_phase8_freshness.sql` before deploying
+   Part 3b. Completed 2026-07-18; the new claim-completion RPC's invalid-status
+   guard was live-verified without mutating run data.
+6. [ ] Confirm the FMP plan and chosen runtime can finish
    `COUNT(ticker_snapshot_heads) × expected FMP endpoint calls (plus bounded
    retries)` inside one daily run. If not, upgrade capacity or choose a durable
    worker; do not reduce the ticker manifest.
@@ -1418,7 +1437,9 @@ Exit criteria:
   provider exists as exactly one immutable `normalized_snapshots` row; the
   ticker head points to the latest verified snapshot, and a cold cache/redeploy
   reads it before making FMP calls. Full quote-backed response
-  reproduction remains explicitly deferred to Phase 12.
+  reproduction remains explicitly deferred to Phase 12. (Dedup and
+  read-DB-before-FMP are test-proven and were live-verified for one ticker
+  2026-07-18; keep open until a daily run exercises the whole manifest.)
 - [ ] An existing stored ticker never triggers any FMP call from a customer
   request, including quote retrieval; durable claims prove at most one complete
   refresh cycle per ticker per Eastern date despite duplicate cron delivery or
@@ -1428,12 +1449,15 @@ Exit criteria:
   popularity, or budget-based omission.
 - [ ] The UTC schedules and `America/New_York` guard produce exactly one claimed
   daily run during the 6 PM Eastern hour in both EST and EDT tests.
-- [ ] Responses expose last attempt/success, next refresh window, and statement
+- [x] Responses expose last attempt/success, next refresh window, and statement
   timestamps, and accurately warn when the latest daily run is due, partial, or
-  failed (price timestamps ride on the live quote — ADR-008).
-- [ ] A pre-window L1 entry cannot remain silently current after its ticker is
+  failed (price timestamps ride on the live quote — ADR-008). Implemented and
+  contract-tested 2026-07-18; migration 004 applied and RPC live-verified.
+- [x] A pre-window L1 entry cannot remain silently current after its ticker is
   promoted; tests cover warm instances spanning 6 PM. (No response/edge cache
-  exists to carry anything — responses are `no-store`.)
+  exists to carry anything — responses are `no-store`.) Test-proven
+  2026-07-18 (`test_warm_instance_spanning_6pm_falls_back_to_db_until_refreshed`,
+  plus the honest-stored-at cross-instance test).
 - [ ] Login rate limiting is enforced across instances, not per instance.
 - [x] Corrupt/foreign/unknown-version Redis entries are treated as misses and
   cleaned up, never surfaced as errors. Verified 2026-07-13 by envelope and

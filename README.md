@@ -95,6 +95,15 @@ request. `fundamentals_as_of`, `fiscal_year`, `statement_period`, filing
 metadata, `price_as_of`, and `price_fetched_at` make the selected data
 auditable.
 
+When the durable snapshot store is enabled, every valuation also returns
+`freshness_status`, `next_refresh_window_at`, `last_refresh_attempt_at`, and
+`last_refresh_success_at`. The statement status is one of
+`bootstrap_snapshot`, `current_as_of_daily_refresh`, `daily_refresh_due`,
+`daily_refresh_running`, `daily_refresh_partial_failed`, or
+`daily_refresh_failed`. These fields describe the slow-moving FMP statements;
+the independent Finnhub quote retains its own timestamps and is still fetched
+live on every request.
+
 ## Architecture
 
 | Layer | Where | Status |

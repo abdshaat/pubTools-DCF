@@ -93,6 +93,12 @@ def test_valuation_happy_path_is_auditable(client: TestClient):
     assert body["currency"] == "USD"
     assert body["monetary_unit"] == "raw_currency_units"
     assert body["fundamentals_as_of"] == "2025-09-27"
+    # Durable daily-refresh metadata is null when no snapshot store is
+    # configured; DB-backed route coverage verifies populated values.
+    assert body["freshness_status"] is None
+    assert body["next_refresh_window_at"] is None
+    assert body["last_refresh_attempt_at"] is None
+    assert body["last_refresh_success_at"] is None
     # price provenance now comes from the live Finnhub quote (ADR-008)
     assert datetime.fromisoformat(body["price_as_of"]).tzinfo is not None
     assert datetime.fromisoformat(body["price_fetched_at"]).tzinfo is not None

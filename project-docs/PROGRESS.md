@@ -1,10 +1,53 @@
 # Progress Log
 
-## 2026-07-18 — ADR-008 Slices 2+3+4 (live Finnhub price, structural change) + Phase 8 Slice C parts 1–2 (durable snapshots, DB read-through, daily-refresh scheduler)
+## 2026-07-18 — Migration 004 applied and safely live-verified
+
+- Owner applied `supabase/migrations/004_phase8_freshness.sql` in Supabase.
+- Verified the new `complete_financial_refresh_claim` RPC exists and is running
+  the deployed definition using a deliberately invalid `verification_only`
+  status. It returned HTTP 400 with the expected `invalid refresh claim
+  status` guard before any update statement, so no run, claim, or ticker-head
+  row was mutated.
+- The Part 3b database-before-code deployment gate is now clear. Remaining
+  Phase 8 live work is unchanged: Upstash env/live Redis checks, `CRON_SECRET`,
+  and FMP capacity confirmation.
+
+## 2026-07-18 — Phase 8 Slice C part 3b: structured statement freshness
+
+- Added structured `freshness_status`, `next_refresh_window_at`,
+  `last_refresh_attempt_at`, and `last_refresh_success_at` to valuation
+  responses. Durable-head metadata now survives DB → Redis → L1 hydration
+  but is excluded from immutable snapshot documents and `data_version`, so a
+  mutable run-state change cannot manufacture a new financial snapshot.
+- Added DST-safe next-window calculation. Pre-boundary heads derive
+  `daily_refresh_due`; durable `daily_refresh_running`,
+  `daily_refresh_failed`, and `daily_refresh_partial_failed` states remain
+  explicit. Provider-only/local mode returns null structured fields and keeps
+  its legacy TTL behavior.
+- Added `supabase/migrations/004_phase8_freshness.sql`: run start publishes
+  running/attempt state to every manifest head; the new SECURITY DEFINER
+  `complete_financial_refresh_claim` RPC atomically completes a claim and
+  publishes a failed head; finish reconciles pending/failed heads. This is an
+  additive migration because 003 is already applied in production.
+- Updated Supabase reads, the in-memory fake, API/customer documentation, and
+  the reviewed OpenAPI snapshot. Tests cover populated DB-backed API fields,
+  null provider-only fields, immutable-fingerprint stability, typed head
+  timestamps, due state, and failed-run publication.
+- Verification: **333 tests passing, 93.70% coverage**; Ruff lint + format,
+  mypy, and package build all clean.
+- **Deployment gate at implementation close:** migration 004 had to be applied
+  before deploying this working tree. It was applied and live-verified later
+  the same day (entry above). Live cron/Redis verification still needs TODO
+  §4.1/4.2/4.4.
+
+## 2026-07-18 — ADR-008 Slices 2+3+4 (live Finnhub price, structural change) + Phase 8 Slice C parts 1–3a (durable snapshots, DB read-through, daily-refresh scheduler, 6 PM boundary); deployed as `8e30cf4` + migration 003 applied
 
 > The session that implemented this timed out before it could write this entry;
 > backfilled at the start of the next session from `issues.MD`'s slice record
-> plus a fresh full verification of the working tree. All of it is uncommitted.
+> plus a fresh full verification of the working tree. It was uncommitted when
+> backfilled; later the same day the owner pushed everything through Slice C
+> part 2 as commit `8e30cf4` (see the "pushed to production" section below).
+> Only part 3a (the 6 PM boundary) remains uncommitted at entry close.
 
 The route rewrite, cache retirement, and docs landed as one unit (Slices 2–4 of
 the `issues.MD` Finnhub feature). Owner resolutions made before implementation:
@@ -54,7 +97,8 @@ supersession note, closing the three "cross-doc updates required" boxes in
 **Same session — Phase 8 Slice C part 1 implemented (durable snapshots + DB
 read-through; scheduler still to come):**
 
-- **`supabase/migrations/003_phase8_snapshots.sql` (new, NOT yet applied):**
+- **`supabase/migrations/003_phase8_snapshots.sql` (new; applied to the live
+  Supabase later this same day — see the incident section below):**
   immutable `normalized_snapshots` (content-addressed by `snapshot_version` =
   sha256 over the canonical price-free base payload — same recipe as the
   response `data_version`, so a re-confirmed identical filing dedups via ON
@@ -150,15 +194,54 @@ scheduler:**
 missing migration-003 table is a **storage error (503 on cold tickers), not a
 miss** — apply migration 003 (now final) before deploying, exactly like
 001/002, and set `CRON_SECRET` in Vercel Production before relying on the
-cron. Nothing is committed yet, so production is unaffected today.
+cron. *(Written before the push below — this exact failure then happened:
+the owner pushed before applying the migration, and keyed valuations 503'd
+until it was applied. Kept as the record of a correctly-predicted gate.)*
 
-**Next (Slice C part 3 / remaining):** the 6 PM Eastern L1 hard-expiry
-boundary (a warm instance must not serve pre-window L1 data as current after
-the window; due/running data must not be re-cached as current), structured
-freshness fields in the response (`freshness_status`,
-`next_refresh_window_at`, last attempt/success — today only
-`data_quality_warnings` carries freshness), then live verification — blocked
-on TODO §4 (env pull, `CRON_SECRET`, migration apply, FMP capacity gate).
+**Same day, later — pushed to production; migration incident; Slice C part 3a
+(the 6 PM boundary) implemented:**
+
+- **Owner committed and pushed everything as `8e30cf4`** — which deployed the
+  DB read-through *before* migration 003 was applied, so production keyed
+  valuations 503'd (the predicted deploy-ordering failure: missing table =
+  storage error, fail-closed; old Redis `fund:` entries were also invalidated
+  by the price-free payload shape). **Owner applied migration 003 during the
+  session; service restored.** Verified live: all four tables respond, both
+  RPC guards fire (`refresh date is required` / `ticker is required`),
+  production `/health` serves 0.2.0, and a **real end-to-end read-through**
+  ran against production infrastructure — cold AAPL bootstrap via real FMP
+  (fresh FY2025 filing, revenue $416.2B), durable head written
+  (`bootstrap_snapshot`), then a second service instance with a
+  **deliberately invalid FMP key** served AAPL entirely from Supabase.
+- **Slice C part 3a — the 6 PM Eastern hard-expiry boundary (uncommitted):**
+  new `app/refresh_window.py` (`EASTERN`, `eastern_now`,
+  `last_refresh_boundary` — wall-clock day arithmetic, DST-safe; own module
+  because `refresh.py` imports the service and the service needs these).
+  `FundamentalsService._is_current()` now requires cache entries to be both
+  within TTL **and** from after the most recent 6 PM Eastern boundary
+  (boundary rule active only when the durable store is configured; TTL-only
+  behavior when it isn't is regression-tested). Applied at all three
+  freshness sites (L1, L2, lock-loser poll). DB-hit rehydration now writes
+  Redis with `stored_at = verified_at` (the head's true age), so a
+  pre-boundary snapshot re-cached anywhere still reads pre-boundary on every
+  instance — "served with a warning, never re-cached as current". The
+  DB-serve freshness warning trigger moved from the 24h age bound to
+  "verified before the last boundary" (= refresh due/running/failed).
+- **Tests: 4 new** (boundary math in EDT/EST and across the 2026
+  spring-forward; a warm instance spanning 18:00 whose 1.5h-old L1 entry
+  stops serving, falls back to the DB with the pending-refresh warning, and
+  becomes current again after `refresh_from_provider` promotes; the honest
+  Redis `stored_at` across two instances; TTL-only behavior preserved with
+  no store). **Suite: 325 → 329 passing, 93.63% coverage**; ruff/format/mypy
+  clean.
+
+**Next at that point (completed later the same day in Part 3b above):**
+structured freshness fields in the response, then live wiring — TODO §4.2
+(`CRON_SECRET` in Vercel:
+**until it's set, the deployed cron 401s every evening and no refresh
+runs**), §4.1 (env pull for live Redis verification), §4.4 (FMP capacity
+gate). Note the boundary code is uncommitted: once deployed, post-6 PM
+responses will warn until the cron actually runs.
 
 ## 2026-07-17 — TODO answers processed; Finnhub Slice 1 implemented (client + normalization)
 
@@ -1107,16 +1190,18 @@ specs live in CLAUDE.md; this file is only the running state.
 
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **325 passing tests (93.58% coverage, 93% floor)**;
-  ruff/format/mypy clean (`app` + `scripts`). Supabase auth, quotas, and usage
+  verification, and **333 passing tests (93.70% coverage, 93% floor)**;
+  ruff/format/mypy/build clean. **ADR-008 and Slice C parts
+  1–2 are committed (`8e30cf4`), deployed, and live-verified; migration 003
+  is applied to the production Supabase.** Supabase auth, quotas, and usage
   metering are live-verified end to end. CSRF enforcement
   (`pt_csrf`/`X-CSRF-Token`) and peppered API-key hashing are implemented.
   **Phase 6** (GitHub OAuth + email magic-link sign-in, self-service key
   list/create/rotate/revoke/rename) is functionally complete and confirmed
   live, except explicitly deferred email-verification/CAPTCHA items.
   **Phase 9 public site is committed and live on `ashaat.dev`** (portfolio at
-  `/`, `/apis` directory, DCF at `/dcf`). **ADR-008 is implemented
-  (uncommitted, model 0.2.0):** the market price is fetched **live from
+  `/`, `/apis` directory, DCF at `/dcf`). **ADR-008 is implemented, deployed,
+  and live-verified (model 0.2.0):** the market price is fetched **live from
   Finnhub on every request and cached nowhere**; `/v1/valuations/*` is
   `Cache-Control: no-store`; `BaseFinancials`/`Valuation` are price-free by
   construction; upside is computed at the API layer from the live quote; any
@@ -1131,26 +1216,34 @@ specs live in CLAUDE.md; this file is only the running state.
   needed env vars (incl. `FINNHUB_API_KEY`) are in Vercel Production.
   `project-docs/REQUEST_FLOW.md` predates ADR-008 on the price/response-cache
   path — trust `issues.MD`/ADRs where they disagree.
-- **In progress:** **Phase 8 Slice C — parts 1 and 2 are implemented
-  (uncommitted):** migration 003 is complete (immutable
-  `normalized_snapshots`, mutable `ticker_snapshot_heads`, run/claim ledger,
-  `store_ticker_snapshot` + `begin/finish_financial_refresh_run` RPCs; NOT
-  yet applied — must be applied before this code deploys), the DB
-  read-through is live in code (L1 → Redis → DB → FMP cold-only; store errors
-  fail closed via `SnapshotStoreError`/503; bootstrap awaits the DB write
-  before Redis/return; existing DB tickers never trigger request-time FMP),
-  and the daily 6 PM Eastern refresh exists end to end
-  (`app/refresh.py` runner, `GET /internal/cron/refresh-financials` with
-  `CRON_SECRET`, `vercel.json` crons at 22+23 UTC with the
-  `America/New_York` guard, durable claims + reconciliation). **Part 3
-  remains:** the 6 PM L1 hard-expiry boundary, structured freshness response
-  fields (today freshness travels only in `data_quality_warnings`), and live
-  verification. Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
+- **In progress — Phase 8 Slice C.** State by part:
+  **Parts 1–2 (DB read-through + daily-refresh scheduler): committed in
+  `8e30cf4`, deployed, and running in production.** Migration 003 is
+  **applied** to the live Supabase (immutable `normalized_snapshots`, mutable
+  `ticker_snapshot_heads`, run/claim ledger, `store_ticker_snapshot` +
+  `begin/finish_financial_refresh_run` RPCs). The statement read order is
+  L1 → Redis → DB → FMP (cold bootstrap only); store errors fail closed via
+  `SnapshotStoreError`/503; a bootstrap awaits the DB write before Redis/
+  return; existing DB tickers never trigger request-time FMP — live-verified
+  2026-07-18 (real AAPL bootstrap, then DB-only serve with an invalid FMP
+  key). The scheduler exists end to end (`app/refresh.py`,
+  `GET /internal/cron/refresh-financials`, `vercel.json` crons at 22+23 UTC,
+  `America/New_York` guard, durable claims + reconciliation) **but no run has
+  executed yet: `CRON_SECRET` is not set in Vercel, so the deployed cron
+  401s nightly** (TODO §4.2 — first owner action).
+  **Parts 3a–3b (6 PM Eastern hard-expiry boundary + structured freshness):
+  implemented and tested, UNCOMMITTED in the working tree**
+  (`app/refresh_window.py` + boundary-aware
+  `_is_current` + honest Redis stored-at; once deployed, post-6 PM responses
+  warn "scheduled refresh pending" until the cron actually runs — so set
+  `CRON_SECRET` before or with that push). Structured response fields and
+  migration 004's atomic claim/head status publication are complete locally;
+  migration 004 is now applied and live-verified. Still open: live cron/Redis
+  observation (TODO §4.1/4.2/4.4). Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
   response cache, or response-cache generation rotation; the daily cycle
-  refreshes statements/profile only. Live wiring blocked on TODO §4 (env
-  pull, `CRON_SECRET` in Vercel, migration apply, FMP capacity). Preview env
-  still has no Supabase vars (auth off in previews); custom SMTP still
-  recommended before real email-login volume.
+  refreshes statements/profile only. Preview env still has no Supabase vars
+  (auth off in previews); custom SMTP still recommended before real
+  email-login volume.
 - **Not started:** external object storage, advanced DCF drivers, and
   Phase 15 (on hold — separate frontend split, superseded in practice by
   Phase 9).
