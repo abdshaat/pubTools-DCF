@@ -190,19 +190,20 @@ def _select_latest_complete_statements(f: FMPFundamentals) -> _SelectedStatement
     return selected
 
 
-def normalize_fmp_quote(
+def normalize_finnhub_quote(
     ticker: str, quote: dict[str, Any], fetched_at: datetime
 ) -> NormalizedQuote:
+    """Finnhub /quote: `c` is the current price, `t` unix seconds (0 = absent)."""
     try:
-        price = float(quote["price"])
+        price = float(quote["c"])
     except (KeyError, TypeError, ValueError, OverflowError):
         raise NormalizationError(ticker, ["current_price"]) from None
     if not isfinite(price) or price <= 0:
         raise NormalizationError(ticker, ["current_price"])
 
     price_as_of = None
-    quote_timestamp = _pick(quote, "timestamp")
-    if quote_timestamp is not _MISSING:
+    quote_timestamp = quote.get("t")
+    if quote_timestamp is not None and quote_timestamp != 0:
         try:
             price_as_of = datetime.fromtimestamp(float(quote_timestamp), tz=UTC)
         except (TypeError, ValueError, OverflowError, OSError):
@@ -226,7 +227,6 @@ def normalize_fmp_fundamentals(f: FMPFundamentals) -> BaseFinancials:
         "change_in_working_capital": _pick(selected.cash_flow, "changeInWorkingCapital"),
         "total_debt": _pick(selected.balance, "totalDebt"),
         "cash": _pick(selected.balance, "cashAndCashEquivalents"),
-        "current_price": _pick(f.quote, "price"),
     }
 
     currency = _pick(f.profile, "currency")
@@ -257,8 +257,6 @@ def normalize_fmp_fundamentals(f: FMPFundamentals) -> BaseFinancials:
         invalid.append("revenue")
     if converted["diluted_shares"] <= 0:
         invalid.append("diluted_shares")
-    if converted["current_price"] <= 0:
-        invalid.append("current_price")
     if converted["da"] < 0:
         invalid.append("da")
     net_debt = converted["total_debt"] - converted["cash"]
@@ -268,8 +266,6 @@ def normalize_fmp_fundamentals(f: FMPFundamentals) -> BaseFinancials:
         raise NormalizationError(f.ticker, sorted(invalid))
 
     source_period = f"{selected.period}{selected.fiscal_year} ({selected.statement_date})"
-
-    quote = normalize_fmp_quote(f.ticker, f.quote, f.fetched_at)
 
     return BaseFinancials(
         ticker=f.ticker,
@@ -281,11 +277,8 @@ def normalize_fmp_fundamentals(f: FMPFundamentals) -> BaseFinancials:
         delta_nwc=-converted["change_in_working_capital"],
         net_debt=net_debt,
         diluted_shares=converted["diluted_shares"],
-        current_price=quote.price,
         currency=str(currency).upper(),
         fundamentals_as_of=selected.statement_date,
-        price_as_of=quote.price_as_of,
-        price_fetched_at=quote.fetched_at,
         fiscal_year=selected.fiscal_year,
         statement_period=selected.period,
         filing_date=selected.filing_date,

@@ -7,6 +7,7 @@ The API layer maps these to HTTP responses:
   NormalizationError     -> 502 (provider data unusable, not the caller's fault)
   ProviderAuthError      -> 500 (server misconfiguration)
   ProviderError          -> 503
+  SnapshotStoreError     -> 503 (durable statement store unavailable)
 """
 
 
@@ -52,6 +53,17 @@ class UnsupportedSectorError(Exception):
             f"{ticker} is in sector '{sector}'; standard FCF DCF does not apply "
             "to financial companies (v1 supports non-financial US large caps only)"
         )
+
+
+class SnapshotStoreError(Exception):
+    """The durable statement store (Supabase snapshots) failed. A store error
+    is NOT a confirmed miss (ADR-006): customer traffic must never fall
+    through to the provider on one, or an outage would break the once-daily
+    provider guarantee and could spike FMP usage."""
+
+    def __init__(self, ticker: str):
+        self.ticker = ticker
+        super().__init__(f"durable statement store unavailable for {ticker}")
 
 
 class NormalizationError(Exception):

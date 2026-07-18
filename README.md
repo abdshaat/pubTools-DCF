@@ -38,7 +38,7 @@ GET /v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30
 - Every projected year includes the complete FCF bridge (growth, margin, taxes,
   NOPAT, D&A, capex, NWC, discount period/factor, FCF, and PV). Responses also
   include request/computation IDs, currency/units, provider and data versions,
-  statement/quote dates, model version, warnings, and a disclaimer.
+  statement and live-price dates, model version, warnings, and a disclaimer.
 
 **v1 scope:** non-financial US large caps. Banks and insurers are rejected
 with a 422 (standard FCF DCF doesn't apply). Tickers that don't exist or fall
@@ -49,18 +49,21 @@ math (e.g. `terminal_growth >= wacc`) return 422 with per-field messages.
 
 Valuation requests are capped at **100 per API key per UTC day** by default.
 Calls made through the website use the same `/v1/valuations/{ticker}` endpoint
-and count toward the same key quota. Exhausted callers receive `429` with
-`X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset`, and
-`Retry-After`. Successful valuation responses deliberately omit per-caller
-quota headers because they are HTTP-cacheable and may be served from a shared
-cache.
+and count toward the same key quota. Every valuation response carries
+`X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `X-RateLimit-Reset`; a `429`
+adds `Retry-After`. The quota is consumed atomically before any fetch/compute,
+so an over-limit request never reaches a data provider.
 
-Valuation responses include an `ETag`. Revalidating with `If-None-Match` can
-return `304 Not Modified`, and a 304 does **not** count against the daily
-quota. If the request reaches the origin server, the app may still rebuild the
-valuation to decide whether the ETag matches; it is quota-free, not guaranteed
-provider/compute-free. A CDN/shared cache can avoid that origin work when it
-answers the conditional request itself.
+### Live market price (ADR-008)
+
+`current_price` is fetched **live from Finnhub on every request** and is never
+cached anywhere. Valuation responses are `Cache-Control: no-store`, and
+conditional requests (`ETag`/`If-None-Match`) are not supported — every request
+is a fresh, fully metered `200` priced at that moment. If the live price is
+unavailable (outage, or a symbol Finnhub doesn't recognize), the valuation is
+still returned with `current_price`/`upside_pct` as `null` plus a warning; the
+DCF math never depends on the market price. Configure with `FINNHUB_API_KEY`
+(absent → the price feature is off and responses carry a config warning).
 
 Production deployments should set `SUPABASE_URL` and
 `SUPABASE_SERVICE_ROLE_KEY`. When both are present, `/v1/valuations/{ticker}`
@@ -84,12 +87,13 @@ complete set; it produces a data-quality warning instead. If no compatible set
 exists, the API fails with a controlled normalization error rather than valuing
 inconsistent data.
 
-Statements/profile data use a long cache lifetime, while quotes use a separate
-60-second default TTL. A failed quote refresh may use a cached quote for at most
-15 minutes and reports that fallback in `warnings`; older prices fail rather than
-silently appearing current. `fundamentals_as_of`, `fiscal_year`,
-`statement_period`, filing metadata, `price_as_of`, and `price_fetched_at` make
-the selected data auditable.
+Statements/profile data use a long cache lifetime (in-process L1 plus Redis L2
+when configured) — this is the only caching on the valuation path, so several
+differently-assumed valuations of one ticker reuse a single statement fetch.
+The market price is never part of that cache; it comes live from Finnhub per
+request. `fundamentals_as_of`, `fiscal_year`, `statement_period`, filing
+metadata, `price_as_of`, and `price_fetched_at` make the selected data
+auditable.
 
 ## Architecture
 
@@ -102,7 +106,7 @@ the selected data auditable.
 | Normalization — provider payloads → canonical `BaseFinancials` | `app/normalization.py` | ✅ done |
 | Fundamentals service — fetch + normalize + L1/L2 TTL cache | `app/fundamentals.py`, `app/redis_cache.py` | ✅ done |
 | API layer — FastAPI routes, validation, error mapping | `app/api.py`, `app/schemas.py` | ✅ done |
-| Customer website — landing page, API reference, and live valuation UI | `docs/index.html` served at `/` | ✅ done |
+| Customer website — DCF docs and live valuation UI at `/dcf`; portfolio at `/`, API directory at `/apis` | `docs/index.html`, `docs/portfolio.html`, `docs/apis.html` | ✅ done |
 | Supabase auth/quota/metering | `app/supabase.py`, `supabase/migrations/` | code ready; DB setup required |
 
 The engine is a pure function — `compute_dcf(base_financials, assumptions) ->
@@ -191,7 +195,7 @@ UPSTASH_REDIS_REST_TOKEN=your-upstash-rest-token
 
 Legacy Marketplace integrations may instead provide `KV_REST_API_URL` and
 `KV_REST_API_TOKEN`; the app accepts either pair. When configured, Redis shares
-fundamentals, profiles, quotes, negative results, and single-flight coordination
+fundamentals, profiles, negative results, and single-flight coordination
 across Vercel instances. When it is absent or unavailable, the API falls back to
 the provider and its existing in-process cache. Redis is never used as the
 billing, quota, identity, or API-key system of record.

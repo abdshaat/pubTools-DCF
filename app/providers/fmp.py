@@ -1,10 +1,12 @@
 """Financial Modeling Prep client (ingestion layer).
 
 Fetches the raw statements needed for one ticker's DCF: income statement,
-balance sheet, cash flow statement, company profile (sector gate), and
-quote (current price). Handles retries with exponential backoff on 429/5xx
-and honors Retry-After. Raw JSON can be persisted via a `raw_sink` hook so
-normalization bugs can be replayed against the original payloads.
+balance sheet, cash flow statement, and company profile (sector gate).
+The market price is NOT fetched here — it comes live from Finnhub per
+request (ADR-008) and is never cached. Handles retries with exponential
+backoff on 429/5xx and honors Retry-After. Raw JSON can be persisted via a
+`raw_sink` hook so normalization bugs can be replayed against the original
+payloads.
 
 This module does NO interpretation of the numbers — that belongs to
 app.normalization. It only moves bytes and classifies transport errors.
@@ -47,7 +49,6 @@ _STATEMENT_ENDPOINTS = [
     ("balance-sheet-statement", True),
     ("cash-flow-statement", True),
     ("profile", False),
-    ("quote", False),
 ]
 
 RawSink = Callable[[str, str, Any], None]
@@ -62,7 +63,6 @@ class FMPFundamentals:
     balance: tuple[dict[str, Any], ...]
     cash_flow: tuple[dict[str, Any], ...]
     profile: dict[str, Any]
-    quote: dict[str, Any]
     fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
 
@@ -204,16 +204,12 @@ class FMPClient:
         ticker: str,
         *,
         profile_override: dict[str, Any] | None = None,
-        quote_override: dict[str, Any] | None = None,
-        quote_fetched_at: datetime | None = None,
     ) -> FMPFundamentals:
-        """Fetch candidate statements plus current profile/quote for `ticker`."""
+        """Fetch candidate statements plus current profile for `ticker`."""
         ticker = ticker.upper()
         results: dict[str, Any] = {}
         if profile_override is not None:
             results["profile"] = profile_override
-        if quote_override is not None:
-            results["quote"] = quote_override
 
         async def fetch_endpoint(endpoint: str, needs_limit: bool) -> tuple[str, bool, Any]:
             params = {"limit": STATEMENT_FETCH_LIMIT} if needs_limit else {}
@@ -253,8 +249,7 @@ class FMPClient:
             balance=results["balance-sheet-statement"],
             cash_flow=results["cash-flow-statement"],
             profile=results["profile"],
-            quote=results["quote"],
-            fetched_at=quote_fetched_at or datetime.now(UTC),
+            fetched_at=datetime.now(UTC),
         )
 
     async def fetch_profile(self, ticker: str) -> dict[str, Any]:
@@ -268,15 +263,3 @@ class FMPClient:
         if not isinstance(payload, dict):
             raise ProviderError(f"FMP returned malformed profile payload for {ticker}")
         return payload
-
-    async def fetch_quote(self, ticker: str) -> tuple[dict[str, Any], datetime]:
-        """Fetch one current quote independently of slow-moving statements."""
-        ticker = ticker.upper()
-        payload = await self._get_json("quote", ticker, {})
-        if isinstance(payload, list):
-            if not payload:
-                raise TickerNotFoundError(ticker)
-            payload = payload[0]
-        if not isinstance(payload, dict):
-            raise ProviderError(f"FMP returned malformed quote payload for {ticker}")
-        return payload, datetime.now(UTC)

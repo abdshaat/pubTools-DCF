@@ -138,13 +138,21 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
   verified Supabase snapshot → provider; provider success writes the immutable
   snapshot/current ticker head before publishing cache and returning. See
   ADR-006 and Phase 8 for freshness and database-failure behavior.
+  **Part 1 implemented 2026-07-18** (migration 003 drafted + read-through +
+  snapshot writes + fail-closed 503 + 20 tests; details in PROGRESS.md);
+  the daily-refresh scheduler below is what keeps this box open. ⚠️ Apply
+  migration 003 before deploying this code — with Supabase configured, a
+  missing table is a storage error (503 on cold tickers), not a miss.
 - [ ] **Daily all-database-ticker refresh scheduler.** ADR-007 requires one
-  complete statements/profile/quote FMP cycle for every ticker in
-  `ticker_snapshot_heads` during each day's 6 PM Eastern window. Configure the
-  CRON_SECRET-protected endpoint at both `0 22 * * *` and `0 23 * * *`, then
-  use an `America/New_York` hour guard plus a durable Eastern-date run claim.
-  The run snapshots all database tickers into per-ticker claims; no activity
-  filter, budget skip, or silent deferral is allowed. Implement with Slice C.
+  complete statements/profile FMP cycle (no quote — ADR-008) for every ticker
+  in `ticker_snapshot_heads` during each day's 6 PM Eastern window.
+  **Code implemented 2026-07-18** (`app/refresh.py`, the CRON_SECRET-protected
+  endpoint, `vercel.json` at `0 22 * * *` + `0 23 * * *`, the
+  `America/New_York` hour guard, durable Eastern-date run claim, full
+  per-ticker claim manifest with no filter/skip/deferral — details in
+  PROGRESS.md). Box stays open until it runs live: needs migration 003
+  applied, `CRON_SECRET` in Vercel Production (TODO §4.2), the capacity gate
+  below, and a deployed observation of one real run.
 - [ ] **Daily refresh capacity gate.** Before deployment, prove the FMP plan and
   runtime can process the entire ticker manifest (including multiple endpoints
   and bounded retries). Insufficient capacity must fail visibly and trigger an
@@ -289,83 +297,100 @@ statements path without changing the price path.
 
 ### Cross-doc updates required
 
-- [ ] ADR-007 + Phase 8 Slice C: the daily FMP refresh no longer fetches/stores
+- [x] ADR-007 + Phase 8 Slice C: the daily FMP refresh no longer fetches/stores
   a quote; remove the `dcf:v1:quote:` key from the Phase 8 namespace; Slice C
-  must not re-introduce a cached quote. (Note added in `IMPLEMENTATION_PLAN.md`
-  Phase 8 as part of this feature.)
-- [ ] Phase 7 notes / `docs/index.html` "Caching" section: valuation responses
+  must not re-introduce a cached quote. Done 2026-07-18: the Phase 8
+  supersession note landed 2026-07-16; the remaining stale details inside
+  Phase 8 (`quote:`/`resp:` rows in the key table, `last_quote`/
+  `quote_verified_at` on the migration-003 head spec, quote references in the
+  single-flight/promotion/exit-criteria text) were scrubbed so Slice C is
+  implemented from a spec that cannot reintroduce a stored price.
+- [x] Phase 7 notes / `docs/index.html` "Caching" section: valuation responses
   are `no-store`; only the internal compute cache is shared; the price is live.
-- [ ] README + `docs/index.html`: document Finnhub as the price source, the
+  Done 2026-07-18: supersession note added at the top of Phase 7 in
+  `IMPLEMENTATION_PLAN.md`; `docs/index.html`'s section was rewritten as
+  "Live price & caching" with the Slice 2–4 work.
+- [x] README + `docs/index.html`: document Finnhub as the price source, the
   `FINNHUB_API_KEY` setup, real-time price / never-cached behavior, and the
-  Finnhub-outage null-price degrade.
+  Finnhub-outage null-price degrade. Done 2026-07-18 with the Slice 2–4 work.
 
 ### Implementation plan (sliced)
 
 **Slice 1 — Finnhub client + normalization (no route wiring).**
-- [ ] `app/providers/finnhub.py`: `FinnhubConfig.from_env()` (`FINNHUB_API_KEY`);
+- [x] `app/providers/finnhub.py`: `FinnhubConfig.from_env()` (`FINNHUB_API_KEY`);
   `FinnhubClient` over the existing `httpx` dependency (no new runtime dep, same
   pattern as `app/providers/fmp.py`/`app/supabase.py`). `fetch_quote(ticker) ->
   (raw: dict, fetched_at: datetime)` hitting `GET /api/v1/quote?symbol=&token=`.
   Timeout well under the Vercel function budget; classify transport/timeout/
   malformed-JSON/non-200 into `ProviderError`; empty/`c==0` payload (Finnhub's
-  "unknown symbol" shape) into `TickerNotFoundError`.
-- [ ] `normalize_finnhub_quote(ticker, raw, fetched_at) -> NormalizedQuote`:
+  "unknown symbol" shape) into `TickerNotFoundError`. Completed 2026-07-17 —
+  3s default timeout, no retries (a quote is latency-sensitive; the caller
+  degrades to a null price instead), 401/403 → `ProviderAuthError`, and
+  transport exceptions are chained rather than interpolated so the token can
+  never leak into an error message (deliberate deviation from the FMP client).
+- [x] `normalize_finnhub_quote(ticker, raw, fetched_at) -> NormalizedQuote`:
   map `c`→price, `t` (unix seconds)→`price_as_of` (UTC); reject non-finite/≤0
-  price via `NormalizationError`, mirroring `normalize_fmp_quote`.
-- [ ] Unit tests with a fake `httpx` transport: happy path, unknown symbol,
+  price via `NormalizationError`, mirroring `normalize_fmp_quote`. Completed
+  2026-07-17 — `t == 0` (Finnhub's "no timestamp") maps to `price_as_of=None`.
+- [x] Unit tests with a fake `httpx` transport: happy path, unknown symbol,
   timeout/5xx→ProviderError, malformed JSON, non-finite/zero price, `t` mapping,
   and `from_env` on/off (absent key → client not constructed / feature off).
+  Completed 2026-07-17 — 25 tests in `tests/test_finnhub.py` (house style:
+  sync tests + `asyncio.run`), including a token-never-in-error-text assertion.
+  Suite 298 → 323, 94.25% coverage, ruff/format/mypy clean.
+- [x] **Live verification against the real Finnhub API** (2026-07-17, key in
+  `.env` + Vercel Preview/Production): real AAPL ($333.74) and MSFT ($393.82)
+  quotes fetched and normalized with `price_as_of` = that Friday's 4 PM ET
+  close (correct after-hours behavior); an unknown symbol's all-zero body was
+  classified `TickerNotFoundError`. `tests/conftest.py`'s isolation fixture now
+  clears `FINNHUB_API_KEY` so the ambient real key can never flip Slice 2's
+  auto-enable on inside tests (the 2026-07-11 Supabase-creds incident class).
 
-**Slice 2 — Decouple price from the math; recompute per request with a live price.**
-- [ ] Engine/model split: `compute_dcf` returns the price-independent `Valuation`
-  (no `current_price`/`upside_pct` requirement — drop the `current_price > 0`
-  precondition from the math path). Add a small pure helper
-  `apply_market_price(valuation, price, price_as_of, price_fetched_at) ->
-  Valuation` (or compute upside in the API layer) that fills
-  `current_price`/`upside_pct`. Keep the engine I/O-free.
-- [ ] `ValuationResponse`/`Valuation`: make `current_price` and `upside_pct`
-  `Optional` (null only on Finnhub outage); `price_as_of` is already optional.
-- [ ] Route (`get_valuation`): every request fetches statements via the
-  fundamentals cache (unchanged), fetches the live Finnhub price via the
-  lifespan-scoped client, computes the DCF fresh, applies the live price +
-  `upside_pct`, and returns. Set `Cache-Control: no-store` for
-  `/v1/valuations/*`. On Finnhub failure, inject nulls + a data-quality warning.
-- [ ] Wire `app.state.finnhub` in `create_app` lifespan (auto-enable on
-  `FINNHUB_API_KEY`; absent → price feature off, warning surfaced).
-- [ ] Tests: two rapid same-ticker requests with **different assumptions** make
-  exactly one FMP statement fetch but two Finnhub price fetches (assert call
-  counts); each response carries a live `price_fetched_at` and `no-store`;
-  Finnhub-down → null price + warning with the math still present;
-  metering/quota behavior unchanged.
+**Slices 2+3+4 — implemented together 2026-07-18** (one structural change; the
+route rewrite, cache retirement, and docs land as a unit). Resolutions the
+owner made before implementation: (a) **quota flow simplified** — one atomic
+`check_and_increment` pre-flight replaces the peek/deferred-consume split
+(which existed only so 304s could be free) and `X-RateLimit-*` headers return
+on all valuation responses (safe again under `no-store`); (b) a **Finnhub
+unknown-symbol for an FMP-served ticker degrades like an outage** (null price +
+warning, never a 404/502); (c) **`model_version` bumped 0.1.0 → 0.2.0** for the
+nullable-price schema change (OpenAPI snapshot regenerated).
 
-**Slice 3 — Retire the response cache and the dead FMP quote path.**
-- [ ] Remove `app/response_cache.py`, its route integration in
-  `app/api.py::get_valuation` (`get_cached_response`/`store_response`), and
-  `tests/test_response_cache.py`'s response-cache tests (keep the login-limiter
-  tests, which live in the same file — split them out).
-- [ ] Remove the Phase 7 ETag/conditional-304 branch from `get_valuation` and the
-  `VALUATION_CACHE_CONTROL`/`VALUATION_VARY` public-cache headers for this
-  endpoint (replaced by `no-store`). Keep `app/http_cache.py` only if used
-  elsewhere — verify with a grep; otherwise remove it and its tests.
-- [ ] Remove `FundamentalsService._get_quote`, `_quote_cache`, the Redis `quote:`
-  read/write, and `quote_override`/`quote_fetched_at` plumbing through
-  `FMPClient.fetch_fundamentals`/`normalize_fmp_fundamentals`. Drop
-  `current_price`/`price_as_of`/`price_fetched_at` from the cached
-  `BaseFinancials` snapshot so no price is ever cached.
-- [ ] Remove `FMPClient.fetch_quote` and its tests (verify with a grep it is
-  unused elsewhere first).
-- [ ] Update `IMPLEMENTATION_PLAN.md` Phase 8 namespace + Slice C to drop the
-  `quote:` and `resp:` keys and the daily quote fetch.
-- [ ] Full suite green; ruff/mypy clean; coverage floor held.
-
-**Slice 4 — Docs, config, live verification.**
-- [ ] README + `docs/index.html`: Finnhub price source, `FINNHUB_API_KEY` setup,
-  real-time/never-cached price, `no-store` valuations, outage degrade.
-- [ ] Add `FINNHUB_API_KEY` to Vercel Production + Preview.
-- [ ] Live-verify against a real server (not just TestClient): consecutive calls
-  return live prices with advancing `price_fetched_at`; header is `no-store`;
-  killing the Finnhub key reproduces the null-price + warning degrade; the DCF
-  math is unchanged across the price refresh.
+- [x] Engine/model split: `BaseFinancials` and `Valuation` carry **no price
+  fields at all** (stronger than Optional — a cached snapshot cannot represent
+  a price by construction); `compute_dcf` drops the `current_price > 0`
+  precondition and its internal upside math; upside is computed in
+  `build_valuation_response(quote=...)` from the live quote.
+- [x] Route: statements via the fundamentals cache → live Finnhub fetch →
+  fresh `compute_dcf` → `Cache-Control: no-store`. Any `ProviderError`/
+  `NormalizationError` from Finnhub (outage, rate limit, unknown symbol,
+  auth misconfig) degrades to null price + warning.
+- [x] `app.state.finnhub` wired in the lifespan (auto-enable on
+  `FINNHUB_API_KEY`, injectable `finnhub_client=` for tests, closed on
+  shutdown); absent → "not configured" warning.
+- [x] Removed: `app/response_cache.py`, `app/http_cache.py` (only the
+  valuation route used it), the ETag/304 branch, `Vary`, the peek phase,
+  `is_not_modified`, `FundamentalsService._get_quote`/`_quote_cache`/Redis
+  `quote:`/stale-quote logic/`quote_ttl_seconds`, the FMP `quote` endpoint
+  from `fetch_fundamentals` (cold load is now 4 FMP calls, not 5),
+  `FMPClient.fetch_quote`, and `normalize_fmp_quote`.
+- [x] Tests: login-limiter tests split into `tests/test_login_rate_limit.py`;
+  new ADR-008 route tests (1 FMP statement load vs 3 Finnhub calls across 3
+  same-ticker requests, live-price/upside assertions, no-store + no-ETag,
+  outage/unknown-symbol/feature-off degrades, conditional headers ignored and
+  metered, atomic-consume ordering, quota headers counting down). Suite:
+  **291 passing, 94.08% coverage**; ruff/format/mypy clean.
+- [x] Docs: README rate-limit/live-price/statement-freshness sections and
+  `docs/index.html` "Live price & caching" section rewritten; example response
+  and version strings updated to 0.2.0; `base_financials` example is
+  price-free.
+- [x] Live-verified against real uvicorn with real FMP+Finnhub keys:
+  AAPL 200 with live price $333.74, `upside_pct` −76.07, `model 0.2.0`,
+  `no-store`, no ETag/Vary, `X-RateLimit-Remaining: 99`, price-free
+  `base_financials`; second call refreshed `price_fetched_at`; with
+  `FINNHUB_API_KEY` blanked the same request returned identical math with
+  null price/upside + the config warning.
+- [x] `FINNHUB_API_KEY` present in Vercel Preview+Production (owner, 2026-07-17).
 
 ### Open sub-decisions (defaults chosen; change here if desired)
 

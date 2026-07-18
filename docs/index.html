@@ -471,7 +471,7 @@
 <nav aria-label="Documentation">
   <div class="brand">
     <div class="name">DCF Valuation API</div>
-    <div class="ver">v1 · model 0.1.0</div>
+    <div class="ver">v1 · model 0.2.0</div>
   </div>
   <div class="group">Understand DCF</div>
   <a href="#overview">Overview</a>
@@ -741,34 +741,24 @@ FMP_API_KEY=your-key-here</code></pre>
   enforced for valuation requests. Public landing, health, and OpenAPI endpoints remain public.</div>
   <div class="note tip"><strong>Rate limit:</strong> valuation requests are capped at 100 per API key
   per UTC day by default. Calls made from this website use the same API endpoint and count toward the same key limit.
-  A <code>429</code> response carries <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>,
-  <code>X-RateLimit-Reset</code>, and <code>Retry-After</code>. Successful (<code>200</code>) valuation responses
-  deliberately omit these headers — see caching below.</div>
+  Every valuation response carries <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and
+  <code>X-RateLimit-Reset</code>; a <code>429</code> adds <code>Retry-After</code>.</div>
 
-  <h3 id="caching">Caching</h3>
-  <p>Valuation responses are safely HTTP-cacheable. Each carries a strong
-  <code>ETag</code> and <code>Cache-Control: public</code>, so you (and any shared CDN in front of the API)
-  can reuse a result and revalidate cheaply with a conditional request:</p>
-  <pre><code>curl -H <span class="s">"X-API-Key: YOUR_KEY"</span> -H <span class="s">'If-None-Match: "&lt;etag&gt;"'</span> <span class="s">"https://ashaat.dev/v1/valuations/AAPL?..."</span></code></pre>
-  <p>If the valuation is unchanged you get a <code>304 Not Modified</code> with no body. <strong>A 304 is
-  free</strong> — it does not count against your daily quota. The <code>ETag</code> changes automatically whenever
-  anything you can observe changes (the price, the underlying financials, or the model version), so a matching
-  ETag always means an identical result.</p>
-  <p class="hint">Quota-free is not the same as guaranteed provider/compute-free: if a conditional request reaches
-  the origin server, the API may still rebuild the valuation to decide whether the <code>ETag</code> matches. A CDN
-  or shared cache can avoid that origin work when it answers the conditional request itself.</p>
-  <div class="note"><strong>Two consequences worth knowing:</strong>
-  <ul style="margin: 8px 0 0; padding-left: 20px;">
-    <li>Because the cache is <em>public/shared</em>, a valuation already cached at a CDN edge can be served to
-    anyone requesting that exact URL — a cache hit never reaches the API's authentication layer. Valuations are a
-    deterministic function of public financial data and your assumptions, not confidential per-customer data, so this
-    is by design; but do not treat a valuation URL as a secret.</li>
-    <li>Per-caller quota headers (<code>X-RateLimit-*</code>) are therefore <em>not</em> included on
-    <code>200</code>/<code>304</code> valuation responses — a shared cache must never serve one customer's quota
-    state to another. Your authoritative quota status comes only from requests that reach the origin.</li>
-  </ul></div>
-  <p>The <a href="#builder">endpoint builder</a> below emits parameters in canonical order with resolved defaults, which
-  gives repeated and shared requests the best cache reuse.</p>
+  <h3 id="caching">Live price &amp; caching</h3>
+  <p>Every valuation carries a <strong>live market price</strong>: <code>current_price</code> is fetched from
+  Finnhub on every request and is never cached anywhere — not by the API, not by a CDN, not by your browser.
+  Responses are therefore <code>Cache-Control: no-store</code>, and conditional requests
+  (<code>ETag</code>/<code>If-None-Match</code>) are not supported: every request returns a fresh
+  <code>200</code> priced at that moment, and every request counts against your daily quota.</p>
+  <p>What <em>is</em> cached — server-side, per ticker — are the slow-moving <strong>financial statements</strong>.
+  Running several valuations of the same ticker with different assumptions reuses one statement snapshot instead of
+  refetching it, so repeat requests stay fast; the DCF math itself is recomputed on every request from that
+  snapshot plus the live price. <code>fundamentals_as_of</code> tells you which filing the statements come from,
+  and <code>price_as_of</code>/<code>price_fetched_at</code> timestamp the quote.</p>
+  <div class="note"><strong>If the live price is unavailable</strong> (provider outage, or a symbol the quote
+  provider doesn't recognize), the API still returns the full valuation — <code>current_price</code> and
+  <code>upside_pct</code> come back <code>null</code> with a warning naming the cause. The intrinsic-value math
+  never depends on the market price.</div>
 </section>
 
 <section id="account">
@@ -968,8 +958,10 @@ FMP_API_KEY=your-key-here</code></pre>
       <tr><td><code>equity_value</code></td><td>Enterprise value minus net debt.</td></tr>
       <tr><td><code>intrinsic_value_per_share</code></td><td>Equity value divided by diluted
         shares.</td></tr>
-      <tr><td><code>current_price</code> / <code>upside_pct</code></td><td>Latest market price and
-        the implied difference between it and intrinsic value, in percent.</td></tr>
+      <tr><td><code>current_price</code> / <code>upside_pct</code></td><td>Live market price
+        (fetched from Finnhub on every request, never cached) and the implied difference between it
+        and intrinsic value, in percent. <code>null</code> when the live price is unavailable — the
+        rest of the valuation is still returned, with a warning.</td></tr>
       <tr><td><code>sensitivity</code></td><td>Per-share value across a 3×3 grid: rows are
         <code>wacc_values</code> (your WACC ±1%), columns are
         <code>terminal_growth_values</code> (±0.5%). The center cell equals
@@ -984,13 +976,13 @@ FMP_API_KEY=your-key-here</code></pre>
   <pre><code>{
   <span class="k">"request_id"</span>: <span class="s">"8bd53754-b11d-4d6f-9634-a47480f6b97d"</span>,
   <span class="k">"computed_at"</span>: <span class="s">"2026-07-11T18:30:00Z"</span>,
-  <span class="k">"model_version"</span>: <span class="s">"0.1.0"</span>,
+  <span class="k">"model_version"</span>: <span class="s">"0.2.0"</span>,
   <span class="k">"data_version"</span>: <span class="s">"sha256:…"</span>,
   <span class="k">"data_provider"</span>: <span class="s">"financialmodelingprep"</span>,
   <span class="k">"currency"</span>: <span class="s">"USD"</span>,
   <span class="k">"monetary_unit"</span>: <span class="s">"raw_currency_units"</span>,
   <span class="k">"fundamentals_as_of"</span>: <span class="s">"2025-09-27"</span>,
-  <span class="k">"price_as_of"</span>: <span class="n">null</span>,
+  <span class="k">"price_as_of"</span>: <span class="s">"2026-07-17T20:00:00Z"</span>,
   <span class="k">"price_fetched_at"</span>: <span class="s">"2026-07-11T18:29:59Z"</span>,
   <span class="k">"fiscal_year"</span>: <span class="s">"2025"</span>,
   <span class="k">"statement_period"</span>: <span class="s">"FY"</span>,
@@ -1007,8 +999,7 @@ FMP_API_KEY=your-key-here</code></pre>
     <span class="k">"capex"</span>: <span class="n">9447000000.0</span>,
     <span class="k">"delta_nwc"</span>: <span class="n">-3651000000.0</span>,
     <span class="k">"net_debt"</span>: <span class="n">76686000000.0</span>,
-    <span class="k">"diluted_shares"</span>: <span class="n">15408095000.0</span>,
-    <span class="k">"current_price"</span>: <span class="n">245.5</span>
+    <span class="k">"diluted_shares"</span>: <span class="n">15408095000.0</span>
   },
   <span class="k">"assumptions"</span>: {
     <span class="k">"wacc"</span>: <span class="n">0.09</span>,
@@ -1215,7 +1206,7 @@ FMP_API_KEY=your-key-here</code></pre>
 </section>
 
 <footer>
-  DCF Valuation API · v1 · model_version 0.1.0 · Figures in examples are computed by the
+  DCF Valuation API · v1 · model_version 0.2.0 · Figures in examples are computed by the
   current engine from the documented inputs.
 </footer>
 

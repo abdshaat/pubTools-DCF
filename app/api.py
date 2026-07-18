@@ -16,10 +16,10 @@ the format FastAPI uses for its own validation errors closely enough that
 callers handle one shape.
 """
 
+import hmac
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
 from inspect import isawaitable
 from pathlib import Path as FilePath
 from typing import Any
@@ -29,7 +29,6 @@ from fastapi import FastAPI, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
-from pydantic import ValidationError
 
 from . import MODEL_VERSION
 from .accounts import (
@@ -64,23 +63,19 @@ from .exceptions import (
     NormalizationError,
     ProviderAuthError,
     ProviderError,
+    SnapshotStoreError,
     TickerNotCoveredError,
     TickerNotFoundError,
     UnsupportedSectorError,
 )
 from .fundamentals import FundamentalsService
-from .http_cache import (
-    NO_STORE,
-    VALUATION_CACHE_CONTROL,
-    VALUATION_VARY,
-    compute_etag,
-    if_none_match_satisfied,
-)
 from .models import Assumptions
+from .normalization import NormalizedQuote, normalize_finnhub_quote
+from .providers.finnhub import FinnhubClient, FinnhubConfig
 from .providers.fmp import FileRawSink, FMPClient
 from .rate_limit import DailyRequestLimiter, RateLimitResult, RedisLoginRateLimiter
 from .redis_cache import RedisBackend, RedisConfig, UpstashRedisClient
-from .response_cache import assumption_fingerprint, get_cached_response, store_response
+from .refresh import DailyRefreshRunner
 from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
@@ -152,6 +147,11 @@ _SECURITY_HEADERS = {
 _DOCS_DIR = FilePath(__file__).parent.parent / "docs"
 _PICS_DIR = (_DOCS_DIR / "Pics").resolve()
 
+# Valuation responses are never HTTP-cacheable (ADR-008): every response
+# carries a live, per-request market price, so no shared/browser cache may
+# retain one. Errors and auth/rate-limit responses use the same directive.
+NO_STORE = "no-store"
+
 _LANDING_PAGE_CSP = "; ".join(
     [
         "default-src 'self'",
@@ -191,9 +191,6 @@ def _over_quota_response(request: Request, result: RateLimitResult) -> JSONRespo
                 "fields": [],
             },
         },
-        # Rate-limit headers stay ONLY on the 429 (never cached); they are
-        # deliberately absent from cacheable valuation responses so a shared
-        # cache can't leak one caller's quota state to another.
         headers=_rate_limit_headers(result),
     )
     response.headers["Cache-Control"] = NO_STORE
@@ -275,9 +272,9 @@ def _valuation_ticker_from_path(path: str) -> str | None:
 
 def create_app(
     fmp_client: FMPClient | None = None,
+    finnhub_client: FinnhubClient | None = None,
     ttl_seconds: float = 4 * 3600,
     profile_ttl_seconds: float = 24 * 3600,
-    quote_ttl_seconds: float = 60,
     daily_rate_limit: int = 100,
     rate_limiter: Any | None = None,
     authenticator: Any | None = None,
@@ -285,6 +282,8 @@ def create_app(
     supabase_client: SupabaseClient | None = None,
     auth_client: SupabaseAuthClient | None = None,
     redis_backend: RedisBackend | None = None,
+    snapshot_store: Any | None = None,
+    refresh_runner: Any | None = None,
 ) -> FastAPI:
     supabase_config = SupabaseConfig.from_env()
     configured_supabase_client = supabase_client or (
@@ -294,22 +293,46 @@ def create_app(
         SupabaseAuthClient(supabase_config) if supabase_config is not None else None
     )
     redis_config = RedisConfig.from_env()
+    # Server-only shared secret protecting the internal refresh endpoint.
+    # Read once at app construction, same as every other env-driven feature.
+    cron_secret = os.environ.get("CRON_SECRET")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_client = fmp_client is None
         client = fmp_client or FMPClient(raw_sink=_default_raw_sink())
+        # Live market price (ADR-008): auto-enables on FINNHUB_API_KEY, same
+        # pattern as Supabase/Redis. Absent -> price feature off; valuations
+        # return null current_price/upside_pct with a warning.
+        finnhub_config = FinnhubConfig.from_env()
+        owns_finnhub = finnhub_client is None and finnhub_config is not None
+        configured_finnhub = finnhub_client or (
+            FinnhubClient(api_key=finnhub_config.api_key) if finnhub_config is not None else None
+        )
+        app.state.finnhub = configured_finnhub
         owns_redis = redis_backend is None and redis_config is not None
         configured_redis = redis_backend or (
             UpstashRedisClient(redis_config) if redis_config is not None else None
         )
         app.state.redis = configured_redis
+        # Durable statement store (Phase 8 Slice C): rides the same Supabase
+        # project/client as auth. Requires migration 003 to be applied before
+        # a deploy with Supabase configured — a missing table is a storage
+        # error (503 for cold tickers), not a miss.
         app.state.fundamentals = FundamentalsService(
             client,
             ttl_seconds=ttl_seconds,
             profile_ttl_seconds=profile_ttl_seconds,
-            quote_ttl_seconds=quote_ttl_seconds,
             redis=configured_redis,
+            snapshots=snapshot_store or configured_supabase_client,
+        )
+        # Daily 6 PM Eastern refresh (ADR-007): needs both the statement
+        # store and the Supabase run/claim ledger, so it activates exactly
+        # when Supabase does.
+        app.state.refresh_runner = refresh_runner or (
+            DailyRefreshRunner(app.state.fundamentals, configured_supabase_client)
+            if configured_supabase_client is not None
+            else None
         )
         if configured_redis is not None:
             # Cross-instance login limiting (Phase 8 Slice B); falls back to
@@ -323,6 +346,8 @@ def create_app(
         finally:
             if owns_client:
                 await client.aclose()
+            if owns_finnhub and configured_finnhub is not None:
+                await configured_finnhub.aclose()
             if configured_supabase_client is not None and supabase_client is None:
                 await configured_supabase_client.aclose()
             if configured_auth_client is not None and auth_client is None:
@@ -358,18 +383,20 @@ def create_app(
     @app.middleware("http")
     async def _request_id(request: Request, call_next: Any) -> Response:
         request.state.request_id = str(uuid4())
-        # Set by the valuation route when a conditional request matched: a 304
-        # is "free" (no quota consumed, no usage event) per Phase 7.
-        request.state.is_not_modified = False
         principal = None
         identity = "anonymous"
         limit = daily_rate_limit
         valuation_ticker = _valuation_ticker_from_path(request.url.path)
         is_valuation = request.method == "GET" and request.url.path.startswith("/v1/valuations/")
 
-        # --- Phase A: authenticate + NON-consuming quota peek (pre-flight) ---
-        # Auth and the over-limit gate must run before any fetch/compute. The
-        # actual quota *consume* is deferred to Phase B so a 304 stays free.
+        # --- authenticate + atomically consume quota (pre-flight) ---
+        # One atomic check-and-increment before any fetch/compute. With the
+        # response cache and conditional 304s retired (ADR-008), nothing is
+        # "free" anymore, so the old peek-then-consume split (and its
+        # documented race) has no reason to exist. Every valuation request —
+        # success OR error (404/422/502) — consumes quota, preserving the
+        # deliberate "invalid requests count against the limit" behavior.
+        consumed: RateLimitResult | None = None
         if is_valuation:
             try:
                 principal = await _resolve(
@@ -403,13 +430,16 @@ def create_app(
                 else daily_rate_limit
             )
             try:
-                peek = await _resolve(
-                    request.app.state.rate_limiter.peek(identity=identity, limit=limit)
+                consumed = await _resolve(
+                    request.app.state.rate_limiter.check_and_increment(
+                        identity=identity, limit=limit
+                    )
                 )
             except SupabaseError:
+                # Fail closed: never serve a valuation we couldn't meter.
                 return _storage_error_response(request)
-            if not peek.allowed:
-                response = _over_quota_response(request, peek)
+            if not consumed.allowed:
+                response = _over_quota_response(request, consumed)
                 if request.app.state.usage_meter is not None:
                     with suppress(SupabaseError):
                         await request.app.state.usage_meter.record(
@@ -428,42 +458,13 @@ def create_app(
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers.update(_SECURITY_HEADERS)
 
-        # --- Phase B: consume quota + record usage (post-computation) ---
-        # A 304 is free. Every other valuation response (fresh 200 OR an error
-        # such as 404/422/502) consumes quota, preserving the deliberate
-        # "invalid requests count against the limit" behavior.
-        if is_valuation and not request.state.is_not_modified:
-            try:
-                consumed = await _resolve(
-                    request.app.state.rate_limiter.check_and_increment(
-                        identity=identity, limit=limit
-                    )
-                )
-            except SupabaseError:
-                # Fail closed: never serve a valuation we couldn't meter.
-                return _storage_error_response(request)
-            if not consumed.allowed:
-                # The Phase A peek passed (possibly stale under a concurrent
-                # burst), but the atomic consume itself refused: this caller
-                # is genuinely at/over the limit. Never serve the
-                # already-computed response in that case -- replace it with
-                # the same 429 the pre-flight gate would have returned.
-                response = _over_quota_response(request, consumed)
-                if request.app.state.usage_meter is not None:
-                    with suppress(SupabaseError):
-                        await request.app.state.usage_meter.record(
-                            request_id=request.state.request_id,
-                            principal=principal,
-                            method=request.method,
-                            path=request.url.path,
-                            status_code=429,
-                            ticker=valuation_ticker,
-                            quota_consumed=False,
-                            rate_limited=True,
-                        )
-                return response
+        if is_valuation and consumed is not None:
+            # Quota headers are safe again now that valuation responses are
+            # no-store (they were removed in Phase 7 only because a shared
+            # cache could have served one caller's quota state to another).
+            response.headers.update(_rate_limit_headers(consumed))
             # Error responses on the valuation path must never be cached.
-            if response.status_code not in (200, 304):
+            if response.status_code != 200:
                 response.headers["Cache-Control"] = NO_STORE
             if request.app.state.usage_meter is not None and valuation_ticker is not None:
                 with suppress(SupabaseError):
@@ -568,6 +569,14 @@ def create_app(
     async def _provider_error(request: Request, exc: ProviderError) -> JSONResponse:
         detail = "data provider is unavailable, try again shortly"
         return _error(request, 503, detail, "provider_unavailable", detail)
+
+    @app.exception_handler(SnapshotStoreError)
+    async def _snapshot_store_error(request: Request, exc: SnapshotStoreError) -> JSONResponse:
+        # A store error is not a miss (ADR-006): the request fails closed
+        # rather than falling through to FMP and breaking the once-daily
+        # provider guarantee.
+        detail = "statement storage is unavailable, try again shortly"
+        return _error(request, 503, detail, "snapshot_store_unavailable", detail)
 
     # --- routes ---
 
@@ -979,71 +988,98 @@ def create_app(
             projection_years=projection_years,
             revenue_growth=growth_values[0] if len(growth_values) == 1 else growth_values,
         )
-
-        # Distributed response cache (Phase 8 Slice B): a hit skips the
-        # provider fetch AND the DCF recompute. Fail-open — any Redis issue
-        # falls through to the normal compute path. Metering is unaffected
-        # (the middleware consumes quota for every non-304 regardless).
         symbol = ticker.upper()
-        fingerprint = assumption_fingerprint(assumptions, sensitivity=sensitivity)
-        payload: ValuationResponse | None = None
-        cached_content = await get_cached_response(
-            request.app.state.redis, ticker=symbol, fingerprint=fingerprint
-        )
-        if cached_content is not None:
+
+        # Statements come through the cache-aside fundamentals layer
+        # (L1 -> Redis -> [DB, Slice C] -> FMP); the DCF math is recomputed on
+        # every request — it is pure and cheap, and per the 2026-07-16 decision
+        # the request/response is never cached, only the statements are.
+        base = await request.app.state.fundamentals.get_base_financials(ticker)
+
+        # Live market price (ADR-008): fetched from Finnhub on every request,
+        # never cached. Any failure — outage, rate limit, or a symbol Finnhub
+        # doesn't recognize even though FMP serves it — degrades to a null
+        # price with a warning; the price-independent math is still returned.
+        quote: NormalizedQuote | None = None
+        price_warning: str | None = None
+        finnhub = request.app.state.finnhub
+        if finnhub is None:
+            price_warning = (
+                "Live market price is not configured; current_price and upside_pct are null."
+            )
+        else:
             try:
-                payload = ValuationResponse.model_validate(
-                    {
-                        **cached_content,
-                        "request_id": request.state.request_id,
-                        "computed_at": datetime.now(UTC),
-                    }
+                raw_quote, quote_fetched_at = await finnhub.fetch_quote(symbol)
+                quote = normalize_finnhub_quote(symbol, raw_quote, quote_fetched_at)
+            except (ProviderError, NormalizationError):
+                price_warning = (
+                    "Live market price is temporarily unavailable; "
+                    "current_price and upside_pct are null."
                 )
-            except ValidationError:
-                # Schema drift within a model version shouldn't happen, but a
-                # stale entry must degrade to a recompute, never a 500.
-                payload = None
 
-        if payload is None:
-            base = await request.app.state.fundamentals.get_base_financials(ticker)
-            valuation = compute_dcf(base, assumptions)
-            grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
-            payload = build_valuation_response(
-                base,
-                assumptions,
-                valuation,
-                grid,
-                request_id=request.state.request_id,
-            )
-            await store_response(
-                request.app.state.redis,
-                ticker=symbol,
-                fingerprint=fingerprint,
-                content=payload.model_dump(mode="json", exclude={"request_id", "computed_at"}),
-                stored_at=datetime.now(UTC).timestamp(),
-            )
+        valuation = compute_dcf(base, assumptions)
+        grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
+        payload = build_valuation_response(
+            base,
+            assumptions,
+            valuation,
+            grid,
+            request_id=request.state.request_id,
+            quote=quote,
+            price_warning=price_warning,
+        )
 
-        # HTTP caching (Phase 7): the ETag is derived from response *content*
-        # only (request_id/computed_at excluded), so equivalent requests share
-        # an ETag and any real change invalidates it automatically.
-        etag = compute_etag(payload)
-        if if_none_match_satisfied(request.headers.get("If-None-Match"), etag):
-            # Not modified: return a bodyless 304 and flag the middleware to
-            # skip quota consumption / usage metering for this "free" request.
-            request.state.is_not_modified = True
-            return Response(
-                status_code=304,
-                headers={
-                    "ETag": etag,
-                    "Cache-Control": VALUATION_CACHE_CONTROL,
-                    "Vary": VALUATION_VARY,
+        # Never HTTP-cacheable: the body carries a live per-request price.
+        response.headers["Cache-Control"] = NO_STORE
+        return payload
+
+    @app.get("/internal/cron/refresh-financials", include_in_schema=False)
+    async def refresh_financials(request: Request) -> JSONResponse:
+        # Vercel cron sends `Authorization: Bearer {CRON_SECRET}`. One
+        # generic 401 for every failure mode (unconfigured, missing header,
+        # mismatch) so probes learn nothing; comparison is constant-time.
+        presented = request.headers.get("authorization", "")
+        expected = f"Bearer {cron_secret}" if cron_secret else ""
+        if not cron_secret or not hmac.compare_digest(presented.encode(), expected.encode()):
+            response = JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "unauthorized",
+                    "error": {
+                        "version": "1",
+                        "code": "cron_unauthorized",
+                        "message": "This internal endpoint requires the cron secret.",
+                        "request_id": request.state.request_id,
+                    },
                 },
             )
+            response.headers["Cache-Control"] = NO_STORE
+            return response
 
-        response.headers["ETag"] = etag
-        response.headers["Cache-Control"] = VALUATION_CACHE_CONTROL
-        response.headers["Vary"] = VALUATION_VARY
-        return payload
+        runner = request.app.state.refresh_runner
+        if runner is None:
+            response = JSONResponse(
+                status_code=503,
+                content={
+                    "detail": "daily refresh is not configured",
+                    "error": {
+                        "version": "1",
+                        "code": "refresh_not_configured",
+                        "message": (
+                            "The daily refresh requires the Supabase snapshot store; "
+                            "it is not configured in this environment."
+                        ),
+                        "request_id": request.state.request_id,
+                    },
+                },
+            )
+            response.headers["Cache-Control"] = NO_STORE
+            return response
+
+        result = await runner.run_if_in_window()
+        response = JSONResponse(status_code=200, content=result)
+        response.headers["Cache-Control"] = NO_STORE
+        return response
 
     @app.get("/health", include_in_schema=False)
     async def health() -> dict[str, str]:

@@ -80,9 +80,9 @@ def test_matches_hand_computed_3_year_flat_growth(base_financials: BaseFinancial
     assert result.enterprise_value == pytest.approx(expected_ev)
     assert result.equity_value == pytest.approx(expected_equity)
     assert result.intrinsic_value_per_share == pytest.approx(expected_per_share)
-    assert result.upside_pct == pytest.approx(
-        (expected_per_share - base_financials.current_price) / base_financials.current_price * 100
-    )
+    # upside_pct is no longer an engine output (ADR-008): the market
+    # comparison is applied at the API layer from the live Finnhub quote.
+    assert not hasattr(result, "upside_pct")
 
 
 def test_matches_hand_computed_zero_growth_zero_terminal_growth(base_financials: BaseFinancials):
@@ -198,7 +198,6 @@ def test_assumption_bounds_rejected(base_financials: BaseFinancials, field: str,
         ("delta_nwc", float("-inf")),
         ("net_debt", float("nan")),
         ("diluted_shares", 0.0),
-        ("current_price", 0.0),
     ],
 )
 def test_invalid_base_financials_rejected(

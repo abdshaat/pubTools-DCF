@@ -7,7 +7,6 @@ shaping, error mapping) is exercised without network or API key.
 
 import hashlib
 import json
-from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from urllib.parse import parse_qs, urlparse
 from uuid import UUID
@@ -20,9 +19,8 @@ from app import MODEL_VERSION
 from app.accounts import CSRF_COOKIE, CSRF_HEADER, LOGIN_ATTEMPTS_DAILY_LIMIT
 from app.api import _default_raw_sink, create_app
 from app.auth import APIKeyAuthenticator, APIKeyRecord
-from app.http_cache import VALUATION_CACHE_CONTROL
+from app.exceptions import ProviderError, TickerNotFoundError
 from app.providers.fmp import FileRawSink, FMPClient
-from app.rate_limit import DailyRequestLimiter
 from app.supabase import (
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
@@ -35,6 +33,28 @@ from tests.test_data_layer import fixture_transport, load_fixture
 VALID_QUERY = (
     "wacc=0.09&terminal_growth=0.025&ebit_margin=0.30&revenue_growth=0.05&projection_years=5"
 )
+
+
+class FakeFinnhubClient:
+    """Injectable stand-in for FinnhubClient: counts calls, returns a fixed
+    quote, or raises a configured error to simulate outages/symbol gaps."""
+
+    def __init__(
+        self, price: float = 250.0, t: int = 1752696000, fail_with: Exception | None = None
+    ):
+        self.price = price
+        self.t = t
+        self.fail_with = fail_with
+        self.calls = 0
+
+    async def fetch_quote(self, ticker: str):
+        self.calls += 1
+        if self.fail_with is not None:
+            raise self.fail_with
+        return {"c": self.price, "t": self.t}, datetime.now(UTC)
+
+    async def aclose(self) -> None:  # pragma: no cover - interface parity
+        pass
 
 
 def test_default_raw_sink_is_disabled_on_vercel(monkeypatch):
@@ -50,7 +70,9 @@ def test_default_raw_sink_is_available_for_local_development(monkeypatch):
 @pytest.fixture
 def client() -> TestClient:
     fmp = FMPClient(api_key="test-key", transport=fixture_transport())
-    app = create_app(fmp_client=fmp)
+    # Price 245.5 matches the value the old FMP fixture quote used to carry,
+    # keeping the audited numbers in these tests stable across ADR-008.
+    app = create_app(fmp_client=fmp, finnhub_client=FakeFinnhubClient(price=245.5))
     with TestClient(app) as test_client:
         yield test_client
 
@@ -71,7 +93,8 @@ def test_valuation_happy_path_is_auditable(client: TestClient):
     assert body["currency"] == "USD"
     assert body["monetary_unit"] == "raw_currency_units"
     assert body["fundamentals_as_of"] == "2025-09-27"
-    assert body["price_as_of"] is None
+    # price provenance now comes from the live Finnhub quote (ADR-008)
+    assert datetime.fromisoformat(body["price_as_of"]).tzinfo is not None
     assert datetime.fromisoformat(body["price_fetched_at"]).tzinfo is not None
     assert body["fiscal_year"] == "2025"
     assert body["statement_period"] == "FY"
@@ -380,7 +403,7 @@ def test_second_request_served_from_cache():
         second = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert first.status_code == second.status_code == 200
-    assert len(call_log) == 5  # one fetch cycle, second request cache-served
+    assert len(call_log) == 4  # one fetch cycle, second request cache-served
 
 
 def test_sensitivity_grid_included_by_default(client: TestClient):
@@ -492,13 +515,13 @@ def test_missing_malformed_or_unknown_api_key_returns_401(header_value: str | No
     assert unauthorized.json()["error"]["code"] == "invalid_api_key"
     assert key not in unauthorized.text
     # A pre-flight auth failure must never be shared-cacheable: it's
-    # per-caller and runs before quota/compute, unlike the metered 200/304.
+    # per-caller and runs before quota/compute.
     assert unauthorized.headers["Cache-Control"] == "no-store"
     assert authorized.status_code == 200
-    # Phase 7: cacheable valuation responses carry an ETag and never leak the
-    # caller's per-key quota state via X-RateLimit-* headers.
-    assert authorized.headers["ETag"]
-    assert "X-RateLimit-Remaining" not in authorized.headers
+    # ADR-008: valuations are no-store (live price in the body), so per-key
+    # quota headers are safe to expose again.
+    assert authorized.headers["Cache-Control"] == "no-store"
+    assert "X-RateLimit-Remaining" in authorized.headers
 
 
 @pytest.mark.parametrize(
@@ -580,10 +603,10 @@ def test_valuation_requests_are_limited_per_day():
 
     assert first.status_code == 200
     assert second.status_code == 200
-    # Phase 7: the per-caller quota headers live only on the 429 (never
-    # cached), not on the cacheable 200 responses.
-    assert "X-RateLimit-Limit" not in first.headers
-    assert "X-RateLimit-Remaining" not in second.headers
+    # ADR-008: no-store responses may carry per-caller quota headers again,
+    # and they must count down as the quota is consumed.
+    assert first.headers["X-RateLimit-Remaining"] == "1"
+    assert second.headers["X-RateLimit-Remaining"] == "0"
     assert blocked.status_code == 429
     assert blocked.headers["X-RateLimit-Limit"] == "2"
     assert blocked.headers["X-RateLimit-Remaining"] == "0"
@@ -624,7 +647,7 @@ def test_authenticated_keys_have_independent_daily_limits():
     assert first_allowed.status_code == 200
     assert first_blocked.status_code == 429
     assert second_allowed.status_code == 200
-    assert "X-RateLimit-Remaining" not in second_allowed.headers
+    assert second_allowed.headers["X-RateLimit-Remaining"] == "0"
 
 
 def test_supabase_auth_quota_and_usage_metering_are_used():
@@ -673,6 +696,14 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
         if request.url.path == "/rest/v1/rpc/record_usage_event":
             calls.append(("usage", json.loads(request.content)))
             return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/rest/v1/ticker_snapshot_heads" and request.method == "GET":
+            # Phase 8 Slice C read-through: a confirmed miss precedes the
+            # one-time FMP bootstrap.
+            calls.append(("snapshot_read", dict(request.url.params)))
+            return httpx.Response(200, json=[])
+        if request.url.path == "/rest/v1/rpc/store_ticker_snapshot":
+            calls.append(("snapshot_store", json.loads(request.content)))
+            return httpx.Response(204)
         raise AssertionError(f"unexpected Supabase request: {request.method} {request.url}")
 
     supabase = SupabaseClient(
@@ -693,10 +724,19 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
         response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
 
     assert response.status_code == 200
-    # Phase 7 flow: auth (lookup + last_used), a non-consuming peek pre-flight,
-    # then consume + usage only after the fresh 200 is confirmed.
-    assert [name for name, _ in calls] == ["lookup", "last_used", "peek", "quota", "usage"]
-    assert "X-RateLimit-Remaining" not in response.headers
+    # ADR-008 flow: auth (lookup + last_used), then ONE atomic consume before
+    # any fetch/compute (the old non-consuming peek is gone). Slice C adds the
+    # durable-store read (miss -> bootstrap) and the awaited snapshot write
+    # BEFORE the usage record/response. Then usage.
+    assert [name for name, _ in calls] == [
+        "lookup",
+        "last_used",
+        "quota",
+        "snapshot_read",
+        "snapshot_store",
+        "usage",
+    ]
+    assert "X-RateLimit-Remaining" in response.headers
     quota_payload = dict(calls)["quota"]
     assert quota_payload["p_subject_id"] == "key-1"
     assert quota_payload["p_limit"] == 100
@@ -718,7 +758,7 @@ def test_website_and_health_do_not_consume_valuation_limit():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert allowed.status_code == 200
-    assert "X-RateLimit-Remaining" not in allowed.headers
+    assert allowed.headers["X-RateLimit-Remaining"] == "0"
     assert blocked.status_code == 429
 
 
@@ -729,9 +769,9 @@ def test_invalid_valuation_requests_count_against_daily_limit():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert invalid.status_code == 422
-    # errors still consume quota (so the next request is blocked), but never
-    # carry the per-caller quota headers, and are never cacheable
-    assert "X-RateLimit-Remaining" not in invalid.headers
+    # errors still consume quota (so the next request is blocked), carry the
+    # per-caller quota headers, and are never cacheable
+    assert invalid.headers["X-RateLimit-Remaining"] == "0"
     assert invalid.headers["Cache-Control"] == "no-store"
     assert blocked.status_code == 429
 
@@ -1527,35 +1567,91 @@ def _valuation_supabase_app(backend: FakeSupabaseBackend):
     )
 
 
-def test_fresh_valuation_carries_cache_headers_and_no_quota_headers(client: TestClient):
-    response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+def _finnhub_app(finnhub: FakeFinnhubClient | None, call_log: list | None = None, **kwargs):
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport(call_log))
+    return create_app(fmp_client=fmp, finnhub_client=finnhub, **kwargs)
+
+
+def test_valuation_carries_live_price_and_is_never_cacheable():
+    finnhub = FakeFinnhubClient(price=250.0)
+    with TestClient(_finnhub_app(finnhub)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
     assert response.status_code == 200
-    assert response.headers["Cache-Control"] == VALUATION_CACHE_CONTROL
-    assert response.headers["Vary"] == "Accept-Encoding"
-    assert response.headers["ETag"].startswith('"')
-    assert "X-RateLimit-Remaining" not in response.headers
+    body = response.json()
+    # The price comes from Finnhub, not from any FMP/cached snapshot.
+    assert body["current_price"] == 250.0
+    assert body["upside_pct"] == pytest.approx(
+        (body["intrinsic_value_per_share"] - 250.0) / 250.0 * 100
+    )
+    assert body["price_as_of"] is not None
+    assert body["price_fetched_at"] is not None
+    # base_financials is the cached statement snapshot: price-free by design.
+    assert "current_price" not in body["base_financials"]
+    # Never HTTP-cacheable, no conditional-request machinery.
+    assert response.headers["Cache-Control"] == "no-store"
+    assert "ETag" not in response.headers
+    assert "Vary" not in response.headers
 
 
-def test_equivalent_request_forms_produce_identical_etags(client: TestClient):
-    # param order + explicit-vs-default tax_rate + scalar-vs-expanded growth
-    canonical = client.get(
-        "/v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30"
-        "&revenue_growth=0.05&projection_years=5&tax_rate=0.21"
-    )
-    reshuffled = client.get(
-        "/v1/valuations/AAPL?projection_years=5"
-        "&revenue_growth=0.05,0.05,0.05,0.05,0.05&terminal_growth=0.025"
-        "&ebit_margin=0.30&wacc=0.09"
-    )
-    assert canonical.status_code == 200
-    assert reshuffled.status_code == 200
-    assert canonical.headers["ETag"] == reshuffled.headers["ETag"]
+def test_statements_are_cached_but_the_price_is_fetched_live_per_request():
+    call_log: list = []
+    finnhub = FakeFinnhubClient()
+    with TestClient(_finnhub_app(finnhub, call_log)) as test_client:
+        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+        fmp_calls_after_first = len(call_log)
+        # Different assumptions, same ticker: the statements must be reused.
+        second = test_client.get(
+            "/v1/valuations/AAPL?wacc=0.10&terminal_growth=0.02&ebit_margin=0.25"
+            "&revenue_growth=0.04&projection_years=6"
+        )
+        # Identical assumptions: still recomputed, still a fresh price.
+        third = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+    assert first.status_code == second.status_code == third.status_code == 200
+    assert fmp_calls_after_first > 0
+    # One FMP statement load total; every request made its own Finnhub call.
+    assert len(call_log) == fmp_calls_after_first
+    assert finnhub.calls == 3
+    assert first.json()["intrinsic_value_per_share"] != second.json()["intrinsic_value_per_share"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ProviderError("finnhub down"), TickerNotFoundError("AAPL")],
+    ids=["outage", "symbol-not-on-finnhub"],
+)
+def test_finnhub_failure_degrades_to_null_price_with_warning(failure):
+    finnhub = FakeFinnhubClient(fail_with=failure)
+    with TestClient(_finnhub_app(finnhub)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+    assert response.status_code == 200
+    body = response.json()
+    # The DCF math (the core product) is still returned in full...
+    assert body["intrinsic_value_per_share"] is not None
+    assert body["enterprise_value"] is not None
+    # ...with the market comparison nulled and the cause surfaced.
+    assert body["current_price"] is None
+    assert body["upside_pct"] is None
+    assert body["price_as_of"] is None
+    assert any("temporarily unavailable" in warning for warning in body["warnings"])
+
+
+def test_price_feature_off_returns_null_price_with_a_config_warning():
+    with TestClient(_finnhub_app(None)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["current_price"] is None
+    assert body["upside_pct"] is None
+    assert any("not configured" in warning for warning in body["warnings"])
 
 
 def test_over_quota_request_is_rejected_before_any_provider_fetch():
     call_log: list = []
+    finnhub = FakeFinnhubClient()
     fmp = FMPClient(api_key="test-key", transport=fixture_transport(call_log))
-    with TestClient(create_app(fmp_client=fmp, daily_rate_limit=1)) as test_client:
+    with TestClient(
+        create_app(fmp_client=fmp, finnhub_client=finnhub, daily_rate_limit=1)
+    ) as test_client:
         first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
         assert first.status_code == 200
         fetches_after_first = len(call_log)
@@ -1564,58 +1660,33 @@ def test_over_quota_request_is_rejected_before_any_provider_fetch():
         blocked = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
 
     assert blocked.status_code == 429
-    # the over-limit request must not have reached the provider at all
+    # the over-limit request must not have reached FMP or Finnhub at all
     assert len(call_log) == fetches_after_first
+    assert finnhub.calls == 1
 
 
-def test_conditional_request_returns_free_304_without_quota_or_usage():
+def test_conditional_request_headers_are_ignored_and_every_request_is_metered():
     backend = FakeSupabaseBackend()
     key = "dcf_live_testsecret"
     _seed_valuation_key(backend, key)
     with TestClient(_valuation_supabase_app(backend)) as test_client:
         fresh = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
         assert fresh.status_code == 200
-        etag = fresh.headers["ETag"]
-        quota_after_fresh = dict(backend.quota_counters)
         usage_after_fresh = len(backend.usage_events)
 
-        not_modified = test_client.get(
+        conditional = test_client.get(
             f"/v1/valuations/AAPL?{VALID_QUERY}",
-            headers={"X-API-Key": key, "If-None-Match": etag},
+            headers={"X-API-Key": key, "If-None-Match": '"anything"'},
         )
 
-    assert not_modified.status_code == 304
-    assert not_modified.content == b""
-    assert not_modified.headers["ETag"] == etag
-    assert not_modified.headers["Cache-Control"] == VALUATION_CACHE_CONTROL
-    assert not_modified.headers["Vary"] == "Accept-Encoding"
-    assert "X-RateLimit-Remaining" not in not_modified.headers
-    # a 304 is free: no quota consumed, no usage event recorded
-    assert dict(backend.quota_counters) == quota_after_fresh
-    assert len(backend.usage_events) == usage_after_fresh
+    # ADR-008 retired ETags/304s: a conditional request is just a normal,
+    # fully-metered request returning a fresh live-priced 200.
+    assert conditional.status_code == 200
+    assert "ETag" not in conditional.headers
+    assert len(backend.usage_events) == usage_after_fresh + 1
 
 
-def test_non_matching_conditional_request_returns_a_fresh_metered_200():
-    backend = FakeSupabaseBackend()
-    key = "dcf_live_testsecret"
-    _seed_valuation_key(backend, key)
-    with TestClient(_valuation_supabase_app(backend)) as test_client:
-        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
-        assert first.status_code == 200
-        usage_after_first = len(backend.usage_events)
-
-        stale = test_client.get(
-            f"/v1/valuations/AAPL?{VALID_QUERY}",
-            headers={"X-API-Key": key, "If-None-Match": '"not-the-real-etag"'},
-        )
-
-    assert stale.status_code == 200
-    assert stale.json()["ticker"] == "AAPL"
-    # a non-matching conditional request is a normal metered request
-    assert len(backend.usage_events) == usage_after_first + 1
-
-
-def test_over_quota_blocks_even_a_would_be_304():
+def test_over_quota_returns_429_no_store_even_with_conditional_headers():
     backend = FakeSupabaseBackend()
     key = "dcf_live_testsecret"
     _seed_valuation_key(backend, key, daily_quota=100)
@@ -1628,41 +1699,3 @@ def test_over_quota_blocks_even_a_would_be_304():
         )
     assert response.status_code == 429
     assert response.headers["Cache-Control"] == "no-store"
-
-
-class _StalePeekRateLimiter:
-    """Simulates the accepted Phase 7 race: the pre-flight peek() reports a
-    stale "under limit" view (as it would under a concurrent burst, since
-    peek doesn't reserve a slot), but the atomic check_and_increment() --
-    the real datastore's serialized consume -- correctly refuses once the
-    limit is reached. Wraps a real DailyRequestLimiter so consume semantics
-    (exact, non-overshooting) match production; only peek() is forced."""
-
-    def __init__(self, limit: int):
-        self._real = DailyRequestLimiter(limit)
-
-    async def peek(self, *, identity: str = "anonymous", limit: int | None = None):
-        real_result = self._real.peek(identity=identity, limit=limit)
-        return replace(real_result, allowed=True, remaining=max(real_result.remaining, 1))
-
-    async def check_and_increment(self, *, identity: str = "anonymous", limit: int | None = None):
-        return self._real.check_and_increment(identity=identity, limit=limit)
-
-
-def test_stale_peek_does_not_let_an_over_limit_consume_serve_a_200():
-    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
-    limiter = _StalePeekRateLimiter(limit=1)
-    with TestClient(
-        create_app(fmp_client=fmp, rate_limiter=limiter, daily_rate_limit=1)
-    ) as test_client:
-        first = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
-        assert first.status_code == 200  # fills the real quota to 1/1
-
-        # peek() is forced to report "allowed" again (the race), but the
-        # real consume must still refuse and the caller must get a 429, not
-        # the already-computed 200 body.
-        second = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
-
-    assert second.status_code == 429
-    assert second.headers["Cache-Control"] == "no-store"
-    assert "X-RateLimit-Remaining" in second.headers

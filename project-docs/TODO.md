@@ -5,7 +5,7 @@ a product decision. Nothing in this file is something Claude can complete alone.
 Each item says what it unblocks, so you can skip sections that aren't relevant
 yet.
 
-Last updated 2026-07-16.
+Last updated 2026-07-18.
 
 **Fastest path to unblocking real work:** Section 1 (deploy the site you already
 have) and Section 2 (four one-line answers). Section 3 unblocks the next feature.
@@ -26,18 +26,29 @@ your domain yet. Do these **in order**.
   Vercel → `pub-tools-dcf` → Settings → Domains → Add → `ashaat.dev`. Verify DNS
   goes green. Decide whether `www.ashaat.dev` should redirect to the apex.
 - [x] **1.3 — Set Production `PUBLIC_BASE_URL` to `https://ashaat.dev`.**
-  Vercel → `pub-tools-dcf` → Settings → Environment Variables → Production →
-  edit `PUBLIC_BASE_URL` → `https://ashaat.dev`. **Redeploy after saving** (env
-  changes don't apply to existing deployments).
-- [x] **1.4 — Allow-list the callback in Supabase.**
-  Supabase → Authentication → URL Configuration → Redirect URLs → add
-  `https://ashaat.dev/v1/auth/callback`. Review the Site URL while you're there.
-- [ ] **1.5 — Test on `https://ashaat.dev` with your local server STOPPED.**
-  Check: `/` portfolio loads with images · `/apis` lists the DCF API · `/dcf`
-  loads · **GitHub sign-in** completes and lands on `/dcf` · **email magic-link
-  sign-in** completes and lands on `/dcf` · a valuation request returns 200.
-- [x] **1.6 — Retire the old portfolio Vercel project** once `ashaat.dev`
-  resolves here and 1.5 passes.
+  **Done by Claude 2026-07-16 via `vercel env rm`/`add`.** It had never actually
+  changed (still the 3-day-old vercel.app value), and — separately — the last
+  deploy was 2 days old, so *no* env change could have taken effect anyway.
+  Verified live: the login redirect now emits
+  `redirect_to=https://ashaat.dev/v1/auth/callback`.
+- [x] **1.4 — Allow-list the callback in Supabase.** You did this.
+- [x] **1.4b — Deploy the Phase 9 code.** Commit `2a3b66e` pushed to `main`
+  2026-07-16; production redeployed and verified: `/` portfolio, `/apis`, `/dcf`,
+  `/Pics/*`, `/health`, `/docs` all 200. *(This was the real reason `/dcf` 404'd
+  — the code had never been committed.)*
+- [ ] **1.4c — ⚠️ Flip the primary domain to the apex.** You chose `ashaat.dev`
+  as canonical, but Vercel still has **www as primary**: `ashaat.dev` 308-
+  redirects to `www.ashaat.dev`. Fix: Vercel → `pub-tools-dcf` → Settings →
+  Domains → set **`www.ashaat.dev` to redirect to `ashaat.dev`** (currently it's
+  the reverse). *Why it matters:* the PKCE `pt_oauth_verifier` cookie is
+  **host-only**. Today you browse `www`, so the cookie lands on `www`, while the
+  callback goes to the apex and bounces back to `www` — it works only because the
+  308 happens to preserve `?code=`. Same host everywhere removes that fragility.
+- [ ] **1.5 — Test sign-in with your local server STOPPED.**
+  `/` portfolio · `/apis` · `/dcf` · **GitHub sign-in** lands on `/dcf` ·
+  **email magic-link** lands on `/dcf` · a valuation returns 200.
+  *(Everything except sign-in is already verified live by Claude.)*
+- [x] **1.6 — Retire the old portfolio Vercel project.**
 
 > ⚠️ **1.3 and 1.4 must both be done, together.** Doing one without the other
 > reproduces your 2026-07-13 outage exactly: sign-in only completes while a local
@@ -52,21 +63,23 @@ your domain yet. Do these **in order**.
 
 ## 2. Decisions I need (no dashboard — just answer)
 
-- [ ] **2.1 — The second "Course Portfolio" page.** Your source repo
-  (`WebstormProjects/index.html/portfolio.html`, ~8.4 KB) has a second page I did
-  **not** migrate, and I dropped its nav link. Want it brought over and restyled
-  to match? *(Yes / no.)*
-- [ ] **2.2 — `www.ashaat.dev`.** Redirect to the apex, or ignore? *(Part of 1.2.)*
-- [ ] **2.3 — Four unused images.** These exist in your source repo but nothing
-  references them, so I left them out to keep the Vercel function bundle lean:
-  `AWS-Certified-Cloud-Practitioner-logo.png`, `GithubLogo.png`,
-  `Java_programming_language_logo.svg.png`, `OutlookLogo.jpg`. Want any added
-  (e.g. an AWS cert card)?
-- [ ] **2.4 — Phase 15's fate.** Phase 15 ("Separate UI/UX from the
-  microservice") plans to strip **all** bundled UI out of this deployment and make
-  it headless — the exact opposite of what you just built in Phase 9. It's marked
-  **on hold**. Re-scope it (e.g. keep the site, split only later products) or drop
-  it entirely? *(Not urgent, but the plan currently holds two opposite goals.)*
+- [x] **2.1 — The second "Course Portfolio" page.** Answered 2026-07-17: drop it,
+  the page is unnecessary. The nav link was already removed; nothing else to do.
+- [x] **2.2 — `www.ashaat.dev`.** Answered 2026-07-17 (owner note: "ashaat.dev now
+  redirects to DCF Valuation API"). Live-verified same day: the apex still 308s to
+  **www** — i.e. www remains the primary host, which is what the owner observed.
+  Sign-in works through the query-preserving 308, so this stays merely a
+  fragility; see 1.4c if it should ever be flipped to apex-primary.
+- [x] **2.3 — Unused images.** Answered 2026-07-17: yes. Added an **AWS Certified
+  Cloud Practitioner** card to the portfolio's certifications section with its
+  logo. **Owner: supply the earned date (or "in progress") so the card can show
+  it — no date was invented.** The other three images stay skipped:
+  `GithubLogo.png`/`OutlookLogo.jpg` are non-transparent duplicates of images
+  already in use, and `Java_programming_language_logo.svg.png` has no section to
+  live in.
+- [x] **2.4 — Phase 15's fate.** Answered 2026-07-17: keep it on hold. Recorded;
+  the plan already marks it on hold with the Phase 9 supersession note, so no
+  further change.
 
 **Unblocks:** finishing Phase 9 cleanly; stopping the plan from contradicting itself.
 
@@ -76,18 +89,20 @@ your domain yet. Do these **in order**.
 
 The plan is written and approved; implementation needs a key.
 
-- [ ] **3.1 — Create a free Finnhub account** at <https://finnhub.io/register>
-  and copy the API key. The free tier gives real-time US quotes at 60 calls/min,
-  which is what ADR-008 assumes.
-- [ ] **3.2 — Add `FINNHUB_API_KEY` to Vercel** → `pub-tools-dcf` → Settings →
-  Environment Variables → **Production** (and Preview if you want previews to
-  have live prices).
-- [ ] **3.3 — Add `FINNHUB_API_KEY` to your local `.env`** so I can verify against
-  the real API rather than only mocks.
-- [ ] **3.4 — Confirm the outage default.** If Finnhub is down, the planned
-  behavior is: return the valuation math with `current_price`/`upside_pct` as
-  `null` + a warning (**never** a cached/stale price). Alternative is failing the
-  whole request with a 502. *(Default stands unless you say otherwise.)*
+- [x] **3.1 — Create a free Finnhub account.** Done 2026-07-17.
+- [x] **3.2 — Add `FINNHUB_API_KEY` to Vercel.** Done 2026-07-17 — confirmed via
+  `vercel env ls`: present for **Preview and Production**.
+- [x] **3.3 — Add `FINNHUB_API_KEY` to your local `.env`.** Done 2026-07-17
+  (after a save-the-file false start). Live-verified same day: real AAPL/MSFT
+  quotes fetched and normalized, unknown symbol correctly classified, and the
+  full suite is immune to the ambient key (`tests/conftest.py` isolation
+  fixture now clears `FINNHUB_API_KEY` too).
+- [x] **3.4 — Confirm the outage default.** Resolved 2026-07-18 (with the other
+  pre-implementation resolutions in `issues.MD`): the null-price degrade is
+  implemented — Finnhub outage/rate-limit/unknown-symbol/misconfig all return
+  the valuation math with `current_price`/`upside_pct` as `null` + a warning,
+  never a cached/stale price and never a 502. Flip the "Open sub-decisions"
+  entry in `issues.MD` if you ever want the 502 behavior instead.
 
 **Unblocks:** the whole Finnhub feature (live price, never cached). Without a key
 I can write the client and tests against a fake, but can't live-verify it.
@@ -105,9 +120,14 @@ Eastern refresh job.
 - [ ] **4.2 — Generate a `CRON_SECRET`** (16+ random characters), add it to Vercel
   **Production**, and redeploy. This protects the internal refresh endpoint. Do
   **not** commit it or expose it to the browser.
-- [ ] **4.3 — Apply migration 003 to Supabase** when I hand it to you — same flow
-  as migrations 001/002 (paste the SQL into the Supabase SQL editor). It creates
-  the immutable snapshot table + ticker heads. *(I'll tell you when it's ready.)*
+- [ ] **4.3 — Apply migration 003 to Supabase** — same flow as migrations
+  001/002 (paste the SQL into the Supabase SQL editor). It creates the
+  immutable snapshot table, ticker heads, the refresh run/claim ledger, and
+  the store/run RPCs. *(**Final as of 2026-07-18** —
+  `supabase/migrations/003_phase8_snapshots.sql`, now including the
+  run-manifest RPCs. Apply it **before** the Slice C code is committed and
+  deployed: with Supabase configured, a missing table is a storage error —
+  503 on cold tickers — not a cache miss.)*
 - [ ] **4.4 — Confirm FMP plan capacity.** The daily job refreshes **every**
   ticker in the database, with several FMP endpoint calls each plus retries. Your
   current FMP tier is ~250 calls/day. Confirm the plan (or upgrade) before the
@@ -144,18 +164,24 @@ Eastern refresh job.
 |---|---|
 | §1 (domain) | Finish Phase 9; verify the live site end to end |
 | §2.1 (course page) | Migrate + restyle that page |
-| §3 (Finnhub key) | Build **and live-verify** the real-time price feature |
+| ~~§3 (Finnhub key)~~ | ~~Build and live-verify the real-time price feature~~ Done 2026-07-18 (uncommitted) |
 | §4.1 (env pull) | Verify Redis against the real Upstash instance |
-| §4.2–4.4 | Build and ship Phase 8 Slice C + the daily refresh cron |
-| Nothing | Write Slice C code/tests against fakes (can start anytime) |
+| §4.2–4.4 | Ship Phase 8 Slice C live + enable the daily refresh cron |
+| Nothing | Slice C part 2 (scheduler) code/tests against fakes (can start anytime) |
 
 ## Also worth knowing
 
-- **Nothing is committed yet.** The Phase 9 site work, the restyled portfolio,
-  `docs/apis.html`, `docs/Pics/`, the plan/ADR updates — all uncommitted. Say the
-  word and I'll commit and push (which triggers a Vercel production deploy via the
-  git integration).
-- **Current state:** 298 tests passing, 94.07% coverage, ruff/format/mypy clean.
+- **Phase 9 is committed and live** (commit `2a3b66e`, deployed 2026-07-16): the
+  portfolio, `/apis`, `/dcf`, and images are all serving on the domain.
+- **ADR-008 (live Finnhub price, model 0.2.0) is implemented and live-verified
+  locally but NOT yet committed/deployed** — the working tree holds the whole
+  feature (plus Slice 1 and the AWS card from 2026-07-17). Production still runs
+  the old cached-quote code until this is committed and pushed.
+- **Current state:** 325 tests passing, 93.58% coverage, ruff/format/mypy clean.
+  Phase 8 Slice C parts 1–2 (durable snapshots, DB read-through, and the daily
+  6 PM Eastern refresh scheduler with its cron endpoint) are implemented and
+  tested against fakes; remaining: the 6 PM L1 cutoff, structured freshness
+  response fields, and live wiring (§4).
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

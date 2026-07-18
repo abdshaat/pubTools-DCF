@@ -8,7 +8,6 @@ backed data layer) while exercising the real milestone-4 client code.
 import asyncio
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -25,7 +24,7 @@ from app.exceptions import (
 )
 from app.fundamentals import FundamentalsService
 from app.models import Assumptions
-from app.normalization import normalize_fmp_fundamentals, normalize_fmp_quote
+from app.normalization import normalize_fmp_fundamentals
 from app.providers.fmp import FMPClient, FMPFundamentals
 from app.redis_cache import InMemoryRedisBackend
 
@@ -69,7 +68,6 @@ def make_fundamentals(ticker: str = "AAPL", **overrides) -> FMPFundamentals:
         "balance": raw["balance-sheet-statement"][0],
         "cash_flow": raw["cash-flow-statement"][0],
         "profile": raw["profile"][0],
-        "quote": raw["quote"][0],
     }
     for name, patch in overrides.items():
         sections[name] = {**sections[name], **patch}
@@ -79,7 +77,6 @@ def make_fundamentals(ticker: str = "AAPL", **overrides) -> FMPFundamentals:
         balance=(sections["balance"],),
         cash_flow=(sections["cash_flow"],),
         profile=sections["profile"],
-        quote=sections["quote"],
     )
 
 
@@ -103,10 +100,8 @@ def test_normalize_maps_fmp_fields_to_canonical_schema():
     assert base.delta_nwc == -3_651_000_000.0
     assert base.net_debt == 106_629_000_000.0 - 29_943_000_000.0
     assert base.diluted_shares == 15_408_095_000.0
-    assert base.current_price == 245.5
     assert base.currency == "USD"
     assert base.fundamentals_as_of == "2025-09-27"
-    assert base.price_as_of is None
     assert base.data_provider == "financialmodelingprep"
 
 
@@ -140,24 +135,12 @@ def test_normalize_rejects_non_finite_or_non_numeric_fields(value):
         ("income", {"revenue": 0}, "revenue"),
         ("income", {"weightedAverageShsOutDil": 0}, "diluted_shares"),
         ("cash_flow", {"depreciationAndAmortization": -1}, "da"),
-        ("quote", {"price": 0}, "current_price"),
     ],
 )
 def test_normalize_rejects_invalid_positive_domain_fields(section, patch, field):
     with pytest.raises(NormalizationError) as exc:
         normalize_fmp_fundamentals(make_fundamentals(**{section: patch}))
     assert exc.value.missing == [field]
-
-
-def test_normalize_maps_optional_quote_timestamp():
-    base = normalize_fmp_fundamentals(make_fundamentals(quote={"timestamp": 1_700_000_000}))
-    assert base.price_as_of == datetime.fromtimestamp(1_700_000_000, tz=UTC)
-
-
-def test_normalize_rejects_invalid_quote_timestamp():
-    with pytest.raises(NormalizationError) as exc:
-        normalize_fmp_fundamentals(make_fundamentals(quote={"timestamp": "invalid"}))
-    assert exc.value.missing == ["price_as_of"]
 
 
 def test_normalize_requires_currency():
@@ -301,7 +284,7 @@ def test_normalized_output_feeds_straight_into_dcf_engine():
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_fundamentals_returns_all_five_sections():
+def test_fetch_fundamentals_returns_all_sections():
     async def scenario():
         async with make_client() as client:
             return await client.fetch_fundamentals("aapl")  # case-insensitive
@@ -309,7 +292,7 @@ def test_fetch_fundamentals_returns_all_five_sections():
     result = asyncio.run(scenario())
     assert result.ticker == "AAPL"
     assert result.income[0]["revenue"] == 391_035_000_000
-    assert result.quote["price"] == 245.5
+    assert result.profile["currency"] == "USD"
 
 
 def test_statement_fetch_requests_multiple_candidate_periods():
@@ -350,9 +333,7 @@ def test_provider_rejects_malformed_statement_record_list():
 def test_provider_accepts_single_statement_and_profile_objects():
     def handler(request: httpx.Request) -> httpx.Response:
         endpoint = request.url.path.rsplit("/", 1)[-1]
-        payload = load_fixture("AAPL")[endpoint]
-        if endpoint != "quote":
-            payload = payload[0]
+        payload = load_fixture("AAPL")[endpoint][0]
         return httpx.Response(200, json=payload)
 
     async def scenario():
@@ -362,20 +343,6 @@ def test_provider_accepts_single_statement_and_profile_objects():
     result = asyncio.run(scenario())
     assert len(result.income) == 1
     assert result.profile["currency"] == "USD"
-
-
-@pytest.mark.parametrize("payload", [[], "malformed"])
-def test_independent_quote_fetch_rejects_empty_or_malformed_payload(payload):
-    def handler(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(200, json=payload)
-
-    async def scenario():
-        async with make_client(transport=httpx.MockTransport(handler)) as client:
-            await client.fetch_quote("AAPL")
-
-    expected = TickerNotFoundError if payload == [] else ProviderError
-    with pytest.raises(expected):
-        asyncio.run(scenario())
 
 
 def test_unknown_ticker_raises_ticker_not_found():
@@ -420,7 +387,7 @@ def test_provider_402_is_not_retried():
 
     with pytest.raises(TickerNotCoveredError):
         asyncio.run(scenario())
-    assert len(attempts) == 5
+    assert len(attempts) == 4
 
 
 def test_missing_api_key_fails_fast(monkeypatch):
@@ -442,7 +409,7 @@ def test_rejected_api_key_raises_auth_error_without_retry():
 
     with pytest.raises(ProviderAuthError):
         asyncio.run(scenario())
-    assert len(attempts) == 5  # concurrent endpoints fail once each, without retry
+    assert len(attempts) == 4  # concurrent endpoints fail once each, without retry
 
 
 def test_retries_on_429_with_backoff_then_succeeds():
@@ -547,7 +514,6 @@ def test_fetch_fundamentals_runs_endpoint_calls_concurrently_with_limit():
         "balance-sheet-statement",
         "cash-flow-statement",
         "profile",
-        "quote",
     }
     assert max_active == 2
 
@@ -589,7 +555,7 @@ def test_transport_timeout_is_retried_then_classified():
 
     with pytest.raises(ProviderError, match="transport error"):
         asyncio.run(scenario())
-    assert sleeps == [0.5] * 5
+    assert sleeps == [0.5] * 4
 
 
 def test_unsupported_http_status_is_classified_without_retry():
@@ -605,7 +571,7 @@ def test_unsupported_http_status_is_classified_without_retry():
 
     with pytest.raises(ProviderError, match="unsupported HTTP 418"):
         asyncio.run(scenario())
-    assert len(attempts) == 5
+    assert len(attempts) == 4
 
 
 def test_raw_sink_receives_every_payload():
@@ -621,7 +587,7 @@ def test_raw_sink_receives_every_payload():
 
     asyncio.run(scenario())
     assert ("AAPL", "income-statement") in stored
-    assert len(stored) == 5
+    assert len(stored) == 4
 
 
 # ---------------------------------------------------------------------------
@@ -642,8 +608,8 @@ def test_cache_serves_second_request_without_provider_call():
 
     first, second, calls_after_first = asyncio.run(scenario())
     assert first == second
-    assert calls_after_first == 5
-    assert len(call_log) == 5  # no additional provider traffic
+    assert calls_after_first == 4
+    assert len(call_log) == 4  # no additional provider traffic
 
 
 def test_same_ticker_cold_burst_uses_one_provider_load():
@@ -662,7 +628,7 @@ def test_same_ticker_cold_burst_uses_one_provider_load():
 
     results = asyncio.run(scenario())
     assert {result.ticker for result in results} == {"AAPL"}
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_two_service_instances_share_redis_and_one_provider_load():
@@ -700,7 +666,7 @@ def test_two_service_instances_share_redis_and_one_provider_load():
 
     first, second = asyncio.run(scenario())
     assert first == second
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_corrupt_distributed_fundamentals_entry_is_replaced_not_surfaced():
@@ -715,7 +681,7 @@ def test_corrupt_distributed_fundamentals_entry_is_replaced_not_surfaced():
 
     result, stored = asyncio.run(scenario())
     assert result.ticker == "AAPL"
-    assert len(call_log) == 5
+    assert len(call_log) == 4
     assert stored is not None and '"ticker":"AAPL"' in stored
 
 
@@ -737,7 +703,7 @@ def test_redis_outage_fails_open_to_provider_fetch():
 
     result = asyncio.run(scenario())
     assert result.ticker == "AAPL"
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_crashed_distributed_lock_holder_never_blocks_provider_fallback():
@@ -755,7 +721,7 @@ def test_crashed_distributed_lock_holder_never_blocks_provider_fallback():
 
     result = asyncio.run(scenario())
     assert result.ticker == "AAPL"
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_negative_result_is_shared_between_service_instances():
@@ -775,7 +741,7 @@ def test_negative_result_is_shared_between_service_instances():
         return calls_after_first
 
     calls_after_first = asyncio.run(scenario())
-    assert calls_after_first == 5
+    assert calls_after_first == 4
     assert len(call_log) == calls_after_first
 
 
@@ -800,7 +766,6 @@ def test_distributed_stale_statement_is_used_only_after_refresh_failure():
             first = FundamentalsService(
                 first_client,
                 ttl_seconds=60,
-                quote_ttl_seconds=3600,
                 max_statement_staleness_seconds=3600,
                 now=lambda: clock["t"],
                 wall_now=lambda: clock["t"],
@@ -815,7 +780,6 @@ def test_distributed_stale_statement_is_used_only_after_refresh_failure():
             second = FundamentalsService(
                 second_client,
                 ttl_seconds=60,
-                quote_ttl_seconds=3600,
                 max_statement_staleness_seconds=3600,
                 now=lambda: clock["t"],
                 wall_now=lambda: clock["t"],
@@ -824,7 +788,7 @@ def test_distributed_stale_statement_is_used_only_after_refresh_failure():
             return await second.get_base_financials("AAPL")
 
     result = asyncio.run(scenario())
-    assert len(initial_calls) == 5
+    assert len(initial_calls) == 4
     assert set(refresh_calls) == {
         "income-statement",
         "balance-sheet-statement",
@@ -857,7 +821,7 @@ def test_waiter_cancellation_does_not_cancel_shared_provider_load():
 
     result, service = asyncio.run(scenario())
     assert result.ticker == "AAPL"
-    assert len(call_log) == 5
+    assert len(call_log) == 4
     assert service._inflight == {}
 
 
@@ -870,7 +834,6 @@ def test_cache_expires_after_ttl():
             service = FundamentalsService(
                 client,
                 ttl_seconds=3600,
-                quote_ttl_seconds=3600,
                 now=lambda: clock["t"],
             )
             await service.get_base_financials("AAPL")
@@ -882,10 +845,10 @@ def test_cache_expires_after_ttl():
             return calls_before_expiry
 
     calls_before_expiry = asyncio.run(scenario())
-    assert calls_before_expiry == 5
-    # Statement refresh reuses the independently fresh profile, then refreshes
-    # the quote: 3 statement calls + 1 quote call instead of another full 5.
-    assert len(call_log) == 9
+    assert calls_before_expiry == 4
+    # Statement refresh reuses the independently fresh profile: 3 statement
+    # calls instead of another full 4 (there is no quote endpoint anymore).
+    assert len(call_log) == 7
 
 
 def test_profile_refreshes_independently_without_refetching_statements():
@@ -898,7 +861,6 @@ def test_profile_refreshes_independently_without_refetching_statements():
                 client,
                 ttl_seconds=3600,
                 profile_ttl_seconds=100,
-                quote_ttl_seconds=3600,
                 now=lambda: clock["t"],
             )
             await service.get_base_financials("AAPL")
@@ -907,100 +869,9 @@ def test_profile_refreshes_independently_without_refetching_statements():
 
     refreshed = asyncio.run(scenario())
     assert refreshed.currency == "USD"
-    assert len(call_log) == 6
+    assert len(call_log) == 5
     assert [endpoint for endpoint, _ in call_log].count("profile") == 2
     assert [endpoint for endpoint, _ in call_log].count("income-statement") == 1
-
-
-def test_quote_refreshes_independently_without_refetching_statements():
-    call_log = []
-    clock = {"t": 0.0}
-
-    async def scenario():
-        async with make_client(transport=fixture_transport(call_log)) as client:
-            service = FundamentalsService(
-                client,
-                ttl_seconds=3600,
-                quote_ttl_seconds=60,
-                now=lambda: clock["t"],
-            )
-            await service.get_base_financials("AAPL")
-            clock["t"] = 61.0
-            return await service.get_base_financials("AAPL")
-
-    refreshed = asyncio.run(scenario())
-    assert refreshed.current_price == 245.5
-    assert len(call_log) == 6
-    assert [endpoint for endpoint, _ in call_log].count("quote") == 2
-    assert [endpoint for endpoint, _ in call_log].count("income-statement") == 1
-
-
-def test_quote_refresh_failure_uses_bounded_stale_quote_with_warning():
-    call_log = []
-    clock = {"t": 0.0}
-    fail_quote = {"value": False}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        endpoint = request.url.path.rsplit("/", 1)[-1]
-        call_log.append((endpoint, request.url.params.get("symbol", "")))
-        if endpoint == "quote" and fail_quote["value"]:
-            return httpx.Response(503)
-        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
-
-    async def no_sleep(seconds: float) -> None:
-        pass
-
-    async def scenario():
-        async with make_client(
-            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
-        ) as client:
-            service = FundamentalsService(
-                client,
-                ttl_seconds=3600,
-                quote_ttl_seconds=60,
-                max_quote_staleness_seconds=900,
-                now=lambda: clock["t"],
-            )
-            await service.get_base_financials("AAPL")
-            clock["t"] = 61.0
-            fail_quote["value"] = True
-            return await service.get_base_financials("AAPL")
-
-    stale = asyncio.run(scenario())
-    assert stale.current_price == 245.5
-    assert any("bounded stale quote" in warning for warning in stale.data_quality_warnings)
-
-
-def test_quote_refresh_failure_beyond_staleness_limit_raises():
-    clock = {"t": 0.0}
-    fail_quote = {"value": False}
-
-    def handler(request: httpx.Request) -> httpx.Response:
-        endpoint = request.url.path.rsplit("/", 1)[-1]
-        if endpoint == "quote" and fail_quote["value"]:
-            return httpx.Response(503)
-        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
-
-    async def no_sleep(seconds: float) -> None:
-        pass
-
-    async def scenario():
-        async with make_client(
-            transport=httpx.MockTransport(handler), max_retries=0, sleep=no_sleep
-        ) as client:
-            service = FundamentalsService(
-                client,
-                quote_ttl_seconds=60,
-                max_quote_staleness_seconds=900,
-                now=lambda: clock["t"],
-            )
-            await service.get_base_financials("AAPL")
-            clock["t"] = 901.0
-            fail_quote["value"] = True
-            await service.get_base_financials("AAPL")
-
-    with pytest.raises(ProviderError):
-        asyncio.run(scenario())
 
 
 def test_statement_refresh_failure_uses_bounded_stale_fundamentals_with_warning():
@@ -1023,7 +894,6 @@ def test_statement_refresh_failure_uses_bounded_stale_fundamentals_with_warning(
             service = FundamentalsService(
                 client,
                 ttl_seconds=60,
-                quote_ttl_seconds=3600,
                 max_statement_staleness_seconds=3600,
                 now=lambda: clock["t"],
             )
@@ -1069,13 +939,9 @@ def test_statement_refresh_failure_beyond_staleness_limit_raises():
         asyncio.run(scenario())
 
 
-def test_invalidate_clears_statement_quote_and_negative_caches():
+def test_invalidate_clears_statement_and_negative_caches():
     service = FundamentalsService(make_client())
     service._cache["AAPL"] = (0.0, normalize_fmp_fundamentals(make_fundamentals()))
-    service._quote_cache["AAPL"] = (
-        0.0,
-        normalize_fmp_quote("AAPL", {"price": 1}, datetime.now(UTC)),
-    )
     raw = make_fundamentals()
     service._raw_cache["AAPL"] = (0.0, raw)
     service._profile_cache["AAPL"] = (0.0, raw.profile)
@@ -1083,14 +949,12 @@ def test_invalidate_clears_statement_quote_and_negative_caches():
 
     service.invalidate("aapl")
     assert "AAPL" not in service._cache
-    assert "AAPL" not in service._quote_cache
     assert "AAPL" not in service._raw_cache
     assert "AAPL" not in service._profile_cache
     assert "BAD" in service._negative
 
     service.invalidate()
     assert not service._cache
-    assert not service._quote_cache
     assert not service._raw_cache
     assert not service._profile_cache
     assert not service._negative
@@ -1122,7 +986,7 @@ def test_not_covered_ticker_is_negative_cached():
     asyncio.run(scenario())
     # Three requests, but only the first reached the provider (one endpoint,
     # one logical load); the rest are served from the negative cache.
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_unsupported_sector_is_negative_cached():
@@ -1139,10 +1003,10 @@ def test_unsupported_sector_is_negative_cached():
             return calls_after_first
 
     calls_after_first = asyncio.run(scenario())
-    assert calls_after_first == 5
+    assert calls_after_first == 4
     # A bank fetched once then rejected on sector: the repeat costs 0 calls
     # instead of another 5.
-    assert len(call_log) == 5
+    assert len(call_log) == 4
 
 
 def test_transient_error_is_not_negative_cached():
@@ -1168,7 +1032,7 @@ def test_transient_error_is_not_negative_cached():
     asyncio.run(scenario())
     # Both logical loads hit the provider — a 503 might clear up, so it must stay
     # retryable and must not be cached.
-    assert len(call_log) == 10
+    assert len(call_log) == 8
 
 
 def test_negative_cache_expires_after_ttl():
@@ -1190,8 +1054,8 @@ def test_negative_cache_expires_after_ttl():
             return calls_before_expiry
 
     calls_before_expiry = asyncio.run(scenario())
-    assert calls_before_expiry == 5
-    assert len(call_log) == 10
+    assert calls_before_expiry == 4
+    assert len(call_log) == 8
 
 
 def test_negative_cache_has_independent_ttl():
@@ -1213,4 +1077,4 @@ def test_negative_cache_has_independent_ttl():
                 await service.get_base_financials("ZZZQQQ")
 
     asyncio.run(scenario())
-    assert len(call_log) == 10
+    assert len(call_log) == 8

@@ -66,7 +66,6 @@ def _validate_base(base: BaseFinancials) -> None:
         "delta_nwc": base.delta_nwc,
         "net_debt": base.net_debt,
         "diluted_shares": base.diluted_shares,
-        "current_price": base.current_price,
     }
     for field, value in numeric_fields.items():
         _require_finite(field, value)
@@ -79,8 +78,6 @@ def _validate_base(base: BaseFinancials) -> None:
         raise DCFValidationError("capex", "must not be negative")
     if base.diluted_shares <= 0:
         raise DCFValidationError("diluted_shares", "must be positive")
-    if base.current_price <= 0:
-        raise DCFValidationError("current_price", "must be positive")
 
 
 def _validate(base: BaseFinancials, assumptions: Assumptions) -> None:
@@ -208,11 +205,6 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
     enterprise_value = pv_fcf_total + pv_terminal_value
     equity_value = enterprise_value - base.net_debt
     intrinsic_value_per_share = equity_value / base.diluted_shares
-    upside_pct = (
-        (intrinsic_value_per_share - base.current_price) / base.current_price * 100
-        if base.current_price
-        else 0.0
-    )
 
     for value in (
         terminal_value,
@@ -220,7 +212,6 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
         enterprise_value,
         equity_value,
         intrinsic_value_per_share,
-        upside_pct,
     ):
         _require_finite("calculation", value)
 
@@ -243,8 +234,6 @@ def compute_dcf(base: BaseFinancials, assumptions: Assumptions) -> Valuation:
         enterprise_value=enterprise_value,
         equity_value=equity_value,
         intrinsic_value_per_share=intrinsic_value_per_share,
-        current_price=base.current_price,
-        upside_pct=upside_pct,
         warnings=tuple(warnings),
     )
 

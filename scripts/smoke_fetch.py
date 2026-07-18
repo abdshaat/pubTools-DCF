@@ -35,7 +35,6 @@ async def main(ticker: str) -> None:
         "delta_nwc",
         "net_debt",
         "diluted_shares",
-        "current_price",
     ):
         print(f"  {field:>16}: {getattr(base, field):,.0f}")
 
@@ -51,8 +50,7 @@ async def main(ticker: str) -> None:
 
     print("--- valuation (placeholder assumptions) ---")
     print(f"  intrinsic value/share: {valuation.intrinsic_value_per_share:,.2f}")
-    print(f"  current price:         {valuation.current_price:,.2f}")
-    print(f"  upside:                {valuation.upside_pct:+.1f}%")
+    print("  (market price/upside are live-from-Finnhub API-layer concerns; ADR-008)")
 
 
 if __name__ == "__main__":

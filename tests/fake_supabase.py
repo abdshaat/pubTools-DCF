@@ -7,6 +7,7 @@ SupabaseClient in the same test, since it's the same fake project.
 """
 
 import json
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -27,7 +28,43 @@ class FakeSupabaseBackend:
         self.otp_requests: list[dict[str, Any]] = []
         # (subject_id, quota_window) -> request_count
         self.quota_counters: dict[tuple[str, str], int] = {}
+        # Phase 8 Slice C durable statement store: ticker -> head row,
+        # snapshot_version -> immutable snapshot row.
+        self.snapshot_heads: dict[str, dict[str, Any]] = {}
+        self.snapshots: dict[str, dict[str, Any]] = {}
+        self.snapshot_store_calls: list[dict[str, Any]] = []
+        self.snapshot_read_count = 0
+        # Flip to simulate a database outage on the snapshot paths only.
+        self.fail_snapshot_reads = False
+        self.fail_snapshot_writes = False
+        # Daily-refresh ledger: refresh_date -> run row,
+        # (ticker, refresh_date) -> claim row.
+        self.refresh_runs: dict[str, dict[str, Any]] = {}
+        self.refresh_claims: dict[tuple[str, str], dict[str, Any]] = {}
         self._counter = 0
+
+    def seed_snapshot(
+        self,
+        *,
+        ticker: str,
+        snapshot: dict[str, Any],
+        snapshot_version: str = "sha256:seeded",
+        verified_at: str = "2026-07-18T00:00:00+00:00",
+        refresh_status: str = "bootstrap_snapshot",
+    ) -> None:
+        """Install a stored head + snapshot document as if a past bootstrap
+        or daily refresh had committed it."""
+        self.snapshots[snapshot_version] = {
+            "snapshot_version": snapshot_version,
+            "ticker": ticker,
+            "snapshot": snapshot,
+        }
+        self.snapshot_heads[ticker] = {
+            "ticker": ticker,
+            "snapshot_version": snapshot_version,
+            "verified_at": verified_at,
+            "refresh_status": refresh_status,
+        }
 
     def register_login_code(
         self,
@@ -205,6 +242,127 @@ class FakeSupabaseBackend:
         if path == "/rest/v1/audit_events" and method == "POST":
             self.audit_events.append(json.loads(request.content))
             return httpx.Response(201, json=[])
+
+        if path == "/rest/v1/ticker_snapshot_heads" and method == "GET":
+            self.snapshot_read_count += 1
+            if self.fail_snapshot_reads:
+                return httpx.Response(503, json={"message": "database unavailable"})
+            ticker = request.url.params.get("ticker", "").removeprefix("eq.")
+            head = self.snapshot_heads.get(ticker)
+            if head is None:
+                return httpx.Response(200, json=[])
+            snapshot_row = self.snapshots.get(head["snapshot_version"], {})
+            # PostgREST FK embed: the referenced row rides along as an object
+            # keyed by the embedded table's name.
+            return httpx.Response(
+                200,
+                json=[{**head, "normalized_snapshots": {"snapshot": snapshot_row.get("snapshot")}}],
+            )
+
+        if path == "/rest/v1/rpc/begin_financial_refresh_run" and method == "POST":
+            body = json.loads(request.content)
+            refresh_date = body["p_refresh_date"]
+            if refresh_date in self.refresh_runs:
+                return httpx.Response(
+                    200,
+                    json={
+                        "already_claimed": True,
+                        "status": self.refresh_runs[refresh_date]["status"],
+                    },
+                )
+            tickers = sorted(self.snapshot_heads)
+            self.refresh_runs[refresh_date] = {
+                "refresh_date": refresh_date,
+                "scheduled_window_at": body.get("p_scheduled_window_at"),
+                "started_at": datetime.now(UTC).isoformat(),
+                "finished_at": None,
+                "status": "running",
+                "total_tickers": len(tickers),
+            }
+            for ticker in tickers:
+                self.refresh_claims[(ticker, refresh_date)] = {
+                    "ticker": ticker,
+                    "refresh_date": refresh_date,
+                    "claimed_at": datetime.now(UTC).isoformat(),
+                    "completed_at": None,
+                    "status": "pending",
+                    "error_code": None,
+                }
+            return httpx.Response(
+                200,
+                json={
+                    "already_claimed": False,
+                    "status": "running",
+                    "total_tickers": len(tickers),
+                    "tickers": tickers,
+                },
+            )
+
+        if path == "/rest/v1/financial_refresh_claims" and method == "PATCH":
+            ticker = request.url.params.get("ticker", "").removeprefix("eq.")
+            refresh_date = request.url.params.get("refresh_date", "").removeprefix("eq.")
+            claim = self.refresh_claims.get((ticker, refresh_date))
+            if claim is not None:
+                claim.update(json.loads(request.content))
+            return httpx.Response(204)
+
+        if path == "/rest/v1/rpc/finish_financial_refresh_run" and method == "POST":
+            body = json.loads(request.content)
+            refresh_date = body["p_refresh_date"]
+            claims = [c for c in self.refresh_claims.values() if c["refresh_date"] == refresh_date]
+            succeeded = sum(1 for c in claims if c["status"] == "succeeded")
+            failed = sum(1 for c in claims if c["status"] == "failed")
+            pending = sum(1 for c in claims if c["status"] not in ("succeeded", "failed"))
+            if pending > 0:
+                status = "partial_failed"
+            elif failed == 0:
+                status = "succeeded"
+            elif succeeded == 0 and claims:
+                status = "failed"
+            else:
+                status = "partial_failed"
+            run = self.refresh_runs.get(refresh_date)
+            if run is not None:
+                run.update(
+                    {
+                        "finished_at": datetime.now(UTC).isoformat(),
+                        "status": status,
+                        "attempted_tickers": succeeded + failed,
+                        "succeeded_tickers": succeeded,
+                        "failed_tickers": failed,
+                    }
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "status": status,
+                    "total": len(claims),
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "pending": pending,
+                },
+            )
+
+        if path == "/rest/v1/rpc/store_ticker_snapshot" and method == "POST":
+            if self.fail_snapshot_writes:
+                return httpx.Response(503, json={"message": "database unavailable"})
+            body = json.loads(request.content)
+            self.snapshot_store_calls.append(body)
+            version = body["p_snapshot_version"]
+            ticker = body["p_ticker"]
+            # Mirrors the RPC: immutable insert (ON CONFLICT DO NOTHING) +
+            # mutable head upsert in one call.
+            self.snapshots.setdefault(
+                version,
+                {"snapshot_version": version, "ticker": ticker, "snapshot": body["p_snapshot"]},
+            )
+            self.snapshot_heads[ticker] = {
+                "ticker": ticker,
+                "snapshot_version": version,
+                "verified_at": datetime.now(UTC).isoformat(),
+                "refresh_status": body.get("p_refresh_status") or "bootstrap_snapshot",
+            }
+            return httpx.Response(204)
 
         raise AssertionError(f"unexpected fake-Supabase request: {method} {path}")
 

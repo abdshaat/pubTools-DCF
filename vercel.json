@@ -1,0 +1,6 @@
+{
+  "crons": [
+    { "path": "/internal/cron/refresh-financials", "schedule": "0 22 * * *" },
+    { "path": "/internal/cron/refresh-financials", "schedule": "0 23 * * *" }
+  ]
+}

@@ -31,7 +31,6 @@ _ENDPOINTS = {
     "balance": "balance-sheet-statement",
     "cash_flow": "cash-flow-statement",
     "profile": "profile",
-    "quote": "quote",
 }
 
 
@@ -53,7 +52,6 @@ def build(ticker: str) -> None:
         balance=(sections["balance"],),
         cash_flow=(sections["cash_flow"],),
         profile=sections["profile"],
-        quote=sections["quote"],
     )
     base = normalize_fmp_fundamentals(fundamentals)
 

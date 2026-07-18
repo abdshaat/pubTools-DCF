@@ -694,6 +694,16 @@ timestamp) are fixed above. **Still outstanding:**
 
 ## Phase 7 — HTTP caching and canonical requests
 
+> **Superseded for the valuation endpoint by ADR-008 (implemented 2026-07-18).**
+> `/v1/valuations/*` responses carry a live, never-cached Finnhub price and are
+> now `Cache-Control: no-store`: the ETag/If-None-Match/304 handling, `Vary`,
+> the public/edge cache, and the peek/deferred-consume quota split (which
+> existed only so 304s could be free) were all removed. Quota is back to one
+> atomic `check_and_increment` pre-flight and `X-RateLimit-*` headers returned
+> to all valuation responses (safe again — nothing shared can cache them).
+> This phase's design below is kept as the historical record; `compute_etag`
+> lives on only in git history (`app/http_cache.py` was deleted).
+
 Goal: fulfill the GET endpoint's caching design safely. This phase is
 "HTTP-protocol semantics only" (headers, ETags, canonical-key logic,
 conditional requests) -- no new caching *store* is introduced. Every request,
@@ -1017,17 +1027,17 @@ request, never break one.
 |---|---|---|---|
 | `dcf:v1:fund:{TICKER}` | canonical normalized snapshot (the same JSON already fingerprinted for `data_version`) | 48h | current when produced by the latest successful daily run; older entries may be served only with explicit stale/refresh-failed metadata |
 | `dcf:v1:profile:{TICKER}` | raw provider profile dict | 48h | same daily-run freshness rule as `fund:` |
-| `dcf:v1:quote:{TICKER}` | `{price, price_as_of, fetched_at}` | 48h | same daily-run freshness rule; the API must disclose the price timestamp and must not describe it as an intraday/current quote |
 | `dcf:v1:neg:{TICKER}` | `{error: "ticker_not_found"\|"ticker_not_covered"\|"unsupported_sector", message}` — reconstructed via an explicit registry; unknown `error` → miss | 4h | fresh for full TTL |
-| `dcf:v1:resp:{TICKER}:{sha256 of canonical assumption string + model_version}` | full `ValuationResponse` JSON **minus `request_id`/`computed_at`** | 60s (= `s-maxage`) | fresh for full TTL |
 | `dcf:v1:lock:fund:{TICKER}` | random holder token | 45s (`PX`) | n/a (lock) |
 | `dcf:v1:login:{ip}:{yyyy-mm-dd}` | integer counter (raw `INCR`, no envelope) | expires end of UTC day | n/a (counter) |
 
 The 48-hour TTL keeps one prior daily result available through a missed or
 failed refresh window. Freshness is determined from durable daily-run/head
-metadata, not merely from Redis age. The pre-ADR-007 4h statement and
-60s/15m quote rules remain implemented in Slice A and must be replaced in
-Slice C before the daily-only provider policy can be claimed as active.
+metadata, not merely from Redis age. The pre-ADR-007 4h statement rule
+remains implemented in Slice A and must be replaced in Slice C before the
+daily-only provider policy can be claimed as active. (The former
+`dcf:v1:quote:`/`dcf:v1:resp:` keys were removed by ADR-008 — no price or
+response is cached anywhere.)
 
 L1 entries must also carry the durable refresh generation/status and have a
 hard expiry no later than the next 6 PM Eastern refresh-window boundary. Once
@@ -1126,9 +1136,10 @@ the newest stored statements with their exact timestamps and refresh status.
   refresh inclusion.
 - For an existing but stale snapshot, customer traffic never calls FMP. Return
   the stored snapshot with `freshness_status`, `last_refresh_attempt_at`,
-  `last_refresh_success_at`, `next_refresh_window_at`, statement and price
-  timestamps, and a warning when the latest cycle is due, running, partial, or
-  failed.
+  `last_refresh_success_at`, `next_refresh_window_at`, statement timestamps,
+  and a warning when the latest cycle is due, running, partial, or failed.
+  (Price fields are live per request — ADR-008 — and carry their own
+  `price_as_of`/`price_fetched_at`.)
 - Acquire a job-level Redis lock and per-ticker locks, use bounded concurrency,
   and make all writes idempotent. Vercel does not retry failed cron invocations,
   so persist per-ticker attempt/success/failure state for operational recovery.
@@ -1142,18 +1153,19 @@ the newest stored statements with their exact timestamps and refresh status.
   and cash-flow records form one complete compatible period. Provider delay,
   partial data, or refresh failure leaves the prior head active and records a
   customer-visible warning/status until the next daily cycle.
-- On each successful ticker promotion, rotate its shared cache generation,
-  replace Redis fundamentals/profile/quote entries, and ensure pre-window L1
-  entries have already expired. Edge/response-cache staleness remains bounded
-  by its documented 60-second cache-control window and the payload still exposes
-  the underlying statement and price timestamps.
+- On each successful ticker promotion, replace the Redis fundamentals/profile
+  entries and ensure pre-window L1 entries have already expired. (There is no
+  response cache, `quote:` key, or response-cache generation to rotate —
+  ADR-008; responses are `no-store`, so nothing downstream can carry stale
+  data past the request.)
 
 Suggested freshness statuses: `current_as_of_daily_refresh`,
 `daily_refresh_due`, `daily_refresh_running`, `daily_refresh_partial_failed`,
 `daily_refresh_failed`, and `bootstrap_snapshot`. `next_refresh_window_at` is
 deterministic schedule metadata; it is not a claim that a company will file at
-that time. Because quotes are refreshed daily too, responses must expose
-`price_as_of`/`price_fetched_at` and avoid implying real-time pricing.
+that time. The price is live from Finnhub on every request (ADR-008) and
+carries its own `price_as_of`/`price_fetched_at`; only statement/profile
+freshness is governed by the daily refresh.
 
 **Implementation status:** Slice A's current code still implements the older
 request-time provider refresh and 60s/15m quote policy. Do not claim the daily
@@ -1170,7 +1182,7 @@ Layered on top of (not replacing) the existing in-process task coalescing:
    - **Winner:** follow the DB read-through flow. A customer request fetches
      from the provider only for a genuinely cold ticker; the daily cron owns
      refreshes for existing snapshots. After any provider success, persist DB,
-     populate `profile:`/`quote:`/`fund:` (fund last), then release via
+     populate `profile:`/`fund:` (fund last; no `quote:` — ADR-008), then release via
      compare-and-delete (`EVAL`: delete only if the stored token matches ours —
      never delete a successor's lock after our own TTL expired).
    - **Loser:** poll the `fund:` key every 200ms for up to 3s; if it appears,
@@ -1184,7 +1196,10 @@ Layered on top of (not replacing) the existing in-process task coalescing:
    plus capped retry delays. Losers still poll for only 3s before falling
    through, so a crashed holder never blocks a valuation for the lock TTL.
 
-### Valuation response cache
+### Valuation response cache (RETIRED by ADR-008 — historical design)
+
+> Implemented in Slice B, then removed 2026-07-18 with the Finnhub live-price
+> feature: no valuation response is cached anywhere. Kept for the record only.
 
 Closes Phase 7's documented "a 304 is quota-free but not compute-free"
 caveat: repeat requests (fresh 200 *and* conditional 304) within the TTL are
@@ -1241,8 +1256,7 @@ as the fallback when Redis is unconfigured or down.
   mutate historical snapshots).
 - Table `ticker_snapshot_heads`: `ticker text primary key`, `snapshot_version
   text not null references normalized_snapshots(snapshot_version)`,
-  `verified_at timestamptz not null`, `last_quote jsonb`, `quote_verified_at
-  timestamptz`, `last_requested_at timestamptz`,
+  `verified_at timestamptz not null`, `last_requested_at timestamptz`,
   `last_refresh_attempt_at timestamptz`,
   `last_refresh_success_at timestamptz`, `refresh_status text`, and
   `updated_at timestamptz not null default now()`. This table
@@ -1270,19 +1284,18 @@ as the fallback when Redis is unconfigured or down.
   same-day claim during bootstrap or joins the following day's manifest.
 - Read path: query the head and referenced snapshot in one RPC/query by ticker.
   Return a typed record containing the immutable normalized payload plus
-  verification/quote timestamps. A missing, malformed, wrong-ticker, future-
+  verification timestamps. A missing, malformed, wrong-ticker, future-
   dated, or beyond-max-staleness record is a miss; malformed records are logged
   and never passed into the engine.
-- Write path: on a provider-backed fundamentals load, compute the quote-free
+- Write path: on a provider-backed fundamentals load, compute the price-free
   `snapshot_version`, then in one transaction/RPC `insert ... on conflict do
   nothing` for the immutable snapshot and upsert the ticker head with the new
-  `verified_at`/last quote. Await this call before publishing Redis and before
+  `verified_at`. Await this call before publishing Redis and before
   returning/completing the claim (Vercel gate: no post-response background
   work). Failure leaves the prior head active and fails that bootstrap/claim.
-- The daily cycle updates `last_quote` and `quote_verified_at` on the head in the
-  same provider-backed promotion. It does not create quote-history rows. This
-  permits Redis-loss recovery while retaining the Phase 12 deferral of durable
-  quote history.
+- No quote is stored on the head or anywhere else (ADR-008: the price is live
+  from Finnhub per request and may not be cached or persisted; durable quote
+  history stays deferred).
 - The public response's existing `data_version` currently hashes the combined
   fundamentals and quote. It is deliberately distinct from internal
   `snapshot_version`. Phase 8 guarantees durable normalized financial
@@ -1342,18 +1355,29 @@ as the fallback when Redis is unconfigured or down.
   self-healing, TTL expiry, Redis-down fail-open, fingerprint properties,
   cross-instance login limiting, UTC-day reset, limiter fail-open.
   Suite: 276 → 292 passing, 94.04% coverage; ruff/format/mypy clean.
-- [ ] **Slice C — migration 003 + DB read-through/snapshot writes.** SQL
-  migration for immutable snapshots and mutable ticker heads; quote-free,
-  price-free snapshot fingerprint; typed Supabase read/write methods;
-  **L1 → Redis → DB → FMP(cold only)** orchestration (the customer-request read
-  path); DB-hit cache repopulation; transactional insert+head-upsert path;
-  durable daily run/claim manifest; secured dual `0 22 * * *`/`0 23 * * *`
-  Vercel Cron configuration with Eastern-hour/date guard; bounded-concurrency
-  processing of every database ticker; customer freshness metadata;
-  fake-Supabase handlers; freshness, cold-bootstrap, no-request-time-FMP for
-  existing tickers, duplicate-cron, EST/EDT guard, complete-manifest
-  reconciliation, partial-run, 6-PM L1 cutoff, malformed-row, DB-down,
-  immutability, conflict, and write-before-cache-before-response ordering tests.
+- [ ] **Slice C — migration 003 + DB read-through/snapshot writes.**
+  **Part 1 implemented 2026-07-18** (see PROGRESS.md): migration 003 drafted
+  (tables + `store_ticker_snapshot` RPC; run-orchestration RPCs pending; not
+  yet applied), price-free snapshot fingerprint, typed Supabase read/write
+  methods, **L1 → Redis → DB → FMP(cold only)** orchestration with DB-hit
+  cache repopulation and write-before-cache-before-return ordering,
+  `SnapshotStoreError` fail-closed 503, fake-Supabase handlers, and the
+  cold-bootstrap / no-request-time-FMP / malformed-row / DB-down / conflict /
+  ordering tests (20 new; suite 311). **Part 2 — the scheduler — implemented
+  2026-07-18** (see PROGRESS.md): `begin/finish_financial_refresh_run` RPCs
+  (atomic date claim, full manifest, claim-derived reconciliation — pending
+  claims force `partial_failed`), `app/refresh.py` runner with the
+  `America/New_York` 18:00-hour guard over both UTC schedules,
+  `FundamentalsService.refresh_from_provider`
+  (`current_as_of_daily_refresh`), the `CRON_SECRET`-protected
+  `GET /internal/cron/refresh-financials`, `vercel.json` crons at
+  `0 22 * * *` + `0 23 * * *`, and 14 tests (EST/EDT guard, duplicate-cron
+  no-op, complete-manifest reconciliation, partial-run isolation, endpoint
+  auth; suite 325). **Part 3 remains:** the 6-PM L1 hard-expiry cutoff
+  (warm instances must not serve pre-window L1 data as current),
+  structured customer freshness metadata beyond `data_quality_warnings`
+  (`freshness_status`, `next_refresh_window_at`, last attempt/success), and
+  live verification with the real Upstash/Supabase/cron wiring.
   **Per ADR-008 this slice must NOT include a `quote:` cache, a `resp:` response
   cache, or response-cache generation rotation** (those are removed by the
   Finnhub feature; see `issues.MD`); the daily cycle refreshes statements/profile
@@ -1404,12 +1428,12 @@ Exit criteria:
   popularity, or budget-based omission.
 - [ ] The UTC schedules and `America/New_York` guard produce exactly one claimed
   daily run during the 6 PM Eastern hour in both EST and EDT tests.
-- [ ] Responses expose last attempt/success, next refresh window, statement and
-  price timestamps, and accurately warn when the latest daily run is due,
-  partial, or failed.
-- [ ] A pre-window L1 or response-cache entry cannot remain silently current
-  after its ticker is promoted; tests cover warm instances spanning 6 PM and
-  bound edge/response-cache carryover to 60 seconds with visible data timestamps.
+- [ ] Responses expose last attempt/success, next refresh window, and statement
+  timestamps, and accurately warn when the latest daily run is due, partial, or
+  failed (price timestamps ride on the live quote — ADR-008).
+- [ ] A pre-window L1 entry cannot remain silently current after its ticker is
+  promoted; tests cover warm instances spanning 6 PM. (No response/edge cache
+  exists to carry anything — responses are `no-store`.)
 - [ ] Login rate limiting is enforced across instances, not per instance.
 - [x] Corrupt/foreign/unknown-version Redis entries are treated as misses and
   cleaned up, never surfaced as errors. Verified 2026-07-13 by envelope and

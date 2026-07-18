@@ -15,9 +15,14 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from . import MODEL_VERSION
 from .models import Assumptions, BaseFinancials, SensitivityGrid, Valuation
+from .normalization import NormalizedQuote
 
 
 class BaseFinancialsOut(BaseModel):
+    """The cached statement snapshot the math ran on. Deliberately carries no
+    market price (ADR-008): the live price is a top-level response field
+    sourced from Finnhub per request, never part of this snapshot."""
+
     ticker: str
     source_period: str
     revenue: float
@@ -27,7 +32,6 @@ class BaseFinancialsOut(BaseModel):
     delta_nwc: float
     net_debt: float
     diluted_shares: float
-    current_price: float
 
 
 class ResolvedAssumptionsOut(BaseModel):
@@ -96,8 +100,11 @@ class ValuationResponse(BaseModel):
     enterprise_value: float
     equity_value: float
     intrinsic_value_per_share: float
-    current_price: float
-    upside_pct: float
+    # Live market comparison from Finnhub (ADR-008). null when the live price
+    # is unavailable (Finnhub outage, unrecognized symbol, or feature off) —
+    # the DCF math above is still returned in that case, with a warning.
+    current_price: float | None
+    upside_pct: float | None
     warnings: list[str]
     sensitivity: SensitivityOut | None = None
 
@@ -211,9 +218,16 @@ def build_valuation_response(
     sensitivity: SensitivityGrid | None = None,
     request_id: str = "internal",
     computed_at: datetime | None = None,
+    quote: NormalizedQuote | None = None,
+    price_warning: str | None = None,
 ) -> ValuationResponse:
+    # data_version fingerprints the statement snapshot only — BaseFinancials
+    # is price-free by construction, so the live quote never shifts it.
     snapshot = json.dumps(asdict(base), sort_keys=True, separators=(",", ":"), default=str)
     data_version = f"sha256:{hashlib.sha256(snapshot.encode()).hexdigest()}"
+    upside_pct = None
+    if quote is not None:
+        upside_pct = (valuation.intrinsic_value_per_share - quote.price) / quote.price * 100
     return ValuationResponse(
         sensitivity=(
             SensitivityOut(
@@ -232,8 +246,8 @@ def build_valuation_response(
         currency=base.currency,
         monetary_unit="raw_currency_units",
         fundamentals_as_of=base.fundamentals_as_of,
-        price_as_of=base.price_as_of,
-        price_fetched_at=base.price_fetched_at,
+        price_as_of=quote.price_as_of if quote is not None else None,
+        price_fetched_at=quote.fetched_at if quote is not None else None,
         fiscal_year=base.fiscal_year,
         statement_period=base.statement_period,
         filing_date=base.filing_date,
@@ -251,7 +265,6 @@ def build_valuation_response(
             delta_nwc=base.delta_nwc,
             net_debt=base.net_debt,
             diluted_shares=base.diluted_shares,
-            current_price=base.current_price,
         ),
         assumptions=ResolvedAssumptionsOut(
             wacc=assumptions.wacc,
@@ -285,7 +298,11 @@ def build_valuation_response(
         enterprise_value=valuation.enterprise_value,
         equity_value=valuation.equity_value,
         intrinsic_value_per_share=valuation.intrinsic_value_per_share,
-        current_price=valuation.current_price,
-        upside_pct=valuation.upside_pct,
-        warnings=[*base.data_quality_warnings, *valuation.warnings],
+        current_price=quote.price if quote is not None else None,
+        upside_pct=upside_pct,
+        warnings=[
+            *base.data_quality_warnings,
+            *valuation.warnings,
+            *([price_warning] if price_warning else []),
+        ],
     )

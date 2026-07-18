@@ -1,5 +1,206 @@
 # Progress Log
 
+## 2026-07-18 — ADR-008 Slices 2+3+4 (live Finnhub price, structural change) + Phase 8 Slice C parts 1–2 (durable snapshots, DB read-through, daily-refresh scheduler)
+
+> The session that implemented this timed out before it could write this entry;
+> backfilled at the start of the next session from `issues.MD`'s slice record
+> plus a fresh full verification of the working tree. All of it is uncommitted.
+
+The route rewrite, cache retirement, and docs landed as one unit (Slices 2–4 of
+the `issues.MD` Finnhub feature). Owner resolutions made before implementation:
+(a) **quota flow simplified** — one atomic `check_and_increment` pre-flight
+replaces the peek/deferred-consume split (which existed only so 304s could be
+free; there are no 304s under `no-store`), and `X-RateLimit-*` headers return on
+all valuation responses; (b) a **Finnhub unknown-symbol for an FMP-served ticker
+degrades like an outage** (null price + warning, never a 404/502); (c)
+**`model_version` 0.1.0 → 0.2.0** for the nullable-price schema change (OpenAPI
+snapshot regenerated).
+
+- **Engine/model split:** `BaseFinancials` and `Valuation` carry **no price
+  fields at all** (stronger than Optional — a cached snapshot cannot represent
+  a price by construction); `compute_dcf` dropped its `current_price > 0`
+  precondition and internal upside math; upside is computed in
+  `build_valuation_response(quote=...)` from the live quote.
+- **Route:** statements via the fundamentals cache → live Finnhub fetch →
+  fresh `compute_dcf` → `Cache-Control: no-store`. Any Finnhub failure
+  (outage, rate limit, unknown symbol, auth misconfig, feature off) degrades
+  to null price/upside + a warning. `app.state.finnhub` is lifespan-wired
+  (auto-enable on `FINNHUB_API_KEY`, injectable for tests).
+- **Removed:** `app/response_cache.py`, `app/http_cache.py`, the ETag/304
+  branch, `Vary`, the peek phase, `FundamentalsService`'s quote cache
+  (L1 + Redis `quote:` + stale-quote logic), the FMP `quote` endpoint from
+  `fetch_fundamentals` (cold load is now 4 FMP calls, not 5),
+  `FMPClient.fetch_quote`, and `normalize_fmp_quote`. Login-limiter tests
+  moved to `tests/test_login_rate_limit.py`.
+- **Docs:** README + `docs/index.html` "Live price & caching" rewritten;
+  examples/version strings at 0.2.0; `base_financials` example is price-free.
+- **Live-verified** against real uvicorn with real FMP+Finnhub keys (AAPL live
+  price, null-price degrade with the key blanked — details in `issues.MD`).
+- **Suite 323 → 291 passing** (net of the removed cache tests), 94.08%
+  coverage; ruff/format clean.
+
+**Continuation session (same day, after the timeout):** re-verified the tree
+(291 passing, 94.08%, ruff/format clean) and found the one thing the interrupted
+session missed — **mypy failed in `scripts/`**: `scripts/smoke_fetch.py` still
+printed `valuation.current_price`/`upside_pct` and read `current_price` off
+`BaseFinancials`, and `scripts/build_demo_snapshots.py` still passed `quote=` to
+`FMPFundamentals`. Both fixed to the price-free model; mypy is now clean across
+`app` + `scripts`. Also scrubbed the remaining pre-ADR-008 quote/response-cache
+references out of `IMPLEMENTATION_PLAN.md` Phase 8 (key table, migration-003
+head columns, single-flight/promotion/exit-criteria text) and added the Phase 7
+supersession note, closing the three "cross-doc updates required" boxes in
+`issues.MD`.
+
+**Same session — Phase 8 Slice C part 1 implemented (durable snapshots + DB
+read-through; scheduler still to come):**
+
+- **`supabase/migrations/003_phase8_snapshots.sql` (new, NOT yet applied):**
+  immutable `normalized_snapshots` (content-addressed by `snapshot_version` =
+  sha256 over the canonical price-free base payload — same recipe as the
+  response `data_version`, so a re-confirmed identical filing dedups via ON
+  CONFLICT DO NOTHING; UPDATE/DELETE revoked from every role incl.
+  service_role), mutable `ticker_snapshot_heads`, the `financial_refresh_runs`
+  / `financial_refresh_claims` ledger for the daily job, and the
+  `store_ticker_snapshot` RPC (atomic snapshot insert + head upsert,
+  service-role-only execute, same lockdown as 001). Run-orchestration RPCs
+  land with the scheduler; the file may be extended until first applied.
+- **`SupabaseClient.get_ticker_snapshot`** (head + snapshot in one PostgREST
+  FK-embed query; typed `TickerSnapshotRecord`; malformed rows → None so a
+  bootstrap repairs them; HTTP errors raise = fail-closed) and
+  **`.store_ticker_snapshot`** (the RPC call, awaited before any cache write).
+- **`FundamentalsService` read order is now L1 → Redis → DB → FMP(cold only)**
+  behind a new injectable `snapshots=` store (None → exactly the old behavior;
+  auto-wired to the Supabase client in `create_app`). An existing DB ticker is
+  served as stored — **customer requests never trigger FMP for it**, including
+  the old request-time profile refresh (gated off when the store is
+  configured); stale DB data gets a "scheduled refresh pending" warning with
+  its `verified_at`. A store **error is not a miss** (new `SnapshotStoreError`
+  → 503 `snapshot_store_unavailable`, `no-store`): degrade to a bounded stale
+  cache copy when one exists, otherwise fail closed — never an FMP fallback. A
+  cold bootstrap awaits the durable write **before** publishing Redis
+  (`fund:` stays the last-written commit marker) and before returning; a
+  failed write publishes nothing and caches nothing.
+- **Tests: 20 new in `tests/test_snapshots.py`** (DB-hit zero-FMP serve, L1+L2
+  hydration across instances, stale-serve warning, no-request-time-refresh with
+  aged caches, cold bootstrap persists + dedup on reconfirmation,
+  db-write-before-redis ordering via event log, store-failure publishes
+  nothing + retry recovers, read-outage fail-closed with cold caches vs
+  bounded-stale serve with warm ones, malformed/wrong-ticker/future-dated row
+  repair, fingerprint stability, typed-record parsing, route-level 503).
+  `tests/fake_supabase.py` gained head/snapshot/store handlers + outage
+  toggles; the strict Supabase call-order test now asserts
+  lookup → last_used → quota → snapshot_read → snapshot_store → usage.
+- **Suite: 291 → 311 passing, 93.73% coverage** (93% floor); ruff/format/mypy
+  clean.
+
+**Same session — Slice C part 2 implemented: the daily 6 PM Eastern refresh
+scheduler:**
+
+- **Migration 003 extended (now complete, still unapplied):**
+  `begin_financial_refresh_run` (atomic Eastern-date claim via the
+  `refresh_date` PK insert + full-manifest pending claims for **every**
+  `ticker_snapshot_heads` row — no filter, no budget skip; duplicate delivery
+  gets `already_claimed`) and `finish_financial_refresh_run` (counts
+  reconciled **from the claims**; any still-pending claim forces
+  `partial_failed` — a ticker cannot disappear silently). Same
+  service-role-only execute lockdown as 001.
+- **New `app/refresh.py`:** `DailyRefreshRunner.run_if_in_window()` — converts
+  the injectable wall clock to `America/New_York`, proceeds only in the 18:xx
+  local hour (so of the two UTC crons exactly one passes in EST and in EDT),
+  claims the Eastern date, refreshes each manifest ticker under a 3-slot
+  semaphore, marks each claim succeeded/failed (`error_code` = exception class
+  name only — provider messages can embed URLs/keys and belong in no ledger),
+  and finishes with reconciled counts. A failed claim-completion write is
+  swallowed: the pending claim is itself the durable "not confirmed" signal.
+  A Redis job lock was deliberately **not** added — the plan allows it only as
+  extra concurrency control, and the transactional date claim already makes a
+  second same-day run impossible.
+- **`FundamentalsService.refresh_from_provider()`** — the scheduled path:
+  fetch + normalize, persist via the shared `_persist_snapshot` (status
+  `current_as_of_daily_refresh`), then replace L1/Redis (`fund:` last). Never
+  called from customer requests; failures propagate so the runner fails that
+  claim while the prior head/caches stay active.
+- **`GET /internal/cron/refresh-financials`** (excluded from OpenAPI):
+  `Authorization: Bearer {CRON_SECRET}` checked with `hmac.compare_digest`,
+  one generic 401 for unconfigured/missing/mismatch; 503
+  `refresh_not_configured` when Supabase (and thus the ledger) is absent;
+  otherwise returns the runner's summary, `no-store`. New **`vercel.json`**
+  schedules it at both `0 22 * * *` and `0 23 * * *` (crons are the file's
+  only key — serving stays on `[tool.vercel]`). `CRON_SECRET` is read at app
+  construction; `tests/conftest.py` isolation now clears it.
+- **`tzdata` added as a Windows-only runtime dependency** (platform marker) so
+  `zoneinfo.ZoneInfo("America/New_York")` works on the dev machine; Linux/
+  Vercel uses the system tz database and installs nothing new.
+- **Tests: 14 new in `tests/test_refresh.py`** — EDT window (22 UTC runs,
+  23 UTC no-ops) and EST window (23 UTC runs, 22 UTC no-ops) with the exact
+  `scheduled_window_at` instants asserted; duplicate delivery spends zero
+  provider calls; a 2-ticker manifest run end-to-end through the Supabase fake
+  (claims/run/heads/Redis all verified, 4 FMP calls per ticker, no quote); one
+  failing ticker → its claim fails with a bounded code, the run ends
+  `partial_failed`, its prior head stays active, pending = 0; empty-manifest
+  run; `refresh_from_provider` cache replacement + store-required guard;
+  endpoint auth (no secret configured / missing / wrong / correct), 503
+  unconfigured, and a full endpoint-to-ledger integration run with the
+  lifespan-built runner. `tests/fake_supabase.py` gained run/claim handlers
+  mirroring the RPC semantics.
+- **Suite: 311 → 325 passing, 93.58% coverage** (93% floor); ruff/format/mypy
+  clean.
+
+**⚠️ Deploy-ordering gate:** once this code deploys with Supabase configured, a
+missing migration-003 table is a **storage error (503 on cold tickers), not a
+miss** — apply migration 003 (now final) before deploying, exactly like
+001/002, and set `CRON_SECRET` in Vercel Production before relying on the
+cron. Nothing is committed yet, so production is unaffected today.
+
+**Next (Slice C part 3 / remaining):** the 6 PM Eastern L1 hard-expiry
+boundary (a warm instance must not serve pre-window L1 data as current after
+the window; due/running data must not be re-cached as current), structured
+freshness fields in the response (`freshness_status`,
+`next_refresh_window_at`, last attempt/success — today only
+`data_quality_warnings` carries freshness), then live verification — blocked
+on TODO §4 (env pull, `CRON_SECRET`, migration apply, FMP capacity gate).
+
+## 2026-07-17 — TODO answers processed; Finnhub Slice 1 implemented (client + normalization)
+
+Processed the owner's answers written into `project-docs/TODO.md`:
+
+- **2.1 Course Portfolio page: dropped permanently** (owner: "completely
+  unnecessary"). The nav link was already removed; item closed.
+- **2.2 Domain:** owner observed "ashaat.dev now redirects"; live re-verified —
+  the apex still 308s to **www** (www remains primary, unchanged from
+  2026-07-16). Sign-in works through the query-preserving 308; flipping to
+  apex-primary (TODO 1.4c) stays open as a fragility, not a blocker.
+- **2.3 Unused images: yes** — added an **AWS Certified Cloud Practitioner**
+  card to `docs/portfolio.html`'s certifications section with its logo (copied
+  into `docs/Pics/`). **No date was invented — owner must supply the earned
+  date (or "in progress")** for the card. The other three images stay skipped
+  (two are non-transparent duplicates; the Java logo has no section).
+- **2.4 Phase 15: keep on hold** — recorded; plan already says so.
+
+**Started the ADR-008 architecture shift — Slice 1 complete** (the only part
+workable without a Finnhub key; no route wiring, so production behavior is
+unchanged):
+
+- New `app/providers/finnhub.py`: `FinnhubConfig.from_env()` auto-enable
+  pattern, `FinnhubClient.fetch_quote()` (3s timeout, **no retries** — the
+  caller will degrade to a null price rather than wait out a ladder),
+  401/403 → `ProviderAuthError`, 429/5xx/unsupported → `ProviderError`,
+  all-zero body (Finnhub's unknown-symbol shape) → `TickerNotFoundError`.
+  Transport exceptions are **chained, never interpolated** into messages so the
+  URL-embedded token cannot leak (deliberate deviation from the FMP client).
+- New `normalize_finnhub_quote()` in `app/normalization.py`: `c`→price,
+  `t`→`price_as_of` (UTC; `t == 0` means absent), non-finite/≤0 rejected.
+- 25 tests in `tests/test_finnhub.py` via `httpx.MockTransport` in the repo's
+  sync + `asyncio.run` style (the repo has no async pytest plugin — first
+  draft used `@pytest.mark.anyio` and was rewritten after checking).
+- **Suite 298 → 323 passing, 94.25% coverage; ruff/format/mypy clean.**
+
+**Next:** Slice 2 (decouple `compute_dcf` from `current_price`, live-price
+injection in the route, `no-store`) — needs no key to build, but live
+verification and production activation wait on TODO §3 (`FINNHUB_API_KEY` in
+Vercel + `.env`). Slices 2–3 must land together with the key configured, or
+production would lose the FMP quote path with nothing replacing it.
+
 ## 2026-07-16 — Phase 9 created and Slices 1–2 implemented: public site (portfolio + API directory)
 
 User asked (urgent) to merge their standalone HTML/CSS portfolio into this
@@ -905,52 +1106,54 @@ specs live in CLAUDE.md; this file is only the running state.
 ## Current state (TL;DR)
 
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
-  positive and negative TTL caching, FastAPI route/error mapping, customer docs,
-  real-key/live endpoint verification, and 292 passing tests (94.04% coverage,
-  93% floor). Supabase auth, quotas, and usage metering are live-verified end
-  to end against a real Supabase project — real 401s for bad keys, real 200s
-  with quota headers for valid keys. CSRF token enforcement
-  (`pt_csrf`/`X-CSRF-Token`) and peppered API-key hashing
-  (`API_KEY_HASH_PEPPER`) are implemented. **Phase 6 is functionally
-  complete except email verification/CAPTCHA/session hardening** (all
-  explicitly deferred, not blocking): GitHub OAuth + email magic-link
-  sign-in, self-service key list/create/rotate/revoke/**rename** are
-  implemented and **user-confirmed working live in production** (after
-  fixing the `PUBLIC_BASE_URL` and `csrfHeaders` scope bugs below) — see
-  `IMPLEMENTATION_PLAN.md` Phase 6 for the itemized done/partial/deferred
-  status. **Phase 7 (HTTP caching + exact quota enforcement) is implemented
-  and live-verified in production**, including the consume-result race fix
-  and pre-flight `no-store` headers; only Vercel-edge `s-maxage` verification
-  remains (needs a temporary production API key, not yet created). **Phase 8
-  Slices A and B are implemented:** lifespan-scoped Upstash REST client,
-  versioned fundamentals/profile/quote/negative L2 caches, distributed
-  single-flight, corruption cleanup, bounded stale fallback, Redis-down
-  fail-open, the distributed valuation response cache (hits skip FMP and the
-  DCF recompute, identical ETag, still metered, generation-aware key), and
-  the cross-instance Redis login limiter are all tested. The
-  public-vs-private cache tradeoff was explicitly re-confirmed by the user
-  2026-07-13: keep it public, no route split. Migration 002 is applied, the
-  GitHub OAuth App is configured in Supabase, and all five env vars are set
-  in Vercel Production. `project-docs/REQUEST_FLOW.md` is the current detailed
-  code-location reference for all origin, valuation, auth, account, and
-  supporting-route flows; it explicitly separates live Slice A/B behavior from
-  planned Slice C.
-- **In progress:** **Phase 8 Slices A+B are complete; Slice C and live
-  verification remain.** Upstash is provisioned in Vercel; local REST vars have
-  not been pulled. Next implementation step is Slice C (migration 003, DB
-  read-through, immutable snapshot/current-head writes, and the final daily
-  all-ticker scheduler). Slice C must remove existing-ticker request-time FMP
-  calls—including quote calls—and add the dual UTC schedules, Eastern guard,
-  durable run manifest, complete-ticker reconciliation, cache-generation
-  rotation, and freshness/price-age warnings. Phase 0's Vercel preview
-  verification remains. Preview env has no Supabase vars (auth off in
-  previews). Before relying on email login for real customer volume,
-  configure custom SMTP in Supabase (its default email sending is
-  rate-limited/dev-oriented). `issues.MD` tracks smaller open items from the
-  2026-07-13 sessions.
-- **Not started:** Phase 8 durable snapshot writes, external object storage,
-  advanced DCF drivers, and Phase 14 (splitting
-  docs/index.html into a separate frontend from the API).
+  FastAPI route/error mapping, customer docs, real-key/live endpoint
+  verification, and **325 passing tests (93.58% coverage, 93% floor)**;
+  ruff/format/mypy clean (`app` + `scripts`). Supabase auth, quotas, and usage
+  metering are live-verified end to end. CSRF enforcement
+  (`pt_csrf`/`X-CSRF-Token`) and peppered API-key hashing are implemented.
+  **Phase 6** (GitHub OAuth + email magic-link sign-in, self-service key
+  list/create/rotate/revoke/rename) is functionally complete and confirmed
+  live, except explicitly deferred email-verification/CAPTCHA items.
+  **Phase 9 public site is committed and live on `ashaat.dev`** (portfolio at
+  `/`, `/apis` directory, DCF at `/dcf`). **ADR-008 is implemented
+  (uncommitted, model 0.2.0):** the market price is fetched **live from
+  Finnhub on every request and cached nowhere**; `/v1/valuations/*` is
+  `Cache-Control: no-store`; `BaseFinancials`/`Valuation` are price-free by
+  construction; upside is computed at the API layer from the live quote; any
+  Finnhub failure degrades to null price + warning. The Phase 7 ETag/304/
+  public-cache handling and the Phase 8 Slice B response cache are **retired**
+  for this endpoint, and the quota flow is back to one atomic
+  `check_and_increment` with `X-RateLimit-*` on all valuation responses.
+  **What remains of Phase 8 Slices A+B:** the statement cache — L1 +
+  Redis `fund:`/`profile:`/`neg:` + distributed single-flight (N
+  differently-assumed valuations of one ticker cost one FMP statement fetch)
+  — and the cross-instance Redis login limiter. Migration 002 applied; all
+  needed env vars (incl. `FINNHUB_API_KEY`) are in Vercel Production.
+  `project-docs/REQUEST_FLOW.md` predates ADR-008 on the price/response-cache
+  path — trust `issues.MD`/ADRs where they disagree.
+- **In progress:** **Phase 8 Slice C — parts 1 and 2 are implemented
+  (uncommitted):** migration 003 is complete (immutable
+  `normalized_snapshots`, mutable `ticker_snapshot_heads`, run/claim ledger,
+  `store_ticker_snapshot` + `begin/finish_financial_refresh_run` RPCs; NOT
+  yet applied — must be applied before this code deploys), the DB
+  read-through is live in code (L1 → Redis → DB → FMP cold-only; store errors
+  fail closed via `SnapshotStoreError`/503; bootstrap awaits the DB write
+  before Redis/return; existing DB tickers never trigger request-time FMP),
+  and the daily 6 PM Eastern refresh exists end to end
+  (`app/refresh.py` runner, `GET /internal/cron/refresh-financials` with
+  `CRON_SECRET`, `vercel.json` crons at 22+23 UTC with the
+  `America/New_York` guard, durable claims + reconciliation). **Part 3
+  remains:** the 6 PM L1 hard-expiry boundary, structured freshness response
+  fields (today freshness travels only in `data_quality_warnings`), and live
+  verification. Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
+  response cache, or response-cache generation rotation; the daily cycle
+  refreshes statements/profile only. Live wiring blocked on TODO §4 (env
+  pull, `CRON_SECRET` in Vercel, migration apply, FMP capacity). Preview env
+  still has no Supabase vars (auth off in previews); custom SMTP still
+  recommended before real email-login volume.
+- **Not started:** external object storage, advanced DCF drivers, and
+  Phase 15 (on hold — separate frontend split, superseded in practice by
+  Phase 9).
 - **Run tests:** `./.venv313/Scripts/python -m pytest -q` (current Windows/OneDrive
   recovery environment; standard clean setups may use `.venv`).
 - **Run server:** `./.venv313/Scripts/uvicorn app.api:app --reload` (needs

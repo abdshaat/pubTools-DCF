@@ -28,6 +28,7 @@ from .auth import (
     AuthFailure,
     AuthFailureReason,
 )
+from .fundamentals import TickerSnapshotRecord
 from .rate_limit import RateLimitResult
 
 
@@ -179,6 +180,141 @@ class SupabaseClient:
         if not isinstance(payload, list):
             raise SupabaseError("Supabase quota-usage lookup returned a non-list payload")
         return int(payload[0]["request_count"]) if payload else 0
+
+    # --- durable statement snapshots (Phase 8 Slice C) ---
+
+    async def get_ticker_snapshot(self, ticker: str) -> TickerSnapshotRecord | None:
+        """Head + referenced immutable snapshot in one PostgREST query (FK
+        embed). Returns None both for a confirmed miss (no head row) and for
+        a malformed row — the caller treats either as a miss so a bootstrap
+        can repair it; only transport/HTTP failures raise (fail-closed)."""
+        response = await self._client.get(
+            "/rest/v1/ticker_snapshot_heads",
+            params={
+                "ticker": f"eq.{ticker.upper()}",
+                "select": (
+                    "ticker,snapshot_version,verified_at,refresh_status,"
+                    "normalized_snapshots(snapshot)"
+                ),
+                "limit": "1",
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase snapshot lookup failed")
+        payload = response.json()
+        if not isinstance(payload, list):
+            raise SupabaseError("Supabase snapshot lookup returned a non-list payload")
+        if not payload:
+            return None
+        row = payload[0]
+        if not isinstance(row, dict):
+            return None
+        embedded = row.get("normalized_snapshots")
+        snapshot = embedded.get("snapshot") if isinstance(embedded, dict) else None
+        try:
+            verified_at = _parse_datetime(row.get("verified_at"))
+        except (SupabaseError, ValueError):
+            return None
+        ticker_value = row.get("ticker")
+        snapshot_version = row.get("snapshot_version")
+        refresh_status = row.get("refresh_status")
+        if (
+            not isinstance(snapshot, dict)
+            or verified_at is None
+            or not isinstance(ticker_value, str)
+            or not isinstance(snapshot_version, str)
+        ):
+            return None
+        return TickerSnapshotRecord(
+            ticker=ticker_value,
+            snapshot_version=snapshot_version,
+            verified_at=verified_at,
+            refresh_status=refresh_status if isinstance(refresh_status, str) else None,
+            snapshot=snapshot,
+        )
+
+    async def store_ticker_snapshot(
+        self,
+        *,
+        ticker: str,
+        snapshot_version: str,
+        snapshot: dict[str, Any],
+        provider: str,
+        fiscal_year: int | None,
+        statement_date: str | None,
+        currency: str | None,
+        refresh_status: str,
+    ) -> None:
+        """Atomic immutable-snapshot insert + head upsert via the migration
+        003 RPC. Awaited before any cache publication (ADR-006)."""
+        response = await self._client.post(
+            "/rest/v1/rpc/store_ticker_snapshot",
+            json={
+                "p_ticker": ticker.upper(),
+                "p_snapshot_version": snapshot_version,
+                "p_snapshot": snapshot,
+                "p_provider": provider,
+                "p_fiscal_year": fiscal_year,
+                "p_statement_date": statement_date,
+                "p_currency": currency,
+                "p_refresh_status": refresh_status,
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase snapshot store RPC failed")
+
+    # --- daily refresh run/claim ledger (Phase 8 Slice C) ---
+
+    async def begin_refresh_run(
+        self, *, refresh_date: str, scheduled_window_at: str
+    ) -> dict[str, Any]:
+        """Atomic Eastern-date claim + full-manifest creation via the
+        migration 003 RPC. `already_claimed: true` means another invocation
+        (duplicate cron delivery) owns this date — do nothing."""
+        response = await self._client.post(
+            "/rest/v1/rpc/begin_financial_refresh_run",
+            json={
+                "p_refresh_date": refresh_date,
+                "p_scheduled_window_at": scheduled_window_at,
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase refresh-run start RPC failed")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise SupabaseError("Supabase refresh-run start RPC returned an unexpected payload")
+        return payload
+
+    async def complete_refresh_claim(
+        self, *, ticker: str, refresh_date: str, status: str, error_code: str | None
+    ) -> None:
+        response = await self._client.patch(
+            "/rest/v1/financial_refresh_claims",
+            params={
+                "ticker": f"eq.{ticker.upper()}",
+                "refresh_date": f"eq.{refresh_date}",
+            },
+            headers={"Prefer": "return=minimal"},
+            json={
+                "status": status,
+                "completed_at": datetime.now(UTC).isoformat(),
+                "error_code": error_code,
+            },
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase refresh-claim update failed")
+
+    async def finish_refresh_run(self, *, refresh_date: str) -> dict[str, Any]:
+        response = await self._client.post(
+            "/rest/v1/rpc/finish_financial_refresh_run",
+            json={"p_refresh_date": refresh_date},
+        )
+        if response.status_code >= 400:
+            raise SupabaseError("Supabase refresh-run finish RPC failed")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise SupabaseError("Supabase refresh-run finish RPC returned an unexpected payload")
+        return payload
 
     # --- customer accounts / self-service keys (Phase 6) ---
 

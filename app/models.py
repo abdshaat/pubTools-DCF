@@ -6,7 +6,6 @@ unit-convention rule in CLAUDE.md.
 
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
 from typing import cast
 
 
@@ -14,6 +13,11 @@ from typing import cast
 class BaseFinancials:
     """Normalized base-year financials for one ticker, as produced by the
     normalization layer. This is the last actual (non-projected) period.
+
+    Deliberately carries NO market price (ADR-008): instances are cached
+    (L1/Redis/DB) and the live price must never be cacheable, so the type
+    cannot represent one. The price travels separately as a NormalizedQuote
+    fetched from Finnhub per request.
     """
 
     ticker: str
@@ -25,11 +29,8 @@ class BaseFinancials:
     delta_nwc: float  # change in net working capital, base year
     net_debt: float
     diluted_shares: float
-    current_price: float
     currency: str | None = None
     fundamentals_as_of: str | None = None
-    price_as_of: datetime | None = None
-    price_fetched_at: datetime | None = None
     data_provider: str = "financialmodelingprep"
     fiscal_year: str | None = None
     statement_period: str | None = None
@@ -99,12 +100,14 @@ class SensitivityGrid:
 
 @dataclass(frozen=True)
 class Valuation:
+    """Price-independent DCF output (ADR-008): the market comparison
+    (current price / upside) is applied at the API layer from the live quote,
+    never computed inside the engine."""
+
     projections: tuple[YearProjection, ...]
     terminal_value: float
     pv_terminal_value: float
     enterprise_value: float
     equity_value: float
     intrinsic_value_per_share: float
-    current_price: float
-    upside_pct: float
     warnings: tuple[str, ...] = ()
