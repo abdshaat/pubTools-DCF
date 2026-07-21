@@ -1,5 +1,26 @@
 # Progress Log
 
+## 2026-07-20 — Phase 8 production cron secret + current capacity gate
+
+- Confirmed the live `ticker_snapshot_heads` manifest contains one ticker:
+  `AAPL`; the refresh ledger still had no runs because prior cron deliveries
+  were unauthenticated.
+- Completed the capacity gate for the current manifest: the price-free daily
+  cycle uses 4 normal FMP endpoint calls and at most 12 bounded attempts for
+  one ticker, below the recorded ~250-call daily allowance and within the
+  current Vercel Python-function duration. This must be recalculated before
+  materially increasing the ticker count.
+- Added a cryptographically random 32-byte `CRON_SECRET` to Vercel Production
+  as a Sensitive environment variable. A transient unsupported PowerShell RNG
+  invocation was caught before deployment and the value was immediately
+  replaced using `RandomNumberGenerator.Create().GetBytes`; only the securely
+  generated replacement will reach a deployment.
+- The July 20 cron windows had already passed, so the first authenticated real
+  run can only be observed at the next 6 PM Eastern window. Live Redis
+  verification remains open because the Marketplace credentials are Sensitive
+  Preview/Production variables and are intentionally non-readable via local
+  Vercel pulls; Development has no Upstash variables.
+
 ## 2026-07-18 — Migration 004 applied and safely live-verified
 
 - Owner applied `supabase/migrations/004_phase8_freshness.sql` in Supabase.
@@ -1229,17 +1250,18 @@ specs live in CLAUDE.md; this file is only the running state.
   key). The scheduler exists end to end (`app/refresh.py`,
   `GET /internal/cron/refresh-financials`, `vercel.json` crons at 22+23 UTC,
   `America/New_York` guard, durable claims + reconciliation) **but no run has
-  executed yet: `CRON_SECRET` is not set in Vercel, so the deployed cron
-  401s nightly** (TODO §4.2 — first owner action).
+  executed yet as of the prior entry because `CRON_SECRET` was absent. It was
+  configured 2026-07-20; the next 6 PM Eastern window is the first live run.
   **Parts 3a–3b (6 PM Eastern hard-expiry boundary + structured freshness):
-  implemented and tested, UNCOMMITTED in the working tree**
+  implemented, tested, and committed in `a1131e2`**
   (`app/refresh_window.py` + boundary-aware
   `_is_current` + honest Redis stored-at; once deployed, post-6 PM responses
   warn "scheduled refresh pending" until the cron actually runs — so set
   `CRON_SECRET` before or with that push). Structured response fields and
   migration 004's atomic claim/head status publication are complete locally;
-  migration 004 is now applied and live-verified. Still open: live cron/Redis
-  observation (TODO §4.1/4.2/4.4). Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
+  migration 004 is now applied and live-verified. The current capacity gate
+  and `CRON_SECRET` are complete; still open: live Redis observation and the
+  next scheduled cron result. Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
   response cache, or response-cache generation rotation; the daily cycle
   refreshes statements/profile only. Preview env still has no Supabase vars
   (auth off in previews); custom SMTP still recommended before real

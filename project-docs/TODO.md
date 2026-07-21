@@ -117,9 +117,11 @@ Eastern refresh job.
 - [ ] **4.1 — Pull the Upstash env vars locally:** run `vercel env pull` in the
   repo (or copy the two Upstash REST vars into `.env`). Redis is provisioned but
   I've never run against the real instance — only the in-memory fake.
-- [ ] **4.2 — Generate a `CRON_SECRET`** (16+ random characters), add it to Vercel
-  **Production**, and redeploy. This protects the internal refresh endpoint. Do
-  **not** commit it or expose it to the browser.
+- [x] **4.2 — Generate a `CRON_SECRET` and add it to Vercel Production.** Done
+  2026-07-20 using a cryptographically random 32-byte value stored as a
+  Vercel Sensitive variable. The value is not stored locally or committed.
+  The post-change push/redeployment is part of the same session; the first
+  authenticated scheduled run will be the next 6 PM Eastern window.
 - [x] **4.3 — Apply migration 003 to Supabase.** Done 2026-07-18 (after the
   Slice C push briefly left production 503ing keyed valuations — the code
   deployed before the migration; applying it restored service). Verified
@@ -131,11 +133,11 @@ Eastern refresh job.
   with a non-mutating invalid-status call to `complete_financial_refresh_claim`:
   the deployed RPC returned its expected `invalid refresh claim status` guard.
   The current working tree may now be deployed without an RPC ordering gap.
-- [ ] **4.4 — Confirm FMP plan capacity.** The daily job refreshes **every**
-  ticker in the database, with several FMP endpoint calls each plus retries. Your
-  current FMP tier is ~250 calls/day. Confirm the plan (or upgrade) before the
-  cron is enabled — the design says insufficient capacity must fail visibly rather
-  than silently refresh fewer tickers.
+- [x] **4.4 — Confirm current FMP/runtime capacity.** Verified 2026-07-20 for
+  the current one-ticker manifest (`AAPL`): 4 normal endpoint calls and at most
+  12 bounded attempts, safely below the recorded ~250-call daily allowance.
+  The bounded one-ticker path also fits the current Vercel Python-function
+  duration. Re-run this gate before materially increasing the ticker count.
 
 **Unblocks:** Phase 8 Slice C; the daily refresh; live Redis verification.
 
@@ -180,16 +182,13 @@ Eastern refresh job.
   `8e30cf4`, pushed by the owner 2026-07-18; migration 003 applied the same
   day). Production runs model 0.2.0 with the live Finnhub price and the
   database read-through, live-verified against the real Supabase/FMP.
-- **⚠️ Tonight's cron will 401 until §4.2 (`CRON_SECRET`) is done** — the
-  refresh endpoint is deployed and scheduled (22:00 + 23:00 UTC) but has no
-  secret configured, so no daily refresh actually runs yet. Once the
-  6 PM-boundary code deploys, responses will carry "scheduled refresh
-  pending" warnings after each 6 PM Eastern until the cron works.
+- **`CRON_SECRET` is configured in Production** as of 2026-07-20. The day's
+  schedules had already passed when it was added, so the first authenticated
+  observation is due at the next 6 PM Eastern window.
 - **Current state:** 333 tests passing, 93.70% coverage; ruff/format/mypy/build
-  clean. Uncommitted in the tree: Slice C parts 3a–3b — the 6 PM Eastern
-  L1/Redis hard-expiry boundary plus structured freshness response fields and
-  migration 004, which is now applied. Remaining: live wiring
-  (§4.1/4.2/4.4).
+  clean. Slice C parts 3a–3b are committed in `a1131e2`; migration 004 is
+  applied. Remaining: local/live Redis observation (§4.1) and observing the
+  next real cron run.
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

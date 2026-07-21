@@ -1387,8 +1387,9 @@ as the fallback when Redis is unconfigured or down.
   partial-failed states are explicit; migration 004 makes claim completion
   plus failed-head publication atomic; OpenAPI/customer docs updated; suite
   333 at 93.70% coverage, lint/format/mypy/build clean. Migration 004 was
-  applied and its new RPC guard live-verified 2026-07-18. **Remaining:** live
-  cron/Redis verification (needs `CRON_SECRET` + env pull + capacity gate).
+  applied and its new RPC guard live-verified 2026-07-18. `CRON_SECRET` and the
+  current one-ticker capacity gate were completed 2026-07-20. **Remaining:**
+  live Redis observation and observation of the next scheduled cron run.
   **Per ADR-008 this slice must NOT include a `quote:` cache, a `resp:` response
   cache, or response-cache generation rotation** (those are removed by the
   Finnhub feature; see `issues.MD`); the daily cycle refreshes statements/profile
@@ -1412,18 +1413,18 @@ as the fallback when Redis is unconfigured or down.
 2. [ ] `vercel env pull` (or copy the two REST vars into local `.env`) so local
    runs can hit the same instance.
 3. [x] Say the word when done — user authorized implementation 2026-07-13.
-4. [ ] Generate a random `CRON_SECRET` (at least 16 characters), add it to
-   Vercel Production, and redeploy. Do not expose it to the browser or commit
-   it. **Now urgent, not pre-deploy:** Slice C parts 1–2 deployed 2026-07-18
-   (`8e30cf4`) with the crons registered — until this secret exists, every
-   nightly invocation 401s and no daily refresh runs.
+4. [x] Generate a random `CRON_SECRET` (at least 16 characters), add it to
+   Vercel Production, and redeploy. Completed 2026-07-20 with a random 32-byte
+   Vercel Sensitive value; never printed, stored locally, or committed.
 5. [x] Apply `supabase/migrations/004_phase8_freshness.sql` before deploying
    Part 3b. Completed 2026-07-18; the new claim-completion RPC's invalid-status
    guard was live-verified without mutating run data.
-6. [ ] Confirm the FMP plan and chosen runtime can finish
+6. [x] Confirm the FMP plan and chosen runtime can finish
    `COUNT(ticker_snapshot_heads) × expected FMP endpoint calls (plus bounded
    retries)` inside one daily run. If not, upgrade capacity or choose a durable
-   worker; do not reduce the ticker manifest.
+   worker; do not reduce the ticker manifest. Verified 2026-07-20 for the live
+   one-ticker manifest: 4 normal calls / 12 maximum attempts, within the
+   recorded ~250-call allowance and current Vercel duration.
 
 Exit criteria:
 
