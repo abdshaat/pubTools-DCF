@@ -120,8 +120,9 @@ Eastern refresh job.
 - [x] **4.2 — Generate a `CRON_SECRET` and add it to Vercel Production.** Done
   2026-07-20 using a cryptographically random 32-byte value stored as a
   Vercel Sensitive variable. The value is not stored locally or committed.
-  The post-change push/redeployment is part of the same session; the first
-  authenticated scheduled run will be the next 6 PM Eastern window.
+  Commit `086572b` was pushed and its production deployment reached Ready in
+  `iad1`; the first authenticated scheduled run will be the next 6 PM Eastern
+  window.
 - [x] **4.3 — Apply migration 003 to Supabase.** Done 2026-07-18 (after the
   Slice C push briefly left production 503ing keyed valuations — the code
   deployed before the migration; applying it restored service). Verified

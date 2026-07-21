@@ -20,6 +20,11 @@
   verification remains open because the Marketplace credentials are Sensitive
   Preview/Production variables and are intentionally non-readable via local
   Vercel pulls; Development has no Upstash variables.
+- Pushed commit `086572b`; its production deployment reached Ready in `iad1`.
+  Live smoke checks returned 200 for `/`, `/apis`, `/dcf`, `/health`, and
+  `/openapi.json`. An unauthenticated call to the internal cron endpoint
+  returned the expected controlled 401 with `Cache-Control: no-store`, proving
+  the deployed route remains closed without the new bearer secret.
 
 ## 2026-07-18 — Migration 004 applied and safely live-verified
 
