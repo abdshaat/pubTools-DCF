@@ -20,7 +20,8 @@ from app.accounts import CSRF_COOKIE, CSRF_HEADER, LOGIN_ATTEMPTS_DAILY_LIMIT
 from app.api import _default_raw_sink, create_app
 from app.auth import APIKeyAuthenticator, APIKeyRecord
 from app.exceptions import ProviderError, TickerNotFoundError
-from app.providers.fmp import FileRawSink, FMPClient
+from app.providers.fmp import FMPClient
+from app.raw_store import FileRawSink, load_captures
 from app.supabase import (
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
@@ -65,6 +66,21 @@ def test_default_raw_sink_is_disabled_on_vercel(monkeypatch):
 def test_default_raw_sink_is_available_for_local_development(monkeypatch):
     monkeypatch.delenv("VERCEL", raising=False)
     assert isinstance(_default_raw_sink(), FileRawSink)
+
+
+def test_provider_captures_are_attributed_to_the_serving_request(tmp_path):
+    """Audit evidence must name the request that caused the provider call."""
+    sink = FileRawSink(tmp_path)
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport(), raw_sink=sink)
+    app = create_app(fmp_client=fmp, finnhub_client=FakeFinnhubClient())
+    with TestClient(app) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert response.status_code == 200
+    stored = load_captures(tmp_path, "AAPL", "income-statement")
+    assert len(stored) == 1
+    assert stored[0].document["request_id"] == response.headers["X-Request-ID"]
+    assert stored[0].document["http"]["url"].endswith("apikey=REDACTED&limit=5")
 
 
 @pytest.fixture

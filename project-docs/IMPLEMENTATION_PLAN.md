@@ -1579,21 +1579,64 @@ Exit criteria:
 Goal: retain provider evidence safely without blocking requests or overwriting
 captures.
 
-- [ ] Replace second-resolution filenames with collision-proof identifiers.
-- [ ] Persist captures atomically with content hash, endpoint, ticker, retrieval
-  time, request ID, HTTP metadata, and schema version.
-- [ ] Move storage off the async request path or make the sink asynchronous.
-- [ ] Define whether sink failure fails the request or alerts asynchronously.
-- [ ] Redact credentials and sensitive headers before logging/storage.
-- [ ] Add compression, retention/lifecycle deletion, access controls, and cost
-  monitoring.
-- [ ] Add replay tooling to renormalize historical captures without provider calls.
-- [ ] Test concurrent captures, atomicity, failure, redaction, replay, and retention.
+**Slice 1 — the capture contract and the local sink (implemented 2026-07-25;
+ADR-009).** New `app/raw_store.py` owns the record, redaction, storage, and
+retention rules; `app/providers/fmp.py` only builds the record and hands it
+over. New `app/request_context.py` carries the request id down to it.
+
+- [x] Replace second-resolution filenames with collision-proof identifiers.
+  Now `{TICKER}/{endpoint}/{microsecond UTC}_{content sha256[:12]}_{capture
+  id[:8]}.json.gz`; names sort chronologically, so replay reads them in order
+  without opening them.
+- [x] Persist captures atomically with content hash, endpoint, ticker, retrieval
+  time, request ID, HTTP metadata, and schema version. Written to a temporary
+  file in the same directory, fsynced, then published with `os.replace`; a
+  failed write unlinks the temporary and leaves nothing partial behind.
+- [x] Move storage off the async request path or make the sink asynchronous.
+  `FileRawSink.__call__` is async and runs compress/write/prune in a worker
+  thread (awaited, not fire-and-forget, so no task outlives the request).
+- [x] Define whether sink failure fails the request or alerts asynchronously.
+  **Decided (ADR-009): never fails the request** — failures are counted in the
+  sink's stats and logged. This replaces the old
+  `OSError -> ProviderError` behavior.
+- [x] Redact credentials and sensitive headers before logging/storage.
+  Credential query values (the FMP `apikey` rides in the URL), URL userinfo,
+  and `Authorization`/`Cookie`/`X-API-Key`-class headers are redacted at the
+  storage boundary; a test asserts the key never reaches the bytes on disk.
+- [x] Add compression, retention/lifecycle deletion, access controls, and cost
+  monitoring. Gzip; prune by age (30d) and per-endpoint count (25), throttled
+  to once per directory per 15 minutes; owner-only file/directory modes where
+  the OS enforces them; `stats()` plus `usage_report()` report captures and
+  bytes written/reclaimed.
+- [x] Add replay tooling to renormalize historical captures without provider calls.
+  `scripts/raw_captures.py {stats,list,replay,prune}`; `replay` rebuilds
+  `FMPFundamentals` from stored evidence and runs the real normalization layer
+  offline. `scripts/build_demo_snapshots.py` now reads through the same loader,
+  which also still understands pre-Phase-10 flat `{endpoint}_{epoch}.json` files.
+- [x] Test concurrent captures, atomicity, failure, redaction, replay, and retention.
+  28 new tests (`tests/test_raw_store.py`, plus provider- and route-level
+  capture tests); suite 334 -> 365 passing at 94.40% coverage.
+
+**Slice 2 — durable production evidence (open; needs an owner decision).**
+`_default_raw_sink()` still returns `None` on Vercel because the function
+filesystem is not durable, so production currently keeps no raw evidence. The
+first exit criterion below cannot close until a backend is chosen (Supabase
+Storage/Postgres alongside the existing project, or S3/R2), with retention and
+cost agreed. Everything except the writer is backend-agnostic.
+
+- [ ] Choose the durable backend and retention window (owner; cost decision).
+- [ ] Implement it as a second sink behind the same `RawSink` contract, with
+  the same redaction/atomicity/best-effort rules and no request-path coupling.
+- [ ] Link captures to `normalized_snapshots.snapshot_version` so evidence and
+  snapshot are navigable in both directions.
 
 Exit criteria:
 
 - [ ] Every normalized snapshot traces to immutable provider evidence.
-- [ ] Audit storage cannot block the event loop or overwrite another capture.
+  (Local development yes; production blocked on Slice 2.)
+- [x] Audit storage cannot block the event loop or overwrite another capture.
+  Thread-offloaded writes, collision-proof names, and atomic publication;
+  test-proven 2026-07-25.
 
 ## Phase 11 — Configuration, observability, and operations
 

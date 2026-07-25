@@ -246,3 +246,70 @@ valuation endpoint. The financial-statement cache still absorbs repeated
 same-ticker traffic, so N differently-assumed valuations of one ticker cost one
 FMP statement fetch. `upside_pct` now reflects the live market, not a value up to
 a day old.
+
+## ADR-009 — Raw provider evidence is best-effort, redacted, and bounded
+
+Date: 2026-07-25
+
+Context: Phase 10 asks for provider evidence that every normalized snapshot can
+be traced back to, without letting audit storage block or break the request that
+produced it. The pre-Phase-10 sink wrote one uncompressed JSON file per
+`{ticker}/{endpoint}_{epoch-second}`, on the event loop, from inside the
+provider client, and raised `ProviderError` when the write failed. That design
+had four defects: two captures of the same ticker/endpoint in the same second
+silently overwrote each other; a partially written file was indistinguishable
+from a complete one; a disk error failed a customer valuation; and it stored
+nothing about *which* request, URL, or HTTP response produced the bytes — while
+the FMP key travels in the query string, so recording the URL naively would
+write a live credential to disk.
+
+Decision:
+
+- **A capture is evidence, never part of the answer.** Sink failures are
+  counted and logged, never surfaced: `FileRawSink.__call__` swallows them and
+  `FMPClient._capture` guards any injected sink the same way. The alternative
+  (fail the request, as before) trades a served valuation for an audit record,
+  which is the wrong way round — the durable normalized snapshot in Supabase
+  (ADR-006), not the capture, is what the product depends on.
+- **Never on the event loop.** The async sink entry point runs the compress,
+  write, and prune work in a worker thread. Capture is awaited rather than
+  fire-and-forget so tests stay deterministic and no task outlives the request.
+- **Never overwrite, never half-write.** A capture filename carries a
+  microsecond UTC timestamp, the payload's content hash, and a random suffix,
+  and is published by an atomic `os.replace` from a temporary file in the same
+  directory. Filenames sort chronologically, so replay tooling reads them in
+  order without parsing content.
+- **Redact at the storage boundary.** Credential query parameters (`apikey`,
+  `token`, …), URL userinfo, and sensitive headers (`Authorization`, `Cookie`,
+  `X-API-Key`, …) are replaced with `REDACTED` before anything is written. The
+  in-memory `RawCapture` still holds the real URL, so the redaction rule lives
+  in exactly one place and applies to every future sink backend.
+- **Bounded by policy, not by hope.** Captures are gzipped and pruned by age
+  (30 days) and by count per ticker/endpoint (25), with prune throttled to once
+  per directory per 15 minutes so it cannot dominate a write. The sink reports
+  captures/bytes written and reclaimed for cost monitoring.
+- **Every capture is attributable.** The stored envelope records schema
+  version, capture id, capture time, provider, ticker, endpoint, request id,
+  attempt number, content hash and size, and redacted HTTP metadata. The
+  request id comes from an ambient context variable
+  (`app/request_context.py`) set by the request-id middleware; the daily
+  refresh binds `refresh:{eastern-date}` instead, so scheduled evidence points
+  at the ledger row that claimed it.
+- **Successful payloads only, as parsed JSON.** Error bodies are not captured:
+  the evidence question is "what produced this snapshot", and failures are
+  already visible as bounded error codes in the refresh ledger. The stored
+  body is the decoded JSON document (as before Phase 10), not the original
+  response bytes — enough to replay normalization exactly, which is what the
+  evidence is for; byte-level provider forensics would need a raw-body capture
+  and is not a goal.
+- **No quote capture.** Finnhub quotes are deliberately not wired to the sink.
+  ADR-008 forbids retaining a market price anywhere, and an audit file is a
+  weaker place to make an exception than a cache is.
+
+Consequences: audit storage can fail, fill, or be disabled without customer
+impact, and no capture can leak the provider key. Because the sink stays local
+(Vercel's filesystem is not durable, so `_default_raw_sink` returns `None`
+there), production still has no evidence trail — Phase 10's exit criterion
+needs an off-box backend, which is a separate decision (cost and retention are
+the owner's call). Everything except the writer is backend-agnostic, so that
+slice reuses the record, redaction, retention, and replay code unchanged.

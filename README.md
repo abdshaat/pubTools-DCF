@@ -294,8 +294,20 @@ python scripts/smoke_fetch.py AAPL
 ```
 
 This fetches and normalizes real financials, runs a DCF with placeholder
-assumptions, and prints the result. Raw provider responses are saved under
-`data/raw/` for auditing.
+assumptions, and prints the result. Raw provider responses are captured under
+`data/raw/` for auditing — gzipped, credential-redacted, never overwritten, and
+pruned by age and count. Capture is best effort and never fails a request, and
+it is disabled on Vercel (the function filesystem is not durable).
+
+Inspect or replay that evidence offline — no provider calls, so it costs
+nothing against the daily FMP budget:
+
+```bash
+python scripts/raw_captures.py stats          # captures and disk usage
+python scripts/raw_captures.py list AAPL      # what was captured, and for which request
+python scripts/raw_captures.py replay AAPL    # renormalize the stored payloads
+python scripts/raw_captures.py prune          # apply the retention policy now
+```
 
 ### Probe latency and bursts
 

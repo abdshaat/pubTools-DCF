@@ -1,5 +1,71 @@
 # Progress Log
 
+## 2026-07-25 — Phase 10 Slice 1: raw provider evidence (capture, redaction, retention, replay)
+
+Phase 8's and Phase 9's open items are all owner/live-observation work, so this
+session took the next implementable phase in the plan. **No deployment step and
+no migration** — the sink is local-only, and it stays off on Vercel.
+
+- **New `app/raw_store.py`** owns the whole evidence contract; the FMP client
+  now only builds a `RawCapture` and hands it over. What changed versus the old
+  three-line `FileRawSink`: filenames are collision-proof
+  (`{TICKER}/{endpoint}/{microsecond UTC}_{sha256[:12]}_{capture id[:8]}.json.gz`,
+  chronologically sortable) instead of second-resolution names that silently
+  overwrote each other; the write is atomic (temp file + fsync + `os.replace`,
+  temp unlinked on failure) instead of a direct `write_text`; the payload is
+  gzipped inside an envelope carrying schema version, capture id, capture time,
+  provider, ticker, endpoint, request id, attempt number, content hash/size, and
+  redacted HTTP metadata; and retention prunes by age (30d) and per-endpoint
+  count (25), throttled to once per directory per 15 minutes.
+- **Failure policy decided and reversed (ADR-009):** a sink failure used to
+  raise `ProviderError` and fail the customer's valuation. Audit storage is
+  evidence, not part of the answer, so failures are now counted in the sink's
+  stats and logged. Both the sink and `FMPClient._capture` swallow, so an
+  injected custom sink cannot break a request either.
+- **Off the event loop:** the async sink entry runs compress/write/prune in a
+  worker thread. Awaited rather than fire-and-forget, so no task outlives the
+  request and tests stay deterministic (a test asserts the writer runs on a
+  different thread than the loop).
+- **Redaction at the storage boundary:** the FMP key travels in the query
+  string, so recording the URL naively would write a live credential to disk.
+  Credential query values, URL userinfo, and `Authorization`/`Cookie`/
+  `X-API-Key`-class headers are replaced before any bytes are written; a test
+  asserts the key never appears in the stored file, and a live-style local run
+  confirmed `apikey=REDACTED` in a real capture.
+- **New `app/request_context.py`:** a context variable carries the request id
+  down to the sink, which sits below a long-lived shared client where threading
+  a parameter would drag an HTTP concern through the cache and normalization
+  layers. Set by the request-id middleware; the daily refresh binds
+  `refresh:{eastern-date}` instead, so scheduled evidence points at the ledger
+  row that claimed it. A route-level test proves the id survives Starlette's
+  middleware task boundary by matching the capture against `X-Request-ID`.
+- **Replay/ops tooling:** `scripts/raw_captures.py {stats,list,replay,prune}` —
+  all offline, so debugging a normalization bug costs no FMP calls. `replay`
+  rebuilds `FMPFundamentals` from stored evidence and runs the real
+  normalization layer. `scripts/build_demo_snapshots.py` now reads through the
+  same loader, which still understands pre-Phase-10 flat
+  `{endpoint}_{epoch}.json` files.
+- **Deliberately not captured:** Finnhub quotes (ADR-008 forbids retaining a
+  price anywhere) and error bodies (failures are already bounded error codes in
+  the refresh ledger).
+- **Tests: 31 new** (`tests/test_raw_store.py` plus provider- and route-level
+  capture tests): redaction incl. a no-secret-on-disk byte check, provenance and
+  content-hash stability, concurrent captures not colliding, atomicity leaving
+  no partial/temp file, off-loop write, swallowed+counted failures, refused
+  unsafe path components, age and count retention, prune throttling, usage
+  reporting, offline replay equalling live normalization, legacy-file reading,
+  and damaged-evidence fallbacks. **Suite 334 → 365 passing, 94.40% coverage**
+  (was 93.70%); ruff lint + format and mypy clean. Also live-exercised the CLI
+  end to end against a scratch capture root.
+- **Left open deliberately — Phase 10 Slice 2 (`TODO.md` §4b):** production
+  still keeps no evidence, because Vercel's filesystem is not durable and the
+  sink is disabled there. Choosing the durable backend (Supabase Storage vs
+  Postgres vs S3/R2) and the retention window is a cost decision for the owner;
+  everything except the writer is backend-agnostic and reusable.
+- Next step: unchanged Phase 8 live work (Upstash/Redis checks, first
+  authenticated cron run), then either Phase 10 Slice 2 once §4b is answered or
+  Phase 11 (typed settings, structured logs, metrics).
+
 ## 2026-07-25 — Auth callback lands on the sign-in section
 
 - The `/v1/auth/callback` redirects now target `/dcf#account` (success) and
@@ -1233,8 +1299,8 @@ specs live in CLAUDE.md; this file is only the running state.
 
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **333 passing tests (93.70% coverage, 93% floor)**;
-  ruff/format/mypy/build clean. **ADR-008 and Slice C parts
+  verification, and **365 passing tests (94.40% coverage, 93% floor)**;
+  ruff/format/mypy clean. **ADR-008 and Slice C parts
   1–2 are committed (`8e30cf4`), deployed, and live-verified; migration 003
   is applied to the production Supabase.** Supabase auth, quotas, and usage
   metering are live-verified end to end. CSRF enforcement
@@ -1288,9 +1354,17 @@ specs live in CLAUDE.md; this file is only the running state.
   refreshes statements/profile only. Preview env still has no Supabase vars
   (auth off in previews); custom SMTP still recommended before real
   email-login volume.
-- **Not started:** external object storage, advanced DCF drivers, and
-  Phase 15 (on hold — separate frontend split, superseded in practice by
-  Phase 9).
+- **Phase 10 Slice 1 (raw provider evidence) is implemented** (2026-07-25,
+  ADR-009): gzipped, credential-redacted, collision-proof, atomic captures with
+  full provenance (incl. the request id via `app/request_context.py`),
+  age/count retention, cost counters, and offline replay tooling
+  (`scripts/raw_captures.py`). Capture is best effort — it never fails a
+  request — and runs off the event loop. **Local only:** `_default_raw_sink()`
+  still returns `None` on Vercel, so production has no evidence trail until
+  Slice 2 picks a durable backend (`TODO.md` §4b — owner cost decision).
+- **Not started:** the durable production evidence backend (Phase 10 Slice 2),
+  Phase 11 operations/observability, advanced DCF drivers, and Phase 15 (on
+  hold — separate frontend split, superseded in practice by Phase 9).
 - **Run tests:** `./.venv313/Scripts/python -m pytest -q` (current Windows/OneDrive
   recovery environment; standard clean setups may use `.venv`).
 - **Run server:** `./.venv313/Scripts/uvicorn app.api:app --reload` (needs

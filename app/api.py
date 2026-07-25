@@ -72,10 +72,12 @@ from .fundamentals import FundamentalsService
 from .models import Assumptions
 from .normalization import NormalizedQuote, normalize_finnhub_quote
 from .providers.finnhub import FinnhubClient, FinnhubConfig
-from .providers.fmp import FileRawSink, FMPClient
+from .providers.fmp import FMPClient
 from .rate_limit import DailyRequestLimiter, RateLimitResult, RedisLoginRateLimiter
+from .raw_store import FileRawSink
 from .redis_cache import RedisBackend, RedisConfig, UpstashRedisClient
 from .refresh import DailyRefreshRunner
+from .request_context import set_request_id
 from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
@@ -116,8 +118,10 @@ def _default_raw_sink() -> FileRawSink | None:
     """Persist provider payloads locally except on Vercel.
 
     Vercel Functions are stateless and deployment files must not be treated as
-    durable storage. Production audit payloads will move to external object
-    storage; disabling this sink keeps requests independent of ephemeral files.
+    durable storage. Production audit payloads still need an off-box backend
+    (Phase 10, open); disabling this sink keeps requests independent of
+    ephemeral files. Writes are compressed, atomic, credential-redacted, and
+    retention-bounded — see app/raw_store.py.
     """
     if os.environ.get("VERCEL"):
         return None
@@ -383,6 +387,11 @@ def create_app(
     @app.middleware("http")
     async def _request_id(request: Request, call_next: Any) -> Response:
         request.state.request_id = str(uuid4())
+        # Also bind it ambiently: the provider client and audit sink sit below
+        # the route behind a shared long-lived client, so they read the id from
+        # the request context instead of a threaded-through parameter. Each
+        # ASGI request has its own context, so no reset is needed here.
+        set_request_id(request.state.request_id)
         principal = None
         identity = "anonymous"
         limit = daily_rate_limit

@@ -27,6 +27,7 @@ from app.models import Assumptions
 from app.normalization import normalize_fmp_fundamentals
 from app.providers.fmp import FMPClient, FMPFundamentals
 from app.redis_cache import InMemoryRedisBackend
+from app.request_context import request_id_scope
 
 FIXTURES = Path(__file__).parent / "fixtures" / "fmp"
 
@@ -474,16 +475,19 @@ def test_provider_classifies_malformed_json():
         asyncio.run(scenario())
 
 
-def test_raw_sink_failure_is_classified_as_provider_error():
-    def sink(ticker: str, endpoint: str, payload: object) -> None:
+def test_raw_sink_failure_never_fails_the_request():
+    """Audit capture is evidence, not part of the answer (ADR-009)."""
+
+    def sink(capture) -> None:
         raise OSError("disk is full")
 
     async def scenario():
         async with make_client(raw_sink=sink) as client:
-            await client.fetch_fundamentals("AAPL")
+            return await client.fetch_fundamentals("AAPL")
 
-    with pytest.raises(ProviderError, match="raw provider payload sink failed"):
-        asyncio.run(scenario())
+    fundamentals = asyncio.run(scenario())
+    assert fundamentals.ticker == "AAPL"
+    assert fundamentals.income
 
 
 def test_fetch_fundamentals_runs_endpoint_calls_concurrently_with_limit():
@@ -580,14 +584,63 @@ def test_raw_sink_receives_every_payload():
     async def scenario():
         client = make_client(
             transport=fixture_transport(),
-            raw_sink=lambda ticker, endpoint, payload: stored.append((ticker, endpoint)),
+            raw_sink=lambda capture: stored.append(capture),
         )
         async with client:
             await client.fetch_fundamentals("AAPL")
 
     asyncio.run(scenario())
-    assert ("AAPL", "income-statement") in stored
-    assert len(stored) == 4
+    assert {(capture.ticker, capture.endpoint) for capture in stored} == {
+        ("AAPL", "income-statement"),
+        ("AAPL", "balance-sheet-statement"),
+        ("AAPL", "cash-flow-statement"),
+        ("AAPL", "profile"),
+    }
+    income = next(capture for capture in stored if capture.endpoint == "income-statement")
+    assert income.provider == "fmp"
+    assert income.status_code == 200
+    assert income.attempt == 1
+    assert income.elapsed_ms is not None
+    assert "apikey=test-key" in income.url  # redaction happens at the storage boundary
+
+
+def test_raw_capture_carries_the_ambient_request_id():
+    stored = []
+
+    async def scenario():
+        with request_id_scope("req-42"):
+            async with make_client(raw_sink=lambda capture: stored.append(capture)) as client:
+                await client.fetch_fundamentals("AAPL")
+
+    asyncio.run(scenario())
+    assert stored
+    assert {capture.request_id for capture in stored} == {"req-42"}
+
+
+def test_raw_capture_records_the_attempt_that_finally_succeeded():
+    stored = []
+    attempts = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request.url.path)
+        if len(attempts) == 1:
+            return httpx.Response(503)
+        return httpx.Response(200, json=load_fixture("AAPL")["profile"])
+
+    async def fake_sleep(seconds: float) -> None:
+        return None
+
+    async def scenario():
+        client = make_client(
+            transport=httpx.MockTransport(handler),
+            raw_sink=lambda capture: stored.append(capture),
+            sleep=fake_sleep,
+        )
+        async with client:
+            await client.fetch_profile("AAPL")
+
+    asyncio.run(scenario())
+    assert [capture.attempt for capture in stored] == [2]
 
 
 # ---------------------------------------------------------------------------

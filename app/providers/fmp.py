@@ -4,23 +4,25 @@ Fetches the raw statements needed for one ticker's DCF: income statement,
 balance sheet, cash flow statement, and company profile (sector gate).
 The market price is NOT fetched here — it comes live from Finnhub per
 request (ADR-008) and is never cached. Handles retries with exponential
-backoff on 429/5xx and honors Retry-After. Raw JSON can be persisted via a
-`raw_sink` hook so normalization bugs can be replayed against the original
-payloads.
+backoff on 429/5xx and honors Retry-After. Successful raw JSON is handed to
+the optional `raw_sink` hook (Phase 10 / ADR-009) so normalization bugs can be
+replayed against the original payloads; capture is best effort and never fails
+a customer request.
 
 This module does NO interpretation of the numbers — that belongs to
 app.normalization. It only moves bytes and classifies transport errors.
 """
 
 import asyncio
+import inspect
 import json
+import logging
 import os
 import random
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -32,6 +34,10 @@ from ..exceptions import (
     TickerNotCoveredError,
     TickerNotFoundError,
 )
+from ..raw_store import RawCapture
+from ..request_context import current_request_id
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_BASE_URL = "https://financialmodelingprep.com/stable"
 DEFAULT_PROVIDER_TIMEOUT_SECONDS = 6.0
@@ -51,7 +57,9 @@ _STATEMENT_ENDPOINTS = [
     ("profile", False),
 ]
 
-RawSink = Callable[[str, str, Any], None]
+# A sink receives the whole capture record (payload plus provenance) and may be
+# sync or async; the client awaits whatever it returns. See app/raw_store.py.
+RawSink = Callable[[RawCapture], Awaitable[None] | None]
 
 
 @dataclass(frozen=True)
@@ -64,19 +72,6 @@ class FMPFundamentals:
     cash_flow: tuple[dict[str, Any], ...]
     profile: dict[str, Any]
     fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
-
-
-class FileRawSink:
-    """Default raw-response store: data/raw/{ticker}/{endpoint}_{epoch}.json"""
-
-    def __init__(self, root: Path):
-        self._root = Path(root)
-
-    def __call__(self, ticker: str, endpoint: str, payload: Any) -> None:
-        directory = self._root / ticker.upper()
-        directory.mkdir(parents=True, exist_ok=True)
-        path = directory / f"{endpoint}_{int(time.time())}.json"
-        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 class FMPClient:
@@ -121,6 +116,28 @@ class FMPClient:
         base = min(0.5 * (2**attempt), self._max_retry_after)
         return min(base + self._jitter() * 0.1, self._max_retry_after)
 
+    async def _capture(self, capture: RawCapture) -> None:
+        """Hand one successful payload to the audit sink, if any.
+
+        Audit storage is evidence, not part of the answer: a sink failure is
+        logged and counted, never surfaced (ADR-009). Sinks may be sync or
+        async — the file sink is async so its filesystem work stays off the
+        event loop.
+        """
+        if self._raw_sink is None:
+            return
+        try:
+            result = self._raw_sink(capture)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning(
+                "raw capture sink failed for %s/%s",
+                capture.endpoint,
+                capture.ticker,
+                exc_info=True,
+            )
+
     async def aclose(self) -> None:
         await self._client.aclose()
 
@@ -146,6 +163,7 @@ class FMPClient:
 
         for attempt in range(self._max_retries + 1):
             response: httpx.Response | None = None
+            started = time.perf_counter()
             try:
                 async with self._semaphore:
                     response = await self._client.get(f"/{endpoint}", params=query)
@@ -182,13 +200,23 @@ class FMPClient:
                         raise ProviderError(
                             f"FMP returned malformed JSON for {endpoint}/{ticker}"
                         ) from exc
-                    if self._raw_sink is not None:
-                        try:
-                            self._raw_sink(ticker, endpoint, payload)
-                        except OSError as exc:
-                            raise ProviderError(
-                                f"raw provider payload sink failed for {endpoint}/{ticker}"
-                            ) from exc
+                    await self._capture(
+                        RawCapture(
+                            provider="fmp",
+                            ticker=ticker,
+                            endpoint=endpoint,
+                            payload=payload,
+                            status_code=response.status_code,
+                            url=str(response.request.url),
+                            request_headers=dict(response.request.headers),
+                            response_headers=dict(response.headers),
+                            # Wall time for this attempt, including any wait
+                            # for one of the client's concurrency slots.
+                            elapsed_ms=(time.perf_counter() - started) * 1000.0,
+                            attempt=attempt + 1,
+                            request_id=current_request_id(),
+                        )
+                    )
                     return payload
 
             if attempt < self._max_retries:

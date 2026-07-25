@@ -87,7 +87,9 @@ This happens once per FastAPI/Vercel function instance, not once per request.
    [`app/api.py`](../app/api.py#L339).
 6. The local raw FMP response sink is disabled on Vercel because the deployment
    filesystem is not durable. See `_default_raw_sink()` in
-   [`app/api.py`](../app/api.py#L120).
+   [`app/api.py`](../app/api.py#L120). Where it is enabled, capture is
+   best effort and off the event loop, so it never affects the response
+   (Phase 10 / ADR-009).
 
 ## 2. The Vercel edge can answer before FastAPI
 
@@ -360,8 +362,12 @@ Code locations:
 - Transport/retry/error classification: [`app/providers/fmp.py`](../app/providers/fmp.py#L138)
 - Multi-endpoint load: [`app/providers/fmp.py`](../app/providers/fmp.py#L202)
 
-Outside Vercel, successful raw endpoint payloads may be written under
-`data/raw/{ticker}` by `FileRawSink`. Vercel disables that local sink.
+Outside Vercel, successful raw endpoint payloads are captured under
+`data/raw/{TICKER}/{endpoint}/` by `FileRawSink`
+([`app/raw_store.py`](../app/raw_store.py)): a gzipped envelope with the
+payload, its content hash, the request id, and redacted HTTP metadata, written
+atomically in a worker thread. A capture failure is counted and logged, never
+raised — the response is unaffected. Vercel disables that local sink.
 
 ### Step 9: normalization and latest compatible filing selection
 

@@ -22,6 +22,7 @@ from typing import Any, Protocol
 
 from .fundamentals import FundamentalsService
 from .refresh_window import EASTERN, REFRESH_HOUR_EASTERN, eastern_now
+from .request_context import request_id_scope
 
 # Enough to move a small manifest quickly without stacking full FMP retry
 # ladders; the provider client's own three-slot semaphore bounds each cycle.
@@ -100,7 +101,11 @@ class DailyRefreshRunner:
                 else:
                     await self._complete_claim(ticker, refresh_date, "succeeded", None)
 
-        await asyncio.gather(*(refresh_one(ticker) for ticker in tickers))
+        # Provider payloads captured during this cycle are attributed to the
+        # durable run (`refresh:{date}`) rather than the cron request's own id,
+        # so audit evidence ties back to the ledger row that claimed it.
+        with request_id_scope(f"refresh:{refresh_date}"):
+            await asyncio.gather(*(refresh_one(ticker) for ticker in tickers))
         summary = await self._ledger.finish_refresh_run(refresh_date=refresh_date)
         return {"run": "completed", "refresh_date": refresh_date, **summary}
 

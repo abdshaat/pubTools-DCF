@@ -16,11 +16,13 @@ import sys
 from dataclasses import asdict
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.normalization import normalize_fmp_fundamentals
 from app.providers.fmp import FMPFundamentals
+from app.raw_store import latest_capture
 
 ROOT = Path(__file__).parent.parent
 RAW = ROOT / "data" / "raw"
@@ -35,11 +37,12 @@ _ENDPOINTS = {
 
 
 def _latest(ticker: str, endpoint: str) -> dict:
-    """Newest recorded payload for one endpoint (files are name_<epoch>.json)."""
-    candidates = sorted((RAW / ticker).glob(f"{endpoint}_*.json"))
-    if not candidates:
-        raise SystemExit(f"no raw {endpoint} for {ticker} — fetch it live first")
-    payload = json.loads(candidates[-1].read_text(encoding="utf-8"))
+    """Newest recorded payload for one endpoint (see app/raw_store.py)."""
+    try:
+        capture = latest_capture(RAW, ticker, endpoint)
+    except LookupError:
+        raise SystemExit(f"no raw {endpoint} for {ticker} — fetch it live first") from None
+    payload: Any = capture.payload
     return payload[0] if isinstance(payload, list) else payload
 
 

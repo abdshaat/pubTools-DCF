@@ -5,7 +5,7 @@ a product decision. Nothing in this file is something Claude can complete alone.
 Each item says what it unblocks, so you can skip sections that aren't relevant
 yet.
 
-Last updated 2026-07-18.
+Last updated 2026-07-25.
 
 **Fastest path to unblocking real work:** Section 1 (deploy the site you already
 have) and Section 2 (four one-line answers). Section 3 unblocks the next feature.
@@ -144,6 +144,33 @@ Eastern refresh job.
 
 ---
 
+## 4b. One decision for Phase 10 — where production keeps raw provider evidence
+
+The capture machinery is built and tested (2026-07-25): every FMP payload is
+stored gzipped, credential-redacted, collision-proof, atomic, and retention-
+bounded, with `scripts/raw_captures.py` to inspect/replay/prune it. **It only
+runs locally.** On Vercel the sink is deliberately off, because a function's
+filesystem is not durable — so production keeps no evidence today, and Phase
+10's "every snapshot traces to provider evidence" criterion stays open.
+
+- [ ] **4b.1 — Choose the durable backend.** Options, cheapest first:
+  (a) **Supabase Storage** in the project you already pay nothing for — one
+  bucket, service-role-only, no new vendor; (b) **Supabase Postgres** as
+  compressed rows next to `normalized_snapshots` — easiest to join, but raw
+  payloads compete with your 500 MB database quota; (c) **S3/R2** — cheapest
+  per GB at volume, one more account and credential to manage.
+- [ ] **4b.2 — Pick a retention window.** Local default is 30 days / 25
+  captures per ticker-endpoint. Evidence for a filing you still serve is worth
+  keeping longer than that; say what you want and it becomes the policy.
+
+Rough size: ~4 payloads per ticker per daily refresh, ~1 KB gzipped each with
+today's fixtures (real filings are larger — order 10–50 KB each). One ticker
+for a year is single-digit MB.
+
+**Unblocks:** Phase 10 Slice 2 and its exit criterion. Nothing else waits on it.
+
+---
+
 ## 5. Deferred — not blocking, decide when relevant
 
 - [ ] **5.1 — Custom SMTP in Supabase.** Supabase's built-in email sender is
@@ -173,7 +200,8 @@ Eastern refresh job.
 | ~~§3 (Finnhub key)~~ | ~~Build and live-verify the real-time price feature~~ Done 2026-07-18 (uncommitted) |
 | §4.1 (env pull) | Verify Redis against the real Upstash instance |
 | §4.2–4.4 | Ship Phase 8 Slice C live + enable the daily refresh cron |
-| Nothing | Slice C part 2 (scheduler) code/tests against fakes (can start anytime) |
+| §4b (evidence backend) | Give production a durable raw-capture trail (Phase 10 Slice 2) |
+| Nothing | Phase 11 (typed settings, structured logs, metrics) can start anytime |
 
 ## Also worth knowing
 
@@ -186,10 +214,11 @@ Eastern refresh job.
 - **`CRON_SECRET` is configured in Production** as of 2026-07-20. The day's
   schedules had already passed when it was added, so the first authenticated
   observation is due at the next 6 PM Eastern window.
-- **Current state:** 333 tests passing, 93.70% coverage; ruff/format/mypy/build
-  clean. Slice C parts 3a–3b are committed in `a1131e2`; migration 004 is
-  applied. Remaining: local/live Redis observation (§4.1) and observing the
-  next real cron run.
+- **Current state:** 365 tests passing, 94.40% coverage; ruff/format/mypy clean.
+  Slice C parts 3a–3b are committed in `a1131e2`; migration 004 is applied.
+  Phase 10 Slice 1 (raw-evidence capture) landed 2026-07-25 and needs no
+  deployment step — it changes only local behavior. Remaining: local/live Redis
+  observation (§4.1), observing the next real cron run, and the §4b decision.
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

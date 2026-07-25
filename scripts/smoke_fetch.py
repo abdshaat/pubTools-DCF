@@ -4,8 +4,9 @@ Usage:
     python scripts/smoke_fetch.py AAPL
 
 Fetches + normalizes one ticker, runs a DCF with placeholder assumptions,
-and prints the result. Raw provider responses are saved under data/raw/
-for auditing.
+and prints the result. Raw provider responses are captured under data/raw/
+for auditing (gzipped and credential-redacted; inspect or replay them with
+scripts/raw_captures.py).
 """
 
 import asyncio
@@ -17,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.dcf_engine import compute_dcf
 from app.fundamentals import FundamentalsService
 from app.models import Assumptions
-from app.providers.fmp import FileRawSink, FMPClient
+from app.providers.fmp import FMPClient
+from app.raw_store import FileRawSink
 
 
 async def main(ticker: str) -> None:
