@@ -1,5 +1,22 @@
 # Progress Log
 
+## 2026-07-25 — Auth callback lands on the sign-in section
+
+- The `/v1/auth/callback` redirects now target `/dcf#account` (success) and
+  `/dcf?login_error=...#account` (error) instead of the top of `/dcf`, so after
+  a GitHub/magic-link round trip the browser scrolls straight to the
+  `<section id="account">` sign-in/account UI. The `#account` fragment sits
+  after the query string on the error path (valid fragment ordering); the
+  page's existing `init()` already preserves `window.location.hash` when it
+  strips `login_error`. No sticky top-bar occlusion — the sticky element is the
+  left sidebar, so anchor scrolling lands cleanly.
+- Tests: strengthened the access-denied test to assert the fragment lands last,
+  and added a success-path test asserting the callback redirects to
+  `/dcf#account`. Full suite **334 passing, 93.70% coverage**; Ruff
+  lint + format and mypy clean.
+- Next step: unchanged Phase 8 live work (Upstash/Redis checks, first
+  authenticated cron run).
+
 ## 2026-07-20 — Phase 8 production cron secret + current capacity gate
 
 - Confirmed the live `ticker_snapshot_heads` manifest contains one ticker:

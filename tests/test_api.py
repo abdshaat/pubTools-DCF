@@ -1071,7 +1071,25 @@ def test_github_callback_redirects_on_access_denied():
     with TestClient(_accounts_app(backend)) as test_client:
         response = test_client.get("/v1/auth/callback?error=access_denied", follow_redirects=False)
     assert response.status_code == 302
-    assert "login_error=access_denied" in response.headers["location"]
+    location = response.headers["location"]
+    assert "login_error=access_denied" in location
+    # The `#account` fragment lands the browser on the sign-in section, and it
+    # must sit after the query string to be a valid URL fragment.
+    assert location.endswith("#account")
+
+
+def test_github_callback_success_redirects_to_account_section():
+    """A completed login round trip lands the browser on the sign-in section
+    (`/dcf#account`) rather than the top of the page."""
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        test_client.get("/v1/auth/github/login", follow_redirects=False)
+        response = test_client.get("/v1/auth/callback?code=good-code", follow_redirects=False)
+    assert response.status_code == 302
+    assert response.headers["location"].endswith("/dcf#account")
 
 
 def test_github_callback_returns_error_when_supabase_not_configured():

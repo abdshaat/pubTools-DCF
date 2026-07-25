@@ -744,8 +744,10 @@ def create_app(
 
         def error_redirect(reason: str) -> RedirectResponse:
             # Phase 9: land on /dcf, not /. The portfolio owns `/` now and has
-            # no account UI or `login_error` handler to render this.
-            resp = RedirectResponse(url=f"{base}/dcf?login_error={reason}", status_code=302)
+            # no account UI or `login_error` handler to render this. The
+            # `#account` fragment scrolls the browser straight to the sign-in
+            # section instead of the top of the page.
+            resp = RedirectResponse(url=f"{base}/dcf?login_error={reason}#account", status_code=302)
             resp.delete_cookie("pt_oauth_verifier")
             return resp
 
@@ -756,7 +758,9 @@ def create_app(
         if error or not code:
             return error_redirect("access_denied" if error else "invalid_request")
 
-        response = RedirectResponse(url=f"{base}/dcf", status_code=302)
+        # `#account` fragment lands the browser on the sign-in section rather
+        # than the top of the page after a successful login round trip.
+        response = RedirectResponse(url=f"{base}/dcf#account", status_code=302)
         try:
             await complete_login(
                 auth_client=auth_client,
