@@ -444,15 +444,20 @@
     <div class="card">
       <div class="card-head">
         <div>
-          <h3>Algorithmic Trading Bot</h3>
+          <h3>DCF Valuation API</h3>
+          <div class="org">
+            <a href="/dcf">Live &amp; documented</a>
+          </div>
         </div>
       </div>
-      <p>Engineered a Python automation module integrating the Alpaca API to automate equities and options
-      trading workflows, reducing manual intervention. Implemented contract filtering, live quote
-      retrieval, and order polling logic, and built a weekly automation routine to dynamically allocate
-      capital and execute options strategies within a defined strike-price range.</p>
+      <p>Designed and shipped a production REST API that computes discounted cash flow valuations for
+      public companies from caller-supplied assumptions, returning the full year-by-year projection and
+      a sensitivity grid so every number is auditable. Built the valuation engine as a pure,
+      deterministic core with heavy unit-test coverage, wrapped in provider ingestion with retries and
+      caching, API-key authentication, and per-key daily quotas. Deployed serverless with
+      Supabase-backed accounts and scheduled jobs that refresh fundamentals.</p>
       <div class="tags">
-        <span class="tag">Python</span><span class="tag">Alpaca API</span><span class="tag">Automation</span>
+        <span class="tag">Python</span><span class="tag">FastAPI</span><span class="tag">Supabase</span><span class="tag">Redis</span><span class="tag">Vercel</span>
       </div>
     </div>
 
@@ -527,7 +532,7 @@
     <div class="skill-group">
       <h4>Frameworks</h4>
       <div class="tags">
-        <span class="tag">React</span><span class="tag">Next.js</span><span class="tag">Angular</span><span class="tag">Spring Boot</span><span class="tag">Node.js</span>
+        <span class="tag">React</span><span class="tag">Next.js</span><span class="tag">Angular</span><span class="tag">Spring Boot</span><span class="tag">FastAPI</span><span class="tag">Node.js</span>
       </div>
     </div>
 
