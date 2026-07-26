@@ -10,6 +10,7 @@ import json
 import logging
 import time
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -17,6 +18,7 @@ from app.api import create_app
 from app.auth import APIKeyAuthenticator
 from app.observability import (
     JsonFormatter,
+    ScrubbingFilter,
     TextFormatter,
     configure_logging,
     increment,
@@ -373,3 +375,95 @@ def test_a_valuation_reports_where_its_time_went(logs):
     assert line["t_statements_ms"] >= 0
     assert line["t_compute_ms"] >= 0
     assert line["duration_ms"] >= line["t_statements_ms"]
+
+
+# ---------------------------------------------------------------------------
+# Loggers this app makes emit but does not own
+# ---------------------------------------------------------------------------
+#
+# `httpx` logs one `HTTP Request: <method> <url> "<status>"` line per outbound
+# call, and FMP puts its key in the query string. Those records never reach the
+# handler `configure_logging` installs, because that one sits on the `app` tree
+# — so before 2026-07-26 the key was written to production logs verbatim. These
+# tests pin the wiring, not just the scrubber: the leak was never in `scrub()`.
+
+
+@pytest.fixture
+def httpx_logs():
+    """Capture `httpx`'s own records the way a foreign handler would render them."""
+    configure_logging(level="INFO", log_format="json")
+    foreign = logging.getLogger("httpx")
+    rendered: list[str] = []
+
+    class _Handler(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            rendered.append(record.getMessage())
+
+    handler = _Handler()
+    previous_level = foreign.level
+    foreign.setLevel(logging.INFO)
+    foreign.addHandler(handler)
+    try:
+        yield rendered
+    finally:
+        foreign.removeHandler(handler)
+        foreign.setLevel(previous_level)
+
+
+def test_the_httpx_request_log_cannot_leak_the_provider_key(httpx_logs):
+    secret = "fmp-live-key-9d41c0"
+    client = FMPClient(api_key=secret, transport=fixture_transport())
+    asyncio.run(client.fetch_fundamentals("AAPL"))
+    asyncio.run(client.aclose())
+
+    assert httpx_logs, "httpx should have logged its outbound calls"
+    for line in httpx_logs:
+        assert secret not in line
+        assert f"apikey={REDACTED}" in line
+        # The rest of the line has to survive, or the fix trades a leak for
+        # blindness — this is the log that found the leak.
+        assert "symbol=AAPL" in line
+        assert '"HTTP/1.1 200 OK"' in line
+
+
+def test_a_live_price_url_cannot_leak_the_finnhub_token(httpx_logs):
+    logging.getLogger("httpx").info(
+        'HTTP Request: %s %s "%s %d %s"',
+        "GET",
+        httpx.URL("https://finnhub.io/api/v1/quote?symbol=AAPL&token=fh-secret-value"),
+        "HTTP/1.1",
+        401,
+        "Unauthorized",
+    )
+
+    line = httpx_logs[0]
+    assert "fh-secret-value" not in line
+    assert f"token={REDACTED}" in line
+    # 401 is the fact that mattered in production on 2026-07-26; an argument
+    # scrubbed into a string would have broken the `%d` and lost the whole line.
+    assert "401 Unauthorized" in line
+
+
+def test_scrubbing_a_record_leaves_non_string_arguments_alone():
+    record_ = logging.LogRecord(
+        name="httpx",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="%s took %d ms",
+        args=("GET", 42),
+        exc_info=None,
+    )
+    assert ScrubbingFilter().filter(record_) is True
+    assert record_.args == ("GET", 42)
+    assert record_.getMessage() == "GET took 42 ms"
+
+
+def test_configure_logging_does_not_stack_foreign_filters():
+    for _ in range(5):
+        configure_logging(level="INFO", log_format="json")
+    for name in ("httpx", "httpcore"):
+        managed = [
+            f for f in logging.getLogger(name).filters if getattr(f, "_pubtools_managed", False)
+        ]
+        assert len(managed) == 1, name

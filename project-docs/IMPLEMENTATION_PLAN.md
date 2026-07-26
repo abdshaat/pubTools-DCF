@@ -1548,7 +1548,12 @@ as the fallback when Redis is unconfigured or down.
   self-healing, TTL expiry, Redis-down fail-open, fingerprint properties,
   cross-instance login limiting, UTC-day reset, limiter fail-open.
   Suite: 276 → 292 passing, 94.04% coverage; ruff/format/mypy clean.
-- [ ] **Slice C — migration 003 + DB read-through/snapshot writes.**
+- [x] **Slice C — migration 003 + DB read-through/snapshot writes.** *(Closed
+  2026-07-26 — this box tracked Slice C's own scope, all of which is
+  implemented, migrated, deployed, and now live-confirmed by five consecutive
+  nightly runs. The Redis observations that remain are Slice A/B exit criteria
+  listed below, not Slice C work; leaving this open on their account made the
+  slice look stalled. `issues.MD` closed the equivalent box the same day.)*
   **Part 1 implemented 2026-07-18** (see PROGRESS.md): migration 003 drafted
   (tables + `store_ticker_snapshot` RPC; run-orchestration RPCs pending; not
   yet applied), price-free snapshot fingerprint, typed Supabase read/write
@@ -1628,15 +1633,23 @@ as the fallback when Redis is unconfigured or down.
 
 Exit criteria:
 
-- [ ] **(owner-blocked)** Two app instances sharing Redis serve the same ticker
+- [ ] **(live)** Two app instances sharing Redis serve the same ticker
   with exactly one provider load (proven in tests via a shared fake backend;
   live-verified on the deployment). Shared-backend test proof completed
-  2026-07-13; the live half needs `TODO.md` §4.1 (the Upstash REST credentials
-  are Vercel-only, so nothing local can reach the real instance).
-- [ ] **(owner-blocked)** A total Redis outage changes latency/cost only:
+  2026-07-13. **Re-classified from (owner-blocked) to (live) on 2026-07-26:**
+  route (b) of `TODO.md` §4.1 is now available — commit `912c9de` is deployed,
+  every log line carries `instance` and `cache`, and production logs are
+  readable from this session (a real keyed valuation logged `redis_calls: 6`,
+  `cache: database`, and several distinct `instance` ids appear across the
+  fleet). What is missing is the composed observation, not access. Caveat:
+  Vercel Hobby retains runtime logs for roughly an hour, so it must be captured
+  close to the traffic that produces it.
+- [ ] **(live)** A total Redis outage changes latency/cost only:
   valuations still succeed, auth/quota still fail closed via Supabase.
-  Test-proven; live confirmation needs §4.1 or a preview environment with
-  Supabase variables (§5.2).
+  Test-proven; live confirmation still needs either the REST credentials
+  locally (§4.1a) or a preview environment with Supabase variables (§5.2) —
+  production logs can show Redis *working*, but deliberately breaking
+  production Redis is not an acceptable way to observe it failing.
 - [x] Every distinct normalized financial `snapshot_version` fetched from the
   provider exists as exactly one immutable `normalized_snapshots` row; the
   ticker head points to the latest verified snapshot, and a cold cache/redeploy
@@ -1676,11 +1689,12 @@ Exit criteria:
   exists to carry anything — responses are `no-store`.) Test-proven
   2026-07-18 (`test_warm_instance_spanning_6pm_falls_back_to_db_until_refreshed`,
   plus the honest-stored-at cross-instance test).
-- [ ] **(owner-blocked)** Login rate limiting is enforced across instances, not
+- [ ] **(live)** Login rate limiting is enforced across instances, not
   per instance. Cross-instance behavior is test-proven against a shared fake
-  backend; live confirmation needs §4.1. (Phase 11 Slice 4 fixed the *identity*
-  this limiter keys on — before that, the per-IP cap behind Vercel's proxy was
-  one shared bucket.)
+  backend; live confirmation needs §4.1 — re-classified from (owner-blocked)
+  2026-07-26 for the same reason as the two above. (Phase 11 Slice 4 fixed the
+  *identity* this limiter keys on — before that, the per-IP cap behind Vercel's
+  proxy was one shared bucket.)
 - [x] Corrupt/foreign/unknown-version Redis entries are treated as misses and
   cleaned up, never surfaced as errors. Verified 2026-07-13 by envelope and
   end-to-end fundamentals-cache tests.
@@ -1939,7 +1953,7 @@ not at boot.
 `PUBLIC_BASE_URL` (`https://ashaat.dev`) and `CRON_SECRET` (32 random bytes) are
 set, and both pass; every numeric setting falls back to its previous default.
 
-### Slice 2 — Structured logs — **implemented 2026-07-25**
+### Slice 2 — Structured logs — **implemented 2026-07-25; the scrubbing item was re-opened and re-closed 2026-07-26 (it had not covered the `httpx` logger)**
 
 - [x] One line per request from `app/observability.py`: timestamp, level,
   request id, method, route **template**, status, `duration_ms`, plus what the
@@ -1951,12 +1965,34 @@ set, and both pass; every numeric setting falls back to its previous default.
   calls they are.
 - [x] Log level and format are settings, defaulting to JSON on Vercel and
   human-readable locally.
-- [x] Secrets and PII never reach a log: API keys (`dcf_live_…`), bearer/apikey
-  tokens, credential-bearing URLs (reusing Phase 10's `redact_url`), email
-  addresses, and any field whose *name* looks secret are scrubbed centrally,
-  recursively, before formatting. Tests feed each class through and assert the
-  emitted line is clean, including a rejected request whose presented key must
-  not survive.
+- [x] ⚠️ **Re-opened and re-closed 2026-07-26.** Secrets and PII never reach a log: API keys
+  (`dcf_live_…`), bearer/apikey tokens, credential-bearing URLs (reusing Phase
+  10's `redact_url`), email addresses, and any field whose *name* looks secret
+  are scrubbed centrally, recursively, before formatting. Tests feed each class
+  through and assert the emitted line is clean, including a rejected request
+  whose presented key must not survive. **This holds only for the `app` logger
+  tree.** `configure_logging()` deliberately installs its handler on
+  `logging.getLogger("app")` with `propagate = False` — correct as far as it
+  goes, but it leaves the **`httpx`** logger, which emits one
+  `HTTP Request: <full URL> -> <status>` line at INFO per outbound call,
+  entirely unscrubbed. FMP authenticates with `?apikey=` in the query string
+  (`app/providers/fmp.py:167`), so **`FMP_API_KEY` is written to production logs
+  in the clear** on every FMP call. Proven on the real deployment 2026-07-26 by
+  a Finnhub line that printed its `token=` value verbatim. The scrubbing
+  machinery was right; only its wiring was incomplete.
+  **Closed the same day:** `ScrubbingFilter` is attached by
+  `configure_logging()` to the `httpx`/`httpcore` loggers, where a logger-level
+  filter runs before propagation to the runtime's own handler. Filtering rather
+  than silencing, because those lines are what found both of that day's
+  production defects. The credential arrives as an `httpx.URL` in `record.args`,
+  so the filter scrubs arguments as well as the message, keeps `record.args` a
+  tuple, and leaves non-strings alone unless scrubbing changed them — the `%d`
+  status code has to stay an `int` or the record cannot format at all. 4 tests
+  (suite 457 → 461), plus live verification on real outbound calls:
+  `apikey=REDACTED` with `symbol`, `limit`, and the status still readable.
+  Follow-up for the owner — rotate `FMP_API_KEY` once this deploys, since the
+  old value is already in log storage (`TODO.md` §7). Full write-up in
+  `issues.MD` → "Live production defects found 2026-07-26".
 - [x] The access log is the **outermost** middleware, so short-circuited
   401/403/429 responses are logged too — the ones an operator most needs — and
   an unhandled exception logs once at ERROR before it propagates.
@@ -2082,8 +2118,13 @@ Exit criteria:
 - [x] The performance budgets are visible in production telemetry, not only in
   `scripts/load_probe.py` — round-trip counts and stage timings ride every
   request line and feed `/internal/metrics`.
-- [ ] **(owner)** SLOs and alert thresholds accepted (`RUNBOOKS.md` §6). This is
-  the only thing between Phase 11 and done.
+- [x] No credential reaches a log line from **any** logger the app causes to
+  emit, not only the `app` tree. Added 2026-07-26 after the `httpx` leak proved
+  the original criterion had been scoped to the loggers we own, which is not
+  where the risk was; closed the same day (see Slice 2).
+- [ ] **(owner)** SLOs and alert thresholds accepted (`RUNBOOKS.md` §6). With
+  the log leak fixed, this is once again the only thing between Phase 11 and
+  done.
 
 ## Phase 12 — Historical analysis and richer assumptions
 

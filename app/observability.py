@@ -194,6 +194,52 @@ def outbound_counter(service: str) -> dict[str, list[Any]]:
 # ---------------------------------------------------------------------------
 
 
+# Loggers outside the `app` tree that this app causes to emit credential-bearing
+# text. `httpx` logs one `HTTP Request: <method> <url> "<status>"` line at INFO
+# per outbound call, and FMP authenticates with `?apikey=` **in the URL**, so
+# those records carry a live secret (`app/providers/fmp.py`; Finnhub's `?token=`
+# likewise). They never pass through the handler installed below — that one is
+# on the `app` tree — so the scrubbing has to be attached to the emitting logger
+# itself, where it runs before propagation to whatever handler the runtime
+# installed. Found on the real deployment 2026-07-26: a production log line had
+# printed a provider credential verbatim.
+_FOREIGN_LOGGERS = ("httpx", "httpcore")
+
+
+class ScrubbingFilter(logging.Filter):
+    """Redact a record's message and `%`-arguments in place.
+
+    A filter, not a formatter, because these records are rendered by somebody
+    else's handler and we do not control it. Always returns True: this redacts
+    records, it never drops them — silencing `httpx` would also throw away the
+    per-call visibility that found this leak in the first place.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.msg, str):
+            record.msg = scrub(record.msg)
+        args = record.args
+        if isinstance(args, Mapping):
+            record.args = scrub(dict(args))
+        elif isinstance(args, tuple):
+            record.args = tuple(_scrub_argument(arg) for arg in args)
+        return True
+
+
+def _scrub_argument(value: Any) -> Any:
+    """Redact one `%`-style argument without breaking its format specifier.
+
+    Non-strings are replaced only when scrubbing actually changed something: an
+    `httpx.URL` must become a redacted string, but the `int` behind a `%d` has
+    to stay an `int` or the record fails to format.
+    """
+    if isinstance(value, str):
+        return scrub(value)
+    text = str(value)
+    scrubbed = scrub(text)
+    return scrubbed if scrubbed != text else value
+
+
 class JsonFormatter(logging.Formatter):
     """One JSON object per line, scrubbed, with telemetry fields inlined."""
 
@@ -248,6 +294,25 @@ def configure_logging(*, level: str = "INFO", log_format: str = "text") -> None:
     # The app's own tree only; never reconfigure the root logger, which belongs
     # to whoever embeds this app.
     root.propagate = False
+    _install_foreign_scrubbers()
+
+
+def _install_foreign_scrubbers() -> None:
+    """Redact the loggers this app makes emit but does not own.
+
+    Deliberately narrow: it adds a filter and changes nothing else about those
+    loggers — no level, no handler, no `propagate`. Whoever embeds this app
+    still decides whether httpx logs at all and where the lines go; this only
+    guarantees that if they are emitted, they carry no credential.
+    """
+    for name in _FOREIGN_LOGGERS:
+        foreign = logging.getLogger(name)
+        for existing in list(foreign.filters):
+            if getattr(existing, "_pubtools_managed", False):
+                foreign.removeFilter(existing)
+        scrubber = ScrubbingFilter()
+        scrubber._pubtools_managed = True  # type: ignore[attr-defined]
+        foreign.addFilter(scrubber)
 
 
 # ---------------------------------------------------------------------------

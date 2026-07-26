@@ -5,10 +5,78 @@ a product decision. Nothing in this file is something Claude can complete alone.
 Each item says what it unblocks, so you can skip sections that aren't relevant
 yet.
 
-Last updated 2026-07-25.
+Last updated 2026-07-26.
 
-**Fastest path to unblocking real work:** Section 1 (deploy the site you already
-have) and Section 2 (four one-line answers). Section 3 unblocks the next feature.
+**Do this first:** §6 — the production Finnhub key is wrong and every live
+valuation is currently returning a null price. One dashboard edit. Everything
+else here is smaller.
+
+---
+
+## 6. ⚠️ Blocking now — the production `FINNHUB_API_KEY` is not a valid key
+
+Found 2026-07-26 by reading production runtime logs. A real keyed
+`GET /v1/valuations/AAPL` at 19:25 UTC produced:
+
+```
+GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=X-Finnhub-Token -> 401 Unauthorized
+... "price": "unavailable"
+```
+
+So **every production valuation is serving `current_price: null` and
+`upside_pct: null`** right now. The math is correct and the response is a 200 —
+ADR-008's outage degrade is working exactly as designed, which is precisely why
+this was invisible until someone read the logs.
+
+It is the *value* that is wrong, not the key itself and not the code: the key in
+your local `.env` returns **HTTP 200** for the same symbol, and the variable is
+present in Vercel for Preview + Production. The token in the log line reads
+`X-Finnhub-Token` — the name of Finnhub's auth *header* — which is what you'd
+see if the header name got pasted where the key value belongs.
+
+- [ ] **6.1 — Replace `FINNHUB_API_KEY` in Vercel.** Vercel → `pub-tools-dcf` →
+  Settings → Environment Variables → `FINNHUB_API_KEY` → set it to the
+  40-character key from your Finnhub dashboard (the same one already in your
+  local `.env`). Do **Production**; check **Preview** while you are there, since
+  both were created in the same edit. Then redeploy (env changes need a new
+  deployment to take effect — the 2026-07-16 lesson).
+- [ ] **6.2 — Confirm.** One valuation whose JSON has a non-null
+  `current_price`. Anything else means the new value is wrong too.
+
+**Unblocks:** the live-price feature actually being live. Nothing else is
+affected — statements, quotas, auth, and the nightly refresh are all healthy.
+
+---
+
+## 7. Rotate `FMP_API_KEY` — after the log-scrubbing fix is deployed
+
+Your FMP key has been written to Vercel's log storage in plaintext. FMP
+authenticates with `?apikey=` **in the URL**, and the `httpx` library logs every
+outbound request URL — those records bypassed our scrubber, which was installed
+only on the app's own logger tree. Every FMP call emitted the key: 4 per nightly
+refresh, plus any cold ticker.
+
+**The code fix is done** (2026-07-26, `app/observability.py` — the `httpx` and
+`httpcore` loggers are now scrubbed; live-verified showing `apikey=REDACTED`).
+That stops new leakage. It cannot un-log what is already stored, so the key
+itself should be replaced.
+
+**Order matters — do not rotate first.** A new key issued before the fix is
+deployed just gets logged too.
+
+- [ ] **7.1 — Deploy the fix.** It is committed to `main`; a push deploys it.
+- [ ] **7.2 — Confirm it took.** After a cold ticker or the next 6 PM Eastern
+  refresh, the FMP line in the runtime logs should read `apikey=REDACTED`.
+- [ ] **7.3 — Then rotate.** FMP dashboard → issue a new key → update
+  `FMP_API_KEY` in Vercel (Production **and** Preview) → redeploy → revoke the
+  old key.
+
+**Severity, honestly:** the exposure is to Vercel's log storage, which only your
+account can read, and Hobby-tier runtime logs are retained for roughly an hour.
+This is prudent hygiene, not an active breach — but a provider key in plaintext
+logs is worth closing out properly.
+
+**Unblocks:** nothing. It is cleanup you should do once, at your convenience.
 
 ---
 
@@ -91,7 +159,10 @@ The plan is written and approved; implementation needs a key.
 
 - [x] **3.1 — Create a free Finnhub account.** Done 2026-07-17.
 - [x] **3.2 — Add `FINNHUB_API_KEY` to Vercel.** Done 2026-07-17 — confirmed via
-  `vercel env ls`: present for **Preview and Production**.
+  `vercel env ls`: present for **Preview and Production**. ⚠️ **2026-07-26: the
+  variable is present but its *value* is not a working key** — Finnhub returns
+  401 in production. `vercel env ls` can only prove presence, never validity, so
+  this box stays closed and the value problem is tracked separately as **§6**.
 - [x] **3.3 — Add `FINNHUB_API_KEY` to your local `.env`.** Done 2026-07-17
   (after a save-the-file false start). Live-verified same day: real AAPL/MSFT
   quotes fetched and normalized, unknown symbol correctly classified, and the
@@ -120,22 +191,30 @@ Eastern refresh job.
 > The immutable snapshot table still holds exactly one row while the ticker head
 > advances daily, which is the dedup design working. Only §4.1 remains.
 
-- [ ] **4.1 — Give me a way to observe the real Redis.** ⚠️ **`vercel env pull`
-  cannot do this** — tried 2026-07-26 for both Development and Production: the
-  CLI writes the variable *names* with **empty values**, because every variable
-  in this project is stored as Sensitive (write-only). That is true of
-  `SUPABASE_URL` and `FMP_API_KEY` too, so it is a property of the project, not
-  of Upstash. Two ways forward, pick either:
+- [ ] **4.1 — Observe the real Redis.** ⚠️ **`vercel env pull` cannot do this**
+  — tried 2026-07-26 for both Development and Production: the CLI writes the
+  variable *names* with **empty values**. That is true of `SUPABASE_URL` and
+  `FMP_API_KEY` too, so it is a property of the project, not of Upstash.
+  **Update 2026-07-26 (later): this may now need nothing from you.** Route (b)
+  is unblocked — commit `912c9de` is deployed (production `/health` reports
+  `instance`), and this session read the production logs directly through the
+  Vercel MCP: multiple distinct `instance` ids serving the fleet, and a real
+  keyed valuation logging `redis_calls: 6` with `cache: database`. So Redis is
+  demonstrably reachable and in use in production; what is left is composing the
+  specific two-instance/outage observations from those logs. Note Vercel's
+  runtime-log retention on Hobby is short (about an hour), so the observation
+  has to be made close to the traffic that produces it.
   - **(a) Paste the two REST values into `.env` yourself** — Vercel → Storage →
-    your Upstash database → REST API → `UPSTASH_REDIS_REST_URL` and
-    `UPSTASH_REDIS_REST_TOKEN`. Then I can run the two-instance and outage
-    checks locally in minutes.
-  - **(b) Deploy the current work and let production answer it** —
-    *recommended*. Each log line now carries `instance` and `cache`
-    (`l1`/`l2`/`database`/`provider`), so two different instances serving one
-    ticker with a single provider load is directly visible in the logs, on the
-    real fleet, with no credential ever leaving Vercel. This is strictly better
-    evidence than a laptop pretending to be two instances.
+    your Upstash database → REST API. Then the two-instance and outage checks
+    can run locally in minutes. *(Naming note: this project's Vercel variables
+    are actually `KV_REST_API_URL` / `KV_REST_API_TOKEN`, provisioned by the
+    Vercel–Upstash integration; `RedisConfig.from_env()` accepts either those or
+    the `UPSTASH_REDIS_REST_*` pair, so paste whichever the dashboard shows.)*
+  - **(b) Let production answer it** — *recommended, and now available*. Each
+    log line carries `instance` and `cache` (`l1`/`l2`/`database`/`provider`),
+    so two different instances serving one ticker with a single provider load is
+    directly visible on the real fleet, with no credential ever leaving Vercel.
+    Strictly better evidence than a laptop pretending to be two instances.
 - [x] **4.2 — Generate a `CRON_SECRET` and add it to Vercel Production.** Done
   2026-07-20 using a cryptographically random 32-byte value stored as a
   Vercel Sensitive variable. The value is not stored locally or committed.
@@ -214,13 +293,16 @@ for a year is single-digit MB.
 
 | You do | I can then do |
 |---|---|
-| §1 (domain) | Finish Phase 9; verify the live site end to end |
-| §2.1 (course page) | Migrate + restyle that page |
-| ~~§3 (Finnhub key)~~ | ~~Build and live-verify the real-time price feature~~ Done 2026-07-18 (uncommitted) |
-| §4.1 (env pull) | Verify Redis against the real Upstash instance |
-| §4.2–4.4 | Ship Phase 8 Slice C live + enable the daily refresh cron |
+| **§6 (Finnhub key value)** | **Nothing — but production stops serving null prices** |
+| §7 (deploy, then rotate `FMP_API_KEY`) | Nothing — it closes out the plaintext-key exposure |
+| §1.4c + §1.5 (domain) | Close Phase 9's last exit criteria |
+| ~~§2.1 (course page)~~ | ~~Migrate + restyle that page~~ Answered: dropped |
+| ~~§3 (Finnhub key)~~ | ~~Build and live-verify the real-time price feature~~ Done 2026-07-18 |
+| §4.1 (Redis observation) | Close the last three Phase 8 boxes — *may need nothing from you now; see the 2026-07-26 update* |
+| ~~§4.2–4.4~~ | ~~Ship Phase 8 Slice C live + enable the daily refresh cron~~ Done; five clean runs observed |
 | §4b (evidence backend) | Give production a durable raw-capture trail (Phase 10 Slice 2) |
-| Nothing | Phase 11 (typed settings, structured logs, metrics) can start anytime |
+| §6 of `RUNBOOKS.md` (SLOs) | Close the last Phase 11 item |
+| Nothing | P3 (fold the usage event into the quota RPC, migration 005) and Phase 12 |
 
 ## Also worth knowing
 
@@ -251,11 +333,18 @@ for a year is single-digit MB.
   the default there). Too low merges every caller into one sign-in bucket; too
   high lets a caller forge their address. Nothing to do unless your topology
   changes.
-- **Current state:** 451 tests passing, 94.84% coverage; ruff/format/mypy clean.
-  Slice C parts 3a–3b are committed in `a1131e2`; migration 004 is applied.
-  Phase 10 Slice 1 (raw-evidence capture) landed 2026-07-25 and needs no
-  deployment step — it changes only local behavior. Remaining: local/live Redis
-  observation (§4.1), observing the next real cron run, and the §4b decision.
+- **The log-scrubbing fix is done** (2026-07-26): the `httpx`/`httpcore` loggers
+  are scrubbed, so provider keys no longer reach the logs. It needs a deploy,
+  and then the key rotation in §7. See `issues.MD` → "Live production defects
+  found 2026-07-26".
+- **Current state 2026-07-26:** 461 tests passing, 94.88% coverage;
+  ruff/format/mypy clean; working tree clean and `main` fully pushed. Commit
+  `912c9de` (Phase 11 Slices 1–4 + P1/P2) is **deployed** — production `/health`
+  returns `instance`, confirming the new code is live. Migrations 001–004 are
+  applied; **005 does not exist yet** (P3 is unstarted). Phase 10 Slice 1
+  (raw-evidence capture) needs no deployment step — it changes only local
+  behavior. Remaining: §6, the Redis observation (§4.1), the §4b decision, and
+  the SLO sign-off.
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

@@ -1,4 +1,81 @@
-# Issues — production sign-in investigation (2026-07-13)
+# Issues
+
+## ⚠️ Live production defects found 2026-07-26 (doc/state audit)
+
+Both were found by reading the real production runtime logs (Vercel MCP,
+`pub-tools-dcf` production, deployment `dpl_9gYqAHSc…` = commit `912c9de`).
+Neither is visible from tests, which is why they survived a green suite.
+
+- [ ] **(owner) The production `FINNHUB_API_KEY` value is not a valid key —
+  every production valuation is returning a null price.** A real keyed
+  `GET /v1/valuations/AAPL` on 2026-07-26 19:25 UTC logged
+  `GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=X-Finnhub-Token
+  "HTTP/1.1 401 Unauthorized"` and closed with `"price": "unavailable"`. So
+  ADR-008's headline feature — the live market price — is silently off in
+  production, and the null-price degrade (working exactly as designed) is what
+  hides it. Evidence it is the *value*, not the key or the code: the key in the
+  local `.env` (40 characters) returns **HTTP 200** for the same symbol from
+  this machine, and the variable *is* present in Vercel for Preview +
+  Production (`vercel env ls`, added 9 days ago). The logged token reads
+  `X-Finnhub-Token`, which is the name of Finnhub's auth *header* — consistent
+  with the header name having been pasted where the key value belongs. **Fix:**
+  Vercel → `pub-tools-dcf` → Settings → Environment Variables → replace
+  `FINNHUB_API_KEY` (Production, and check Preview) with the 40-character key
+  from the Finnhub dashboard, then redeploy. Confirm with one valuation whose
+  response carries a non-null `current_price`. Also in `TODO.md` §6.
+- [x] **The `httpx` INFO log prints full outbound request URLs, and the FMP key
+  rides in the URL query string — so `FMP_API_KEY` is written to production
+  logs in the clear.** **Fixed 2026-07-26** (same session, details below the
+  original description). `configure_logging()` installs the scrubbing handler on
+  the **`app`** logger tree only (`app/observability.py`, `logging.getLogger("app")`
+  + `propagate = False`), which is correct for our own lines but leaves the
+  `httpx` logger untouched; on Vercel those records still reach stdout. Proven
+  by the Finnhub line above (a credential printed verbatim). FMP builds
+  `{"symbol": ticker, "apikey": self._api_key, …}` as query params
+  (`app/providers/fmp.py:167`), so **every** FMP call — 4 per nightly refresh,
+  plus any cold ticker — emits the key. Supabase and Upstash are unaffected
+  (their credentials are headers). This contradicts the Phase 11 Slice 2 claim
+  that "secrets and PII never reach a log", which holds only inside the `app`
+  tree. **Fix (code, not owner):** either silence/raise the level of the
+  `httpx` logger at startup, or attach a scrubbing filter to it — the existing
+  `scrub()`/`redact_url()` already do the work; the gap is only which logger
+  they are wired to. Rotate `FMP_API_KEY` afterwards, since the current value
+  has been in log storage.
+
+  **Fix, as shipped (2026-07-26).** `ScrubbingFilter` in `app/observability.py`,
+  attached by `configure_logging()` to the `httpx` and `httpcore` loggers.
+  Filtering, not silencing: a logger-level filter runs *before* propagation to
+  whatever handler the runtime installed, which is the only hook available for a
+  logger this app does not own. **Silencing `httpx` was rejected** — those lines
+  are what exposed both defects in this section, so the fix redacts them rather
+  than throwing away the visibility. Three details that made it non-trivial:
+  (1) the URL arrives as an `httpx.URL` in `record.args`, not in `record.msg`,
+  so scrubbing the message alone would have caught nothing; (2) `record.args`
+  must stay a **tuple** or `%`-formatting breaks; (3) arguments are only
+  replaced when scrubbing actually changed the text, so the `int` behind the
+  `%d` status code stays an `int` — otherwise the record fails to format and the
+  whole line is lost, which is how a redaction fix turns into an outage in the
+  logs. The filter is idempotent across repeated `configure_logging()` calls
+  (marked and removed like the handler), and it touches nothing else about those
+  loggers — no level, no handler, no `propagate`, so an embedder still decides
+  whether httpx logs at all.
+  **Tests: 4 new** in `tests/test_observability.py` (suite **457 → 461**, 94.88%
+  coverage; ruff/format/mypy clean) — a real `FMPClient.fetch_fundamentals` call
+  whose key must not appear in any emitted line while `symbol=AAPL` and the
+  status still do, the Finnhub `token=` shape with its `401` preserved, the
+  non-string-argument guard, and filter-stacking.
+  **Live-verified outside pytest** against real outbound calls, reproducing
+  Vercel's stdout handler at INFO — before: `…&token=fake-key-DO-NOT-USE-1234567890
+  "HTTP/1.1 401 Unauthorized"`; after: `…&token=REDACTED "HTTP/1.1 401
+  Unauthorized"`; and the FMP shape as
+  `…income-statement?symbol=AAPL&apikey=REDACTED&limit=8`. *(The verification
+  script deliberately avoided importing `app.api`, because that path calls
+  `load_dotenv()` and would restore real credentials — the trap recorded in
+  `PROGRESS.md` on 2026-07-26.)*
+  ⚠️ **Still owner-side: rotate `FMP_API_KEY` after this deploys** — the current
+  value has already been written to Vercel's log storage. `TODO.md` §7.
+
+# Production sign-in investigation (2026-07-13)
 
 Symptom reported: signing in from the production URL only works when the app
 is also running locally.
@@ -69,7 +146,13 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
 
 ## Needs the project owner (Supabase dashboard / decisions)
 
-- [ ] **Supabase Auth URL configuration must match the real domain.** In
+- [x] **Supabase Auth URL configuration must match the real domain.** Closed
+  2026-07-26 as **superseded**: this item was written for the
+  `pub-tools-dcf-nu.vercel.app` host, which the Phase 9 migration to
+  `ashaat.dev` replaced. The live equivalents were completed by the owner —
+  `PUBLIC_BASE_URL = https://ashaat.dev` and the matching Supabase redirect
+  allowlist entry (`TODO.md` §1.3/§1.4) — and sign-in has since been observed
+  completing in production. Original wording below for history. In
   Supabase → Authentication → URL Configuration:
   - Add `https://pub-tools-dcf-nu.vercel.app/v1/auth/callback` to the
     Redirect URLs allowlist (the allowlisted URL from Phase 6 used the dead
@@ -86,9 +169,12 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
   unauthenticated behind the in-process limiter) and sign-in unconfigured.
   Decide whether previews should mirror production auth; if so, add the vars
   for Preview with a preview-appropriate `PUBLIC_BASE_URL`.
+  *(Re-confirmed 2026-07-26 via `vercel env ls production`: all three are still
+  Production-only. Tracked for the owner as `TODO.md` §5.2 — this is the same
+  item, not a second one.)*
 - [ ] **Custom SMTP in Supabase** before relying on email magic-link login
   for real customer volume (carried over from Phase 6 — default sender is
-  rate-limited/dev-oriented).
+  rate-limited/dev-oriented). *(Same item as `TODO.md` §5.1.)*
 
 ## Pre-existing findings from the 2026-07-13 plan-vs-code audit
 
@@ -178,27 +264,47 @@ exactly as the 2026-07-13 `PUBLIC_BASE_URL` incident above did.
 
 **The domain is `ashaat.dev`** (confirmed by the owner 2026-07-16).
 
-- [ ] **Remove `ashaat.dev` from the standalone portfolio Vercel project**
-  (a domain can only be attached to one project at a time).
-- [ ] **Add `ashaat.dev` to the `pub-tools-dcf` project** and verify DNS
-  resolves. Decide whether `www.ashaat.dev` should redirect to the apex.
-- [ ] **Update Production `PUBLIC_BASE_URL`** to `https://ashaat.dev` and
-  redeploy. The OAuth/magic-link `redirect_to` is built from this value; a stale
-  value sends users to the old host after sign-in.
-- [ ] **Add `https://ashaat.dev/v1/auth/callback`** to Supabase →
+> **Status sync 2026-07-26.** These boxes had gone stale against `TODO.md` §1,
+> which is the owner's live queue and records the work as done. Corrected here
+> so the two files stop contradicting each other. What is genuinely still open
+> is only §1.4c (apex is not the primary host) and §1.5 (a sign-in round trip
+> tested with the local server stopped).
+
+- [x] **Remove `ashaat.dev` from the standalone portfolio Vercel project**
+  (a domain can only be attached to one project at a time). Done by the owner
+  (`TODO.md` §1.1).
+- [x] **Add `ashaat.dev` to the `pub-tools-dcf` project** and verify DNS
+  resolves. Done (`TODO.md` §1.2). ⚠️ The www/apex direction was *not* settled
+  the way the owner intended — see §1.4c and the note below.
+- [x] **Update Production `PUBLIC_BASE_URL`** to `https://ashaat.dev` and
+  redeploy. Done 2026-07-16 (`TODO.md` §1.3); the login redirect was
+  live-verified emitting `redirect_to=https://ashaat.dev/v1/auth/callback`.
+- [x] **Add `https://ashaat.dev/v1/auth/callback`** to Supabase →
   Authentication → URL Configuration → Redirect URLs, and review the Site URL.
-  Supabase only honors allow-listed redirect targets. (The previously
-  allow-listed `pub-tools-dcf-nu.vercel.app` callback can stay for now — the
-  vercel.app host keeps working — but `PUBLIC_BASE_URL` decides which host
-  sign-in actually returns to, so only one completes a round trip.)
+  Done by the owner (`TODO.md` §1.4). Supabase only honors allow-listed
+  redirect targets. (The previously allow-listed `pub-tools-dcf-nu.vercel.app`
+  callback can stay — the vercel.app host keeps working — but
+  `PUBLIC_BASE_URL` decides which host sign-in actually returns to, so only one
+  completes a round trip.)
+- [ ] **⚠️ Flip the primary domain to the apex** (`TODO.md` §1.4c).
+  Re-verified live 2026-07-26: `https://ashaat.dev/` still returns **308 →
+  `https://www.ashaat.dev/`**, i.e. www is still primary, the reverse of the
+  stated intent. It works only because the 308 preserves `?code=`, and the
+  PKCE `pt_oauth_verifier` cookie is host-only.
 - [x] **Update the hardcoded base URL in `docs/index.html`** →
   `https://ashaat.dev`. Done 2026-07-16: both curl examples updated. The
   endpoint builder needed no change — `defaultBaseUrl()` derives from
   `window.location.origin`, so it follows whatever host serves the page.
 - [ ] **Test on `https://ashaat.dev` with the local server stopped:** `/`
   portfolio, `/apis` directory, `/dcf` tool, a full GitHub **and** email sign-in
-  round trip landing on `/dcf`, and a valuation request.
-- [ ] **Retire the old portfolio Vercel project** once `ashaat.dev` resolves here.
+  round trip landing on `/dcf`, and a valuation request. *(Still open as
+  `TODO.md` §1.5, though production logs on 2026-07-26 show a real browser
+  completing `/v1/auth/me`, key create/revoke, and a 200 valuation — so the
+  round trip does work; what is missing is the owner's deliberate
+  local-server-stopped confirmation.)*
+- [x] **Retire the old portfolio Vercel project** once `ashaat.dev` resolves
+  here. Done (`TODO.md` §1.6); `vercel list-projects` shows `pub-tools-dcf` as
+  the only project on the account (verified 2026-07-26).
 
 Notes for whoever does this:
 
@@ -211,9 +317,15 @@ Notes for whoever does this:
 - 4 images in the source portfolio repo were **not** copied because nothing
   referenced them (`AWS-Certified-Cloud-Practitioner-logo.png`, `GithubLogo.png`,
   `Java_programming_language_logo.svg.png`, `OutlookLogo.jpg`).
+  **Updated 2026-07-17 (`TODO.md` §2.3):** the AWS logo is now in use — a
+  Certified Cloud Practitioner card was added to the certifications section, and
+  production logs confirm `/Pics/AWS-Certified-Cloud-Practitioner-logo.png`
+  serving 200. The other three stay skipped (two are non-transparent duplicates,
+  one has no section). **Still owner-side:** supply the certification's earned
+  date (or "in progress") so the card can show it — no date was invented.
 - The source portfolio repo also has a second page (`portfolio.html`, "Course
-  Portfolio") that was **not** migrated; its nav link was dropped. Decide whether
-  it should come across.
+  Portfolio") that was **not** migrated; its nav link was dropped. **Decided
+  2026-07-17 (`TODO.md` §2.1): drop it.** Nothing further to do.
 
 ## Feature: real-time current price from Finnhub, never cached (planned 2026-07-16)
 

@@ -1,5 +1,103 @@
 # Progress Log
 
+## 2026-07-26 (last) — Documentation audit; two live production defects found, one fixed
+
+The task was to reconcile `issues.MD`, `PROGRESS.md`, and
+`IMPLEMENTATION_PLAN.md` against the working tree and the real deployment. The
+docs turned out to be in good shape; **production did not.** The audit found two
+defects that no test could have caught, because both live in configuration and
+in a logger the app does not own. The second was then fixed on the owner's
+go-ahead; the first is theirs (a Vercel value).
+
+- **Verified state, not asserted:** suite **457 passing, 94.88% coverage**
+  (matches the previous entry exactly); ruff lint + format and mypy clean;
+  working tree clean and `main` level with `origin/main`. Migrations 001–004
+  exist; **005 does not**, confirming P3 is genuinely unstarted — the commit
+  named `p3` (`912c9de`) is the P1/P2 + Phase 11 bundle, not P3. Commit
+  `912c9de` **is deployed**: production `/health` returns
+  `{"status":"ok","model_version":"0.2.0","environment":"production","instance":"eecada4b"}`.
+- **⚠️ Defect 1 — the production Finnhub key is not a valid key, so every live
+  valuation is serving a null price.** A real keyed `GET /v1/valuations/AAPL` at
+  19:25 UTC logged `finnhub.io/api/v1/quote?symbol=AAPL&token=X-Finnhub-Token`
+  → **401**, and the request line closed with `"price": "unavailable"`. ADR-008's
+  null-price degrade is working perfectly, which is exactly why this was
+  invisible: the endpoint returns 200 with correct math and no price. The value
+  is the problem, not the key and not the code — the 40-character key in the
+  local `.env` returns **HTTP 200** for the same symbol, and the variable is
+  present in Vercel for Preview + Production. The logged token is the literal
+  string `X-Finnhub-Token`, the name of Finnhub's auth *header*. Owner fix:
+  `TODO.md` §6. **Lesson worth keeping: `vercel env ls` proves presence and
+  never validity**, and the docs had been treating "present" as "working" since
+  2026-07-17.
+- **⚠️ Defect 2 — `FMP_API_KEY` is being written to production logs in the
+  clear.** `configure_logging()` installs the scrubbing handler on
+  `logging.getLogger("app")` with `propagate = False`. That is right for our own
+  lines and leaves the **`httpx`** logger — which emits one
+  `HTTP Request: <full URL> -> <status>` at INFO per outbound call — completely
+  unscrubbed; on Vercel those records still reach stdout. FMP authenticates with
+  `?apikey=` in the query string (`app/providers/fmp.py:167`), so every FMP call
+  (4 per nightly refresh, plus any cold ticker) prints the key. The Finnhub line
+  above is the proof: a credential rendered verbatim in a production log.
+  Supabase and Upstash are unaffected — their credentials are headers. This
+  **re-opened** the Phase 11 Slice 2 claim that "secrets and PII never reach a
+  log"; the scrubbing machinery was correct, only its wiring was incomplete.
+- **Defect 2 fixed the same session.** `ScrubbingFilter` in
+  `app/observability.py`, attached by `configure_logging()` to the `httpx` and
+  `httpcore` loggers. A **logger-level filter** is the hook that works here: it
+  runs before propagation to whatever handler the runtime installed, which is
+  the only thing we control for a logger we do not own — and it changes nothing
+  else about those loggers (no level, no handler, no `propagate`).
+  **Filtering, not silencing**: those `httpx` lines are exactly what exposed
+  both of today's defects, so throwing them away to stop the leak would have
+  paid for redaction with blindness. Three things made it more than a one-liner:
+  (1) the credential arrives as an `httpx.URL` in **`record.args`**, not in
+  `record.msg`, so scrubbing the message alone would have caught nothing;
+  (2) `record.args` must stay a **tuple** or `%`-formatting breaks; (3) a
+  non-string argument is replaced **only if scrubbing changed it**, so the `int`
+  behind the `%d` status code stays an `int` — stringify it and the record fails
+  to format, turning a redaction fix into a total loss of the line. Idempotent
+  across repeated `configure_logging()` calls, like the handler.
+  **Suite 457 → 461, 94.88% coverage**; ruff/format/mypy clean. The tests pin
+  the *wiring*, since the bug was never in `scrub()`: a real
+  `FMPClient.fetch_fundamentals` call asserts the key is absent from every
+  emitted line while `symbol=AAPL` and `"HTTP/1.1 200 OK"` survive.
+  **Live-verified outside pytest** on real outbound calls, reproducing Vercel's
+  stdout handler at INFO — before: `…&token=fake-key-DO-NOT-USE-1234567890`;
+  after: `…&token=REDACTED`; FMP shape:
+  `…income-statement?symbol=AAPL&apikey=REDACTED&limit=8`. The verification
+  script deliberately did **not** import `app.api`, because that path calls
+  `load_dotenv()` and would restore real credentials — the same trap recorded in
+  the entry below, avoided by construction this time rather than by care.
+  **Still owner-side:** deploy, then rotate `FMP_API_KEY` (`TODO.md` §7) — the
+  fix stops new leakage but cannot un-log what is already stored.
+- **`TODO.md` §4.1 is closer than it read.** Route (b) is live: `instance` and
+  `cache` ride every log line and production logs are readable through the
+  Vercel MCP — a real valuation logged `redis_calls: 6` with `cache: database`,
+  and several distinct `instance` ids appear across the fleet, so Redis is
+  demonstrably shared and in use. The three Phase 8 Redis exit criteria were
+  re-classified **(owner-blocked) → (live)**. Two caveats recorded: Hobby
+  retains runtime logs for about an hour, and the *outage* criterion still needs
+  §4.1a or a preview environment, because breaking production Redis on purpose
+  is not an acceptable observation method. Also corrected: this project's Vercel
+  variables are `KV_REST_API_URL`/`KV_REST_API_TOKEN` (the Vercel–Upstash
+  integration's names), not `UPSTASH_REDIS_REST_*`; `RedisConfig.from_env()`
+  accepts either.
+- **Doc reconciliation.** `issues.MD`'s Phase 9 checklist still showed five
+  owner steps open that `TODO.md` §1 records as done (domain moved,
+  `PUBLIC_BASE_URL`, Supabase allowlist, old project retired) — synced, with the
+  genuinely-open §1.4c and §1.5 called out. The superseded
+  `pub-tools-dcf-nu.vercel.app` allowlist item was closed as superseded rather
+  than left contradicting Phase 9. Phase 9's image and second-page notes were
+  updated with the 2026-07-17 decisions. `IMPLEMENTATION_PLAN.md`'s Slice C box
+  was closed (its own scope is complete; only Slice A/B exit criteria remain).
+  `TODO.md`'s stale counts (451 → 457) and its blocked-on table were refreshed.
+- **Re-verified live, unchanged:** `https://ashaat.dev/` still **308s to
+  `www.ashaat.dev`** — §1.4c is still real, not stale.
+- Next: P3 + migration 005, then Phase 12. Owner-side, in order: §6 (the
+  Finnhub value — production is serving null prices until it lands), deploy this
+  work and then §7 (`FMP_API_KEY` rotation), the SLO sign-off, §1.4c/§1.5,
+  and §4b.
+
 ## 2026-07-26 (later) — Env-pull dead end, instance identity, and performance items P1 + P2
 
 Owner ran `vercel env pull` to unblock TODO 4.1.
@@ -1587,9 +1685,27 @@ specs live in CLAUDE.md; this file is only the running state.
 
 ## Current state (TL;DR)
 
+*(Verified against the working tree and the live deployment 2026-07-26.)*
+
+- **⚠️ One live production defect is open right now:** the **production
+  `FINNHUB_API_KEY` value is not a valid key** — Finnhub returns 401, so every
+  live valuation serves `current_price: null` behind ADR-008's working outage
+  degrade. Owner fix, one dashboard edit: `TODO.md` §6. Found 2026-07-26 by
+  reading real production logs; no test could have caught it, because the
+  variable *is* set and the code *is* correct.
+- **Fixed the same day:** the `httpx` logger was not scrubbed, so `FMP_API_KEY`
+  (which rides in FMP's URL query string) was written to production logs in the
+  clear. `ScrubbingFilter` now covers the `httpx`/`httpcore` loggers.
+  **Awaiting deploy, and then a key rotation** (`TODO.md` §7) — the fix stops
+  new leakage but cannot un-log what is stored. Both defects are written up in
+  `issues.MD` → "Live production defects found 2026-07-26".
+- **Deployment:** commit `912c9de` (Phase 11 Slices 1–4 + P1/P2) is live —
+  production `/health` returns an `instance` id. The log-scrubbing fix is newer
+  than that and **not yet deployed**. Migrations 001–004 applied; **005 does not
+  exist** (P3 unstarted).
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **457 passing tests (94.88% coverage, 93% floor)**;
+  verification, and **461 passing tests (94.88% coverage, 93% floor)**;
   ruff/format/mypy clean. Performance items **P1** (last-used write coalesced
   off the critical path) and **P2** (statements and live price fetched
   concurrently) landed 2026-07-26: a warm keyed request now costs 3 Supabase
@@ -1615,7 +1731,9 @@ specs live in CLAUDE.md; this file is only the running state.
   Redis `fund:`/`profile:`/`neg:` + distributed single-flight (N
   differently-assumed valuations of one ticker cost one FMP statement fetch)
   — and the cross-instance Redis login limiter. Migration 002 applied; all
-  needed env vars (incl. `FINNHUB_API_KEY`) are in Vercel Production.
+  needed env vars are **present** in Vercel Production — but presence is not
+  validity: `FINNHUB_API_KEY`'s stored *value* is wrong (see the defect note at
+  the top of this section).
   `project-docs/REQUEST_FLOW.md` predates ADR-008 on the price/response-cache
   path — trust `issues.MD`/ADRs where they disagree.
 - **Phase 8 Slice C is complete and confirmed live (2026-07-26): five
@@ -1633,9 +1751,10 @@ specs live in CLAUDE.md; this file is only the running state.
   2026-07-18 (real AAPL bootstrap, then DB-only serve with an invalid FMP
   key). The scheduler exists end to end (`app/refresh.py`,
   `GET /internal/cron/refresh-financials`, `vercel.json` crons at 22+23 UTC,
-  `America/New_York` guard, durable claims + reconciliation) **but no run has
-  executed yet as of the prior entry because `CRON_SECRET` was absent. It was
-  configured 2026-07-20; the next 6 PM Eastern window is the first live run.
+  `America/New_York` guard, durable claims + reconciliation) **and it is
+  confirmed running: `CRON_SECRET` went in 2026-07-20 and five consecutive
+  nightly runs (2026-07-21 → 2026-07-25) all succeeded, one claim per (ticker,
+  Eastern date), counts reconciled, ~1 s and 4 FMP calls each.**
   **Parts 3a–3b (6 PM Eastern hard-expiry boundary + structured freshness):
   implemented, tested, and committed in `a1131e2`**
   (`app/refresh_window.py` + boundary-aware
@@ -1644,8 +1763,10 @@ specs live in CLAUDE.md; this file is only the running state.
   `CRON_SECRET` before or with that push). Structured response fields and
   migration 004's atomic claim/head status publication are complete locally;
   migration 004 is now applied and live-verified. The current capacity gate
-  and `CRON_SECRET` are complete; still open: live Redis observation and the
-  next scheduled cron result. Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
+  and `CRON_SECRET` are complete, and the cron is confirmed live; **the only
+  thing still open in Phase 8 is the Redis observation** (`TODO.md` §4.1 — now
+  classified `(live)` rather than owner-blocked, since production carries
+  `instance`/`cache` on every log line). Per ADR-008 Slice C must NOT reintroduce a `quote:` cache,
   response cache, or response-cache generation rotation; the daily cycle
   refreshes statements/profile only. Preview env still has no Supabase vars
   (auth off in previews); custom SMTP still recommended before real
@@ -1658,8 +1779,11 @@ specs live in CLAUDE.md; this file is only the running state.
   request — and runs off the event loop. **Local only:** `_default_raw_sink()`
   still returns `None` on Vercel, so production has no evidence trail until
   Slice 2 picks a durable backend (`TODO.md` §4b — owner cost decision).
-- **Phase 11 is code-complete (Slices 1–4, 2026-07-25)**; only the owner's SLO
-  sign-off in `RUNBOOKS.md` §6 remains. `app/settings.py` is
+- **Phase 11 is code-complete (Slices 1–4, 2026-07-25)**; the owner's SLO
+  sign-off in `RUNBOOKS.md` §6 is again the only thing left, after the Slice 2
+  secret-scrubbing criterion was re-opened and re-closed on 2026-07-26 (the
+  scrubber had covered the `app` logger tree only, so `httpx`'s own request-URL
+  lines went out carrying the FMP key). `app/settings.py` is
   the single typed, boot-validated source for every environment-driven value
   (`app.state.settings`; explicit arguments still win), and
   `app/observability.py` emits one scrubbed structured line per request with
@@ -1674,8 +1798,9 @@ specs live in CLAUDE.md; this file is only the running state.
   request timings, drains in-flight statement loads on shutdown, and added
   `project-docs/RUNBOOKS.md`.
 - **Not started:** the durable production evidence backend (Phase 10 Slice 2),
-  the P1–P3 round-trip optimizations, OpenTelemetry export (deliberately an
-  owner decision — it adds a runtime dependency), advanced DCF drivers, and
+  **P3 only** of the round-trip optimizations (P1, P2, P4 are done — P3 needs
+  migration 005, which does not exist yet), OpenTelemetry export (deliberately
+  an owner decision — it adds a runtime dependency), advanced DCF drivers, and
   Phase 15 (on hold — separate frontend split, superseded in practice by
   Phase 9).
 - **Run tests:** `./.venv313/Scripts/python -m pytest -q` (current Windows/OneDrive
