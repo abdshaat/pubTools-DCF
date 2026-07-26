@@ -1,5 +1,26 @@
 # Progress Log
 
+## 2026-07-26 (portfolio) — DCF API replaces the trading bot in the Projects section
+
+Content-only change to `docs/portfolio.html` (served at `/`).
+
+- **Projects section now leads with the DCF Valuation API**, replacing the
+  Algorithmic Trading Bot card. The new card describes what this repo actually
+  is — auditable year-by-year projection plus sensitivity grid, a pure
+  deterministic engine, provider ingestion with retries and caching, API-key
+  auth and per-key daily quotas, serverless deploy with Supabase accounts and
+  the scheduled fundamentals refresh — and links to `/dcf` via the existing
+  `.org` anchor pattern used by the experience cards. Tags: Python, FastAPI,
+  Supabase, Redis, Vercel.
+- **Added FastAPI to the Frameworks skill group.** The featured project's
+  primary framework was missing from the skills list; nothing else in the
+  Projects, About, or Skills sections referenced the trading bot, so no other
+  copy needed follow-up.
+- No behavior, route, or API change; the TL;DR below is unaffected.
+- **Verification:** the 8 site-route tests in `tests/test_api.py` pass, and the
+  page parses with balanced tags. Both existing assertions on `/`
+  ("Abdelruhman Shaat", `href="/apis"`) are untouched.
+
 ## 2026-07-26 (later) — Env-pull dead end, instance identity, and performance items P1 + P2
 
 Owner ran `vercel env pull` to unblock TODO 4.1.
