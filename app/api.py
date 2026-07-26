@@ -16,8 +16,9 @@ the format FastAPI uses for its own validation errors closely enough that
 callers handle one shape.
 """
 
+import asyncio
 import hmac
-import os
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from inspect import isawaitable
@@ -29,6 +30,7 @@ from fastapi import FastAPI, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from starlette.routing import Match
 
 from . import MODEL_VERSION
 from .accounts import (
@@ -48,7 +50,6 @@ from .accounts import (
     csrf_tokens_match,
     get_current_customer,
     list_keys,
-    public_base_url,
     rename_key,
     request_email_login,
     revoke_key,
@@ -58,6 +59,7 @@ from .accounts import (
     set_session_cookies,
 )
 from .auth import VALUATION_SCOPE, APIKeyAuthenticator, AuthFailure, AuthFailureReason
+from .client_ip import FORWARDED_FOR_HEADER, resolve_client_identity
 from .dcf_engine import DCFValidationError, compute_dcf, compute_sensitivity_grid
 from .exceptions import (
     NormalizationError,
@@ -69,13 +71,24 @@ from .exceptions import (
     UnsupportedSectorError,
 )
 from .fundamentals import FundamentalsService
-from .models import Assumptions
+from .models import Assumptions, BaseFinancials
 from .normalization import NormalizedQuote, normalize_finnhub_quote
-from .providers.finnhub import FinnhubClient, FinnhubConfig
+from .observability import (
+    INSTANCE_ID,
+    MetricsRegistry,
+    configure_logging,
+    log_request,
+    record,
+    snapshot,
+    stage,
+    telemetry_scope,
+)
+from .providers.finnhub import FinnhubClient
 from .providers.fmp import FMPClient
 from .rate_limit import DailyRequestLimiter, RateLimitResult, RedisLoginRateLimiter
 from .raw_store import FileRawSink
-from .redis_cache import RedisBackend, RedisConfig, UpstashRedisClient
+from .readiness import ReadinessChecker
+from .redis_cache import RedisBackend, UpstashRedisClient
 from .refresh import DailyRefreshRunner
 from .request_context import set_request_id
 from .schemas import (
@@ -91,12 +104,12 @@ from .schemas import (
     build_api_key_summary,
     build_valuation_response,
 )
+from .settings import Settings
 from .supabase import (
     AuthSession,
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
     SupabaseClient,
-    SupabaseConfig,
     SupabaseDailyQuotaLimiter,
     SupabaseError,
     SupabaseUsageMeter,
@@ -114,7 +127,7 @@ except ImportError:
     pass
 
 
-def _default_raw_sink() -> FileRawSink | None:
+def _default_raw_sink(settings: Settings) -> FileRawSink | None:
     """Persist provider payloads locally except on Vercel.
 
     Vercel Functions are stateless and deployment files must not be treated as
@@ -123,9 +136,40 @@ def _default_raw_sink() -> FileRawSink | None:
     ephemeral files. Writes are compressed, atomic, credential-redacted, and
     retention-bounded — see app/raw_store.py.
     """
-    if os.environ.get("VERCEL"):
+    if settings.on_vercel:
         return None
-    return FileRawSink(FilePath(__file__).parent.parent / "data" / "raw")
+    return FileRawSink(
+        FilePath(__file__).parent.parent / "data" / "raw",
+        retention_days=settings.raw_capture_retention_days,
+        max_captures_per_endpoint=settings.raw_capture_max_per_endpoint,
+    )
+
+
+def _route_template(request: Request) -> str:
+    """The matched route pattern, never the raw path.
+
+    `/v1/valuations/AAPL` is logged as `/v1/valuations/{ticker}`: it keeps log
+    cardinality bounded, and the ticker travels as its own field instead of
+    being smeared across route names.
+    """
+    route = request.scope.get("route")
+    template = getattr(route, "path_format", None) or getattr(route, "path", None)
+    if isinstance(template, str):
+        return template
+    # Requests refused in the pre-flight gate (401/403/429/503) never reach the
+    # router, so the scope has no route. Match against the table by hand rather
+    # than labelling them all "unmatched": a quota rejection nobody can
+    # attribute to a route is useless in a metric. Only runs on that path.
+    for candidate in request.app.routes:
+        matcher = getattr(candidate, "matches", None)
+        if matcher is None:
+            continue
+        match, _ = matcher(request.scope)
+        if match is Match.FULL:
+            pattern = getattr(candidate, "path_format", None) or getattr(candidate, "path", None)
+            if isinstance(pattern, str):
+                return pattern
+    return "unmatched"
 
 
 def _parse_revenue_growth(raw: str) -> list[float]:
@@ -277,9 +321,9 @@ def _valuation_ticker_from_path(path: str) -> str | None:
 def create_app(
     fmp_client: FMPClient | None = None,
     finnhub_client: FinnhubClient | None = None,
-    ttl_seconds: float = 4 * 3600,
-    profile_ttl_seconds: float = 24 * 3600,
-    daily_rate_limit: int = 100,
+    ttl_seconds: float | None = None,
+    profile_ttl_seconds: float | None = None,
+    daily_rate_limit: int | None = None,
     rate_limiter: Any | None = None,
     authenticator: Any | None = None,
     usage_meter: Any | None = None,
@@ -288,27 +332,47 @@ def create_app(
     redis_backend: RedisBackend | None = None,
     snapshot_store: Any | None = None,
     refresh_runner: Any | None = None,
+    settings: Settings | None = None,
 ) -> FastAPI:
-    supabase_config = SupabaseConfig.from_env()
+    # One typed, validated read of the environment for the whole app (Phase 11).
+    # An explicit argument always wins over the environment, so tests and the
+    # load probe can pin a value without reading the environment.
+    resolved = settings or Settings.from_env()
+    if ttl_seconds is not None:
+        resolved = resolved.with_overrides(fundamentals_ttl_seconds=ttl_seconds)
+    if profile_ttl_seconds is not None:
+        resolved = resolved.with_overrides(profile_ttl_seconds=profile_ttl_seconds)
+    if daily_rate_limit is not None:
+        resolved = resolved.with_overrides(daily_rate_limit=daily_rate_limit)
+
+    # Structured logging is configured from settings before anything can log.
+    configure_logging(level=resolved.log_level, log_format=resolved.log_format)
+
+    supabase_config = resolved.supabase
     configured_supabase_client = supabase_client or (
         SupabaseClient(supabase_config) if supabase_config is not None else None
     )
     configured_auth_client = auth_client or (
         SupabaseAuthClient(supabase_config) if supabase_config is not None else None
     )
-    redis_config = RedisConfig.from_env()
-    # Server-only shared secret protecting the internal refresh endpoint.
-    # Read once at app construction, same as every other env-driven feature.
-    cron_secret = os.environ.get("CRON_SECRET")
+    redis_config = resolved.redis
+    # Server-only shared secrets protecting the internal endpoints.
+    cron_secret = resolved.cron_secret
+    metrics_token = resolved.metrics_token
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owns_client = fmp_client is None
-        client = fmp_client or FMPClient(raw_sink=_default_raw_sink())
+        client = fmp_client or FMPClient(
+            raw_sink=_default_raw_sink(resolved),
+            timeout=resolved.provider_timeout_seconds,
+            max_retries=resolved.provider_max_retries,
+            provider_concurrency=resolved.provider_concurrency,
+        )
         # Live market price (ADR-008): auto-enables on FINNHUB_API_KEY, same
         # pattern as Supabase/Redis. Absent -> price feature off; valuations
         # return null current_price/upside_pct with a warning.
-        finnhub_config = FinnhubConfig.from_env()
+        finnhub_config = resolved.finnhub
         owns_finnhub = finnhub_client is None and finnhub_config is not None
         configured_finnhub = finnhub_client or (
             FinnhubClient(api_key=finnhub_config.api_key) if finnhub_config is not None else None
@@ -325,8 +389,8 @@ def create_app(
         # error (503 for cold tickers), not a miss.
         app.state.fundamentals = FundamentalsService(
             client,
-            ttl_seconds=ttl_seconds,
-            profile_ttl_seconds=profile_ttl_seconds,
+            ttl_seconds=resolved.fundamentals_ttl_seconds,
+            profile_ttl_seconds=resolved.profile_ttl_seconds,
             redis=configured_redis,
             snapshots=snapshot_store or configured_supabase_client,
         )
@@ -338,6 +402,14 @@ def create_app(
             if configured_supabase_client is not None
             else None
         )
+        # Readiness (Phase 11 Slice 3) reports dependency reachability; it
+        # never probes FMP or Finnhub, whose budgets are metered per call.
+        app.state.readiness = ReadinessChecker(
+            supabase=configured_supabase_client,
+            redis=configured_redis,
+            price_configured=configured_finnhub is not None,
+            cache_seconds=resolved.readiness_cache_seconds,
+        )
         if configured_redis is not None:
             # Cross-instance login limiting (Phase 8 Slice B); falls back to
             # the in-process limiter set below whenever Redis is down.
@@ -348,6 +420,9 @@ def create_app(
         try:
             yield
         finally:
+            # Drain before closing anything the drained work depends on: an
+            # in-flight statement load still needs the FMP client and Supabase.
+            await app.state.fundamentals.aclose()
             if owns_client:
                 await client.aclose()
             if owns_finnhub and configured_finnhub is not None:
@@ -372,12 +447,17 @@ def create_app(
         authenticator = SupabaseAPIKeyAuthenticator(configured_supabase_client, required=True)
     if rate_limiter is None and configured_supabase_client is not None:
         rate_limiter = SupabaseDailyQuotaLimiter(
-            configured_supabase_client, default_limit=daily_rate_limit
+            configured_supabase_client, default_limit=resolved.daily_rate_limit
         )
     if usage_meter is None and configured_supabase_client is not None:
         usage_meter = SupabaseUsageMeter(configured_supabase_client)
 
-    app.state.rate_limiter = rate_limiter or DailyRequestLimiter(daily_rate_limit)
+    app.state.settings = resolved
+    app.state.metrics = MetricsRegistry()
+    # Replaced in the lifespan once the Redis backend exists; this default keeps
+    # /ready answerable if it is somehow reached before startup completes.
+    app.state.readiness = ReadinessChecker(cache_seconds=resolved.readiness_cache_seconds)
+    app.state.rate_limiter = rate_limiter or DailyRequestLimiter(resolved.daily_rate_limit)
     app.state.authenticator = authenticator or APIKeyAuthenticator(required=False)
     app.state.usage_meter = usage_meter
     app.state.supabase_client = configured_supabase_client
@@ -387,6 +467,7 @@ def create_app(
     @app.middleware("http")
     async def _request_id(request: Request, call_next: Any) -> Response:
         request.state.request_id = str(uuid4())
+        record(request_id=request.state.request_id)
         # Also bind it ambiently: the provider client and audit sink sit below
         # the route behind a shared long-lived client, so they read the id from
         # the request context instead of a threaded-through parameter. Each
@@ -394,7 +475,7 @@ def create_app(
         set_request_id(request.state.request_id)
         principal = None
         identity = "anonymous"
-        limit = daily_rate_limit
+        limit = resolved.daily_rate_limit
         valuation_ticker = _valuation_ticker_from_path(request.url.path)
         is_valuation = request.method == "GET" and request.url.path.startswith("/v1/valuations/")
 
@@ -408,12 +489,13 @@ def create_app(
         consumed: RateLimitResult | None = None
         if is_valuation:
             try:
-                principal = await _resolve(
-                    request.app.state.authenticator.authenticate(
-                        request.headers.get("X-API-Key"),
-                        required_scope=VALUATION_SCOPE,
+                with stage("auth"):
+                    principal = await _resolve(
+                        request.app.state.authenticator.authenticate(
+                            request.headers.get("X-API-Key"),
+                            required_scope=VALUATION_SCOPE,
+                        )
                     )
-                )
             except AuthFailure as exc:
                 if exc.reason is AuthFailureReason.INSUFFICIENT_SCOPE:
                     return _auth_error_response(
@@ -436,17 +518,19 @@ def create_app(
             limit = (
                 principal.daily_quota
                 if principal is not None and principal.daily_quota is not None
-                else daily_rate_limit
+                else resolved.daily_rate_limit
             )
             try:
-                consumed = await _resolve(
-                    request.app.state.rate_limiter.check_and_increment(
-                        identity=identity, limit=limit
+                with stage("quota"):
+                    consumed = await _resolve(
+                        request.app.state.rate_limiter.check_and_increment(
+                            identity=identity, limit=limit
+                        )
                     )
-                )
             except SupabaseError:
                 # Fail closed: never serve a valuation we couldn't meter.
                 return _storage_error_response(request)
+            record(quota="exceeded" if not consumed.allowed else "allowed")
             if not consumed.allowed:
                 response = _over_quota_response(request, consumed)
                 if request.app.state.usage_meter is not None:
@@ -489,6 +573,45 @@ def create_app(
                     )
         return response
 
+    @app.middleware("http")
+    async def _access_log(request: Request, call_next: Any) -> Response:
+        """Outermost middleware: exactly one structured line per request.
+
+        Registered last, so it wraps `_request_id` and therefore also sees the
+        responses that short-circuit there (401/403/429/503) — those are the
+        ones an operator most needs to see. The telemetry scope opened here is
+        what every layer below annotates: cache outcome, provider and Supabase
+        round trips, ticker, quota decision.
+        """
+        started = time.perf_counter()
+        with telemetry_scope():
+            try:
+                response = await call_next(request)
+            except Exception:
+                _log_finished(request, 500, started)
+                raise
+            _log_finished(request, response.status_code, started)
+            return response
+
+    def _log_finished(request: Request, status: int, started: float) -> None:
+        duration_seconds = time.perf_counter() - started
+        request.app.state.metrics.observe_request(
+            route=_route_template(request),
+            status=status,
+            duration_seconds=duration_seconds,
+            fields=snapshot(),
+        )
+        log_request(
+            method=request.method,
+            route=_route_template(request),
+            status=status,
+            duration_ms=(time.perf_counter() - started) * 1000.0,
+            # The inner middleware runs in its own task context, so its
+            # `set_request_id` is not visible here; `request.state` is backed by
+            # the shared ASGI scope and is.
+            extra={"request_id": getattr(request.state, "request_id", None)},
+        )
+
     # --- error mapping (see app/exceptions.py for the rationale) ---
 
     def _error(
@@ -499,6 +622,9 @@ def create_app(
         message: str,
         fields: list[dict[str, str]] | None = None,
     ) -> JSONResponse:
+        # Stable code, not free text: metrics count by it and log lines carry
+        # it, so "what is failing" is answerable without reading bodies.
+        record(error_code=code)
         return JSONResponse(
             status_code=status,
             content={
@@ -644,10 +770,21 @@ def create_app(
         )
 
     async def _login_limit_response(request: Request) -> JSONResponse | None:
-        ip = request.client.host if request.client else "unknown"
+        # Behind a proxy the socket peer is the platform, not the caller, so the
+        # per-IP cap would be one shared bucket; trusting the header blindly
+        # would let anyone mint a fresh bucket per request. app/client_ip.py
+        # resolves it under an explicit hop count (Phase 11 Slice 4).
+        identity = resolve_client_identity(
+            peer=request.client.host if request.client else None,
+            forwarded_for=request.headers.get(FORWARDED_FOR_HEADER),
+            trusted_proxy_hops=resolved.trusted_proxy_hops,
+        )
+        # The source, never the address: the source proves the configuration is
+        # right, while the address is personal data that logs should not keep.
+        record(client_ip_source=identity.source)
         result = await _resolve(
             request.app.state.login_rate_limiter.check_and_increment(
-                identity=ip,
+                identity=identity.address,
                 limit=LOGIN_ATTEMPTS_DAILY_LIMIT,
             )
         )
@@ -749,7 +886,7 @@ def create_app(
     ) -> RedirectResponse:
         """Completes either login method -- GitHub's authorize redirect and
         Supabase's magic-link verify both land here with `?code=...`."""
-        base = public_base_url()
+        base = resolved.public_base_url
 
         def error_redirect(reason: str) -> RedirectResponse:
             # Phase 9: land on /dcf, not /. The portfolio owns `/` now and has
@@ -1004,34 +1141,55 @@ def create_app(
         symbol = ticker.upper()
 
         # Statements come through the cache-aside fundamentals layer
-        # (L1 -> Redis -> [DB, Slice C] -> FMP); the DCF math is recomputed on
-        # every request — it is pure and cheap, and per the 2026-07-16 decision
-        # the request/response is never cached, only the statements are.
-        base = await request.app.state.fundamentals.get_base_financials(ticker)
-
-        # Live market price (ADR-008): fetched from Finnhub on every request,
-        # never cached. Any failure — outage, rate limit, or a symbol Finnhub
-        # doesn't recognize even though FMP serves it — degrades to a null
-        # price with a warning; the price-independent math is still returned.
-        quote: NormalizedQuote | None = None
-        price_warning: str | None = None
+        # (L1 -> Redis -> DB -> FMP); the DCF math is recomputed on every
+        # request — it is pure and cheap, and per the 2026-07-16 decision the
+        # request/response is never cached, only the statements are.
+        #
+        # Statements and the live price are fetched CONCURRENTLY (performance
+        # item P2): the quote feeds no DCF input — `BaseFinancials` has been
+        # price-free by construction since ADR-008 — so serializing them only
+        # added the smaller of the two latencies to every request. Accepted
+        # trade-off: a request whose statements then fail (404/422/502) has
+        # already spent a Finnhub call it used to skip. Bounded by the fact
+        # that auth and quota are consumed pre-flight, so only authenticated,
+        # quota-paying requests ever reach here.
         finnhub = request.app.state.finnhub
-        if finnhub is None:
-            price_warning = (
-                "Live market price is not configured; current_price and upside_pct are null."
-            )
-        else:
+
+        async def load_statements() -> BaseFinancials:
+            with stage("statements"):
+                return await request.app.state.fundamentals.get_base_financials(ticker)
+
+        async def load_quote() -> tuple[NormalizedQuote | None, str | None]:
+            """Never raises: a price failure is a warning, not an error."""
+            if finnhub is None:
+                return None, (
+                    "Live market price is not configured; current_price and upside_pct are null."
+                )
             try:
-                raw_quote, quote_fetched_at = await finnhub.fetch_quote(symbol)
-                quote = normalize_finnhub_quote(symbol, raw_quote, quote_fetched_at)
+                with stage("price"):
+                    raw_quote, quote_fetched_at = await finnhub.fetch_quote(symbol)
+                    return normalize_finnhub_quote(symbol, raw_quote, quote_fetched_at), None
             except (ProviderError, NormalizationError):
-                price_warning = (
+                return None, (
                     "Live market price is temporarily unavailable; "
                     "current_price and upside_pct are null."
                 )
 
-        valuation = compute_dcf(base, assumptions)
-        grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
+        statements_result, quote_result = await asyncio.gather(
+            load_statements(), load_quote(), return_exceptions=True
+        )
+        if isinstance(quote_result, BaseException):  # pragma: no cover - load_quote absorbs
+            raise quote_result
+        if isinstance(statements_result, BaseException):
+            # The statements error is the customer-visible one; the quote task
+            # has already completed, so nothing is left dangling.
+            raise statements_result
+        base = statements_result
+        quote, price_warning = quote_result
+
+        with stage("compute"):
+            valuation = compute_dcf(base, assumptions)
+            grid = compute_sensitivity_grid(base, assumptions) if sensitivity else None
         payload = build_valuation_response(
             base,
             assumptions,
@@ -1042,6 +1200,12 @@ def create_app(
             price_warning=price_warning,
         )
 
+        record(
+            ticker=symbol,
+            model_version=MODEL_VERSION,
+            sensitivity=sensitivity,
+            price="live" if quote is not None else "unavailable",
+        )
         # Never HTTP-cacheable: the body carries a live per-request price.
         response.headers["Cache-Control"] = NO_STORE
         return payload
@@ -1096,7 +1260,71 @@ def create_app(
 
     @app.get("/health", include_in_schema=False)
     async def health() -> dict[str, str]:
-        return {"status": "ok", "model_version": MODEL_VERSION}
+        """Liveness: is this process able to answer at all?
+
+        Touches no dependency and spends no provider call, on purpose — a
+        liveness probe that fails when a database is slow gets the instance
+        killed for someone else's outage. Dependency state lives at /ready.
+        """
+        return {
+            "status": "ok",
+            "model_version": MODEL_VERSION,
+            "environment": resolved.environment,
+            # Which process answered — the only way to tell one serverless
+            # instance from another when reading logs or instance-local metrics.
+            "instance": INSTANCE_ID,
+        }
+
+    @app.get("/ready", include_in_schema=False)
+    async def ready() -> JSONResponse:
+        """Readiness: are the dependencies this instance needs reachable?
+
+        503 when a fail-closed dependency (Supabase) is unreachable; 200 with a
+        `degraded` entry when an accelerator (Redis) is. Results are cached for
+        a few seconds and concurrent probes collapse onto one check, so polling
+        cannot amplify into the database.
+        """
+        report = await app.state.readiness.check()
+        payload = JSONResponse(
+            status_code=200 if report.ready else 503,
+            content=report.to_dict(),
+        )
+        payload.headers["Cache-Control"] = NO_STORE
+        return payload
+
+    @app.get("/internal/metrics", include_in_schema=False)
+    async def metrics(request: Request) -> Response:
+        """Prometheus exposition for this instance, behind a bearer token.
+
+        Guarded because the counters describe traffic, quota rejections, and
+        provider spend. Same generic-401 shape as the cron endpoint: an
+        unconfigured token, a missing header, and a wrong value are
+        indistinguishable to a prober.
+        """
+        presented = request.headers.get("authorization", "")
+        expected = f"Bearer {metrics_token}" if metrics_token else ""
+        if not metrics_token or not hmac.compare_digest(presented.encode(), expected.encode()):
+            denied = JSONResponse(
+                status_code=401,
+                content={
+                    "detail": "unauthorized",
+                    "error": {
+                        "version": "1",
+                        "code": "metrics_unauthorized",
+                        "message": "This internal endpoint requires the metrics token.",
+                        "request_id": request.state.request_id,
+                    },
+                },
+            )
+            denied.headers["Cache-Control"] = NO_STORE
+            return denied
+
+        rendered = app.state.metrics.render()
+        return Response(
+            content=rendered,
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+            headers={"Cache-Control": NO_STORE},
+        )
 
     return app
 

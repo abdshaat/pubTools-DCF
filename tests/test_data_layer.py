@@ -6,6 +6,7 @@ backed data layer) while exercising the real milestone-4 client code.
 """
 
 import asyncio
+import contextlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -1131,3 +1132,69 @@ def test_negative_cache_has_independent_ttl():
 
     asyncio.run(scenario())
     assert len(call_log) == 8
+
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown (Phase 11 Slice 4)
+# ---------------------------------------------------------------------------
+
+
+def test_shutdown_lets_an_in_flight_statement_load_finish():
+    """A cold bootstrap tears down mid-write otherwise: `get_base_financials`
+    shields its loader, so shutdown has to drain deliberately."""
+    release = asyncio.Event()
+    finished = []
+
+    async def slow_handler(request: httpx.Request) -> httpx.Response:
+        await release.wait()
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        payload = load_fixture("AAPL")[endpoint]
+        return httpx.Response(200, json=payload)
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(slow_handler)) as client:
+            service = FundamentalsService(client)
+
+            async def load() -> None:
+                await service.get_base_financials("AAPL")
+                finished.append(True)
+
+            task = asyncio.create_task(load())
+            await asyncio.sleep(0)  # let the loader register as in-flight
+            release.set()
+            await service.aclose(grace_seconds=2.0)
+            await task
+
+    asyncio.run(scenario())
+    assert finished == [True]
+
+
+def test_shutdown_cancels_a_load_that_outlives_its_grace_window():
+    """A hung provider must not hold the process past the platform's budget."""
+    never = asyncio.Event()
+
+    async def hanging_handler(request: httpx.Request) -> httpx.Response:
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    async def scenario() -> list[asyncio.Task]:
+        async with make_client(transport=httpx.MockTransport(hanging_handler)) as client:
+            service = FundamentalsService(client)
+            task = asyncio.create_task(service.get_base_financials("AAPL"))
+            await asyncio.sleep(0)
+            await service.aclose(grace_seconds=0.05)
+            inflight = list(service._inflight.values())
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return inflight
+
+    inflight = asyncio.run(scenario())
+    assert all(task.cancelled() or task.done() for task in inflight)
+
+
+def test_shutdown_with_nothing_in_flight_is_a_no_op():
+    async def scenario():
+        async with make_client() as client:
+            await FundamentalsService(client).aclose()
+
+    asyncio.run(scenario())

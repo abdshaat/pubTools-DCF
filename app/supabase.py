@@ -13,6 +13,8 @@ leaves this backend.
 """
 
 import os
+import time as time_module
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, time, timedelta
@@ -29,6 +31,7 @@ from .auth import (
     AuthFailureReason,
 )
 from .fundamentals import TickerSnapshotRecord
+from .observability import outbound_counter
 from .rate_limit import RateLimitResult
 
 
@@ -84,10 +87,25 @@ class SupabaseClient:
                 "apikey": config.service_role_key,
                 "authorization": f"Bearer {config.service_role_key}",
             },
+            event_hooks=outbound_counter("supabase"),
         )
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+    async def ping(self) -> None:
+        """Cheapest honest readiness probe: one bounded read of the auth table.
+
+        Proves connectivity, credentials, and that migration 001 is applied —
+        which is exactly what the fail-closed request path needs. Raises
+        SupabaseError so the readiness checker can report unavailable.
+        """
+        response = await self._client.get(
+            "/rest/v1/api_keys",
+            params={"select": "id", "limit": "1"},
+        )
+        if response.status_code >= 400:
+            raise SupabaseError(f"Supabase readiness probe failed (HTTP {response.status_code})")
 
     async def get_api_key_by_prefix(self, prefix: str) -> dict[str, Any] | None:
         response = await self._client.get(
@@ -538,6 +556,7 @@ class SupabaseAuthClient:
             timeout=timeout,
             transport=transport,
             headers={"apikey": config.service_role_key},
+            event_hooks=outbound_counter("supabase_auth"),
         )
 
     async def aclose(self) -> None:
@@ -623,9 +642,45 @@ class SupabaseAuthClient:
 
 
 class SupabaseAPIKeyAuthenticator:
-    def __init__(self, client: SupabaseClient, *, required: bool = True):
+    """Authenticates `X-API-Key` against Supabase, fail-closed.
+
+    `last_used_at` is refreshed at most once per key per
+    `last_used_interval_seconds` on this instance (performance item P1). It used
+    to be written on *every* keyed request, putting a blocking PATCH on the
+    critical path of a cache-warm valuation purely to maintain an informational
+    field — a quarter of the round trips for something no decision reads. The
+    cost of coalescing is that the timestamp lags by at most that interval,
+    which is well inside the resolution anyone reads it at ("was this key used
+    today?"). The lookup and the quota consume are untouched: those are
+    authorization and billing, and they stay exact.
+    """
+
+    DEFAULT_LAST_USED_INTERVAL_SECONDS = 300.0
+
+    def __init__(
+        self,
+        client: SupabaseClient,
+        *,
+        required: bool = True,
+        last_used_interval_seconds: float = DEFAULT_LAST_USED_INTERVAL_SECONDS,
+        monotonic: Callable[[], float] = time_module.monotonic,
+    ):
+        if last_used_interval_seconds < 0:
+            raise ValueError("last_used_interval_seconds must be non-negative")
         self.required = required
         self._client = client
+        self._last_used_interval = last_used_interval_seconds
+        self._monotonic = monotonic
+        self._last_used_writes: dict[str, float] = {}
+
+    def _should_record_use(self, key_id: str) -> bool:
+        """True at most once per key per interval, per instance."""
+        now = self._monotonic()
+        previous = self._last_used_writes.get(key_id)
+        if previous is not None and now - previous < self._last_used_interval:
+            return False
+        self._last_used_writes[key_id] = now
+        return True
 
     @property
     def enabled(self) -> bool:
@@ -663,7 +718,12 @@ class SupabaseAPIKeyAuthenticator:
             raise AuthFailure(AuthFailureReason.INSUFFICIENT_SCOPE)
 
         key_id = str(record["id"])
-        await self._client.mark_key_used(key_id)
+        if self._should_record_use(key_id):
+            # Best effort: a failed bookkeeping write must not deny a caller
+            # whose key just verified. The next request through this instance
+            # retries it anyway.
+            with suppress(SupabaseError):
+                await self._client.mark_key_used(key_id)
         return AuthenticatedPrincipal(
             key_id=key_id,
             customer_id=str(record["customer_id"]),

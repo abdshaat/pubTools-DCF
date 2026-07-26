@@ -114,9 +114,28 @@ I can write the client and tests against a fake, but can't live-verify it.
 This is the "cache → database → FMP" read path you specified, plus the 6 PM
 Eastern refresh job.
 
-- [ ] **4.1 — Pull the Upstash env vars locally:** run `vercel env pull` in the
-  repo (or copy the two Upstash REST vars into `.env`). Redis is provisioned but
-  I've never run against the real instance — only the in-memory fake.
+> ✅ **The refresh job is confirmed working in production (checked 2026-07-26).**
+> Five consecutive nightly runs — 21–25 July — all succeeded: one claim per
+> ticker per Eastern date, counts reconciled, about a second each, 4 FMP calls.
+> The immutable snapshot table still holds exactly one row while the ticker head
+> advances daily, which is the dedup design working. Only §4.1 remains.
+
+- [ ] **4.1 — Give me a way to observe the real Redis.** ⚠️ **`vercel env pull`
+  cannot do this** — tried 2026-07-26 for both Development and Production: the
+  CLI writes the variable *names* with **empty values**, because every variable
+  in this project is stored as Sensitive (write-only). That is true of
+  `SUPABASE_URL` and `FMP_API_KEY` too, so it is a property of the project, not
+  of Upstash. Two ways forward, pick either:
+  - **(a) Paste the two REST values into `.env` yourself** — Vercel → Storage →
+    your Upstash database → REST API → `UPSTASH_REDIS_REST_URL` and
+    `UPSTASH_REDIS_REST_TOKEN`. Then I can run the two-instance and outage
+    checks locally in minutes.
+  - **(b) Deploy the current work and let production answer it** —
+    *recommended*. Each log line now carries `instance` and `cache`
+    (`l1`/`l2`/`database`/`provider`), so two different instances serving one
+    ticker with a single provider load is directly visible in the logs, on the
+    real fleet, with no credential ever leaving Vercel. This is strictly better
+    evidence than a laptop pretending to be two instances.
 - [x] **4.2 — Generate a `CRON_SECRET` and add it to Vercel Production.** Done
   2026-07-20 using a cryptographically random 32-byte value stored as a
   Vercel Sensitive variable. The value is not stored locally or committed.
@@ -211,10 +230,28 @@ for a year is single-digit MB.
   `8e30cf4`, pushed by the owner 2026-07-18; migration 003 applied the same
   day). Production runs model 0.2.0 with the live Finnhub price and the
   database read-through, live-verified against the real Supabase/FMP.
-- **`CRON_SECRET` is configured in Production** as of 2026-07-20. The day's
-  schedules had already passed when it was added, so the first authenticated
-  observation is due at the next 6 PM Eastern window.
-- **Current state:** 365 tests passing, 94.40% coverage; ruff/format/mypy clean.
+- **`CRON_SECRET` is configured in Production** as of 2026-07-20, and the
+  nightly refresh has since been observed succeeding five days running
+  (2026-07-21 → 2026-07-25). Nothing further is needed from you for the cron.
+- **Nothing new is required from you for Phase 11.** Settings are validated at
+  boot; your production variables were checked on 2026-07-25 and all pass, and
+  every new setting has a default. `LOG_LEVEL`/`LOG_FORMAT` and
+  `READINESS_CACHE_SECONDS` are optional.
+- **Optional if you want production metrics:** add a `METRICS_TOKEN` (16+ chars)
+  in Vercel and scrape `GET /internal/metrics` with
+  `Authorization: Bearer <token>`. Without it the endpoint stays closed (401),
+  which is the safe default — nothing else changes. Note the counters are
+  per-instance, so a scrape describes whichever instance answered.
+- **One decision waiting on you: SLOs.** `project-docs/RUNBOOKS.md` §6 proposes
+  availability 99.5%, warm p95 < 900 ms, cold p95 < 4 s, sign-in 99%, freshness
+  ≥95%/day, live price ≥98%, plus page/notice alert thresholds — all derived
+  from measured numbers. Accept or edit them; they are proposals until you do,
+  because an SLO is a promise about your product.
+- **If you set `TRUSTED_PROXY_HOPS`,** it must match reality: Vercel is 1 (now
+  the default there). Too low merges every caller into one sign-in bucket; too
+  high lets a caller forge their address. Nothing to do unless your topology
+  changes.
+- **Current state:** 451 tests passing, 94.84% coverage; ruff/format/mypy clean.
   Slice C parts 3a–3b are committed in `a1131e2`; migration 004 is applied.
   Phase 10 Slice 1 (raw-evidence capture) landed 2026-07-25 and needs no
   deployment step — it changes only local behavior. Remaining: local/live Redis

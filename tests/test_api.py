@@ -5,6 +5,7 @@ full stack (routing, validation, fetch, normalization, engine, response
 shaping, error mapping) is exercised without network or API key.
 """
 
+import asyncio
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
@@ -22,6 +23,7 @@ from app.auth import APIKeyAuthenticator, APIKeyRecord
 from app.exceptions import ProviderError, TickerNotFoundError
 from app.providers.fmp import FMPClient
 from app.raw_store import FileRawSink, load_captures
+from app.settings import Settings
 from app.supabase import (
     SupabaseAPIKeyAuthenticator,
     SupabaseAuthClient,
@@ -60,12 +62,12 @@ class FakeFinnhubClient:
 
 def test_default_raw_sink_is_disabled_on_vercel(monkeypatch):
     monkeypatch.setenv("VERCEL", "1")
-    assert _default_raw_sink() is None
+    assert _default_raw_sink(Settings.from_env()) is None
 
 
 def test_default_raw_sink_is_available_for_local_development(monkeypatch):
     monkeypatch.delenv("VERCEL", raising=False)
-    assert isinstance(_default_raw_sink(), FileRawSink)
+    assert isinstance(_default_raw_sink(Settings.from_env()), FileRawSink)
 
 
 def test_provider_captures_are_attributed_to_the_serving_request(tmp_path):
@@ -769,6 +771,228 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
     assert usage_payload["status_code"] == 200
     assert usage_payload["quota_consumed"] is True
     assert key not in str(calls)
+
+
+def _keyed_supabase_app(calls: list, key: str, *, clock=None):
+    """A Supabase-backed app whose every round trip is recorded."""
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        path, method = request.url.path, request.method
+        if path == "/rest/v1/api_keys" and method == "GET":
+            calls.append("lookup")
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "key-1",
+                        "customer_id": "customer-1",
+                        "prefix": "live",
+                        "secret_hash": APIKeyAuthenticator.hash_secret(key),
+                        "scopes": ["valuation:read"],
+                        "revoked": False,
+                        "expires_at": None,
+                        "daily_quota": 100,
+                    }
+                ],
+            )
+        if path == "/rest/v1/api_keys" and method == "PATCH":
+            calls.append("last_used")
+            return httpx.Response(204)
+        if path == "/rest/v1/rpc/consume_daily_quota":
+            calls.append("quota")
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "allowed": True,
+                        "limit": 100,
+                        "remaining": 99,
+                        "reset_epoch": 1_800_000_000,
+                        "retry_after": 3600,
+                    }
+                ],
+            )
+        if path == "/rest/v1/rpc/record_usage_event":
+            calls.append("usage")
+            return httpx.Response(200, json={"ok": True})
+        if path == "/rest/v1/ticker_snapshot_heads" and method == "GET":
+            calls.append("snapshot_read")
+            return httpx.Response(200, json=[])
+        if path == "/rest/v1/rpc/store_ticker_snapshot":
+            calls.append("snapshot_store")
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected Supabase request: {method} {request.url}")
+
+    supabase = SupabaseClient(
+        SupabaseConfig(url="https://example.supabase.co", service_role_key="service-key"),
+        transport=httpx.MockTransport(handler),
+    )
+    authenticator = SupabaseAPIKeyAuthenticator(supabase, **({"monotonic": clock} if clock else {}))
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    return create_app(
+        fmp_client=fmp,
+        supabase_client=supabase,
+        authenticator=authenticator,
+        finnhub_client=FakeFinnhubClient(),
+    )
+
+
+def _split_by_request(calls: list[str]) -> list[list[str]]:
+    """Group a flat call log into per-request lists (each starts at a lookup)."""
+    grouped: list[list[str]] = []
+    for name in calls:
+        if name == "lookup":
+            grouped.append([])
+        grouped[-1].append(name)
+    return grouped
+
+
+def test_a_warm_keyed_request_makes_at_most_three_supabase_round_trips():
+    """Performance item P1: the last-used write is off the critical path."""
+    key = "dcf_live_testsecret"
+    calls: list[str] = []
+    with TestClient(_keyed_supabase_app(calls, key)) as client:
+        for _ in range(3):
+            response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+            assert response.status_code == 200
+
+    cold, *warm = _split_by_request(calls)
+    # The cold request still pays for the durable-store miss and the bootstrap.
+    assert cold == ["lookup", "last_used", "quota", "snapshot_read", "snapshot_store", "usage"]
+    # Warm requests: lookup + quota + usage only. The last-used PATCH is the
+    # round trip this item removed, and no decision a customer sees reads it.
+    for request_calls in warm:
+        assert request_calls == ["lookup", "quota", "usage"]
+        assert len(request_calls) <= 3
+
+
+def test_last_used_is_refreshed_again_after_its_interval():
+    key = "dcf_live_testsecret"
+    calls: list[str] = []
+    clock = {"t": 1000.0}
+    app = _keyed_supabase_app(calls, key, clock=lambda: clock["t"])
+    with TestClient(app) as client:
+        client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+        client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+        assert calls.count("last_used") == 1
+        clock["t"] += 301.0  # past the coalescing window
+        client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert calls.count("last_used") == 2
+
+
+def test_a_failed_last_used_write_never_denies_a_valid_key():
+    """Bookkeeping must not decide authentication."""
+    key = "dcf_live_testsecret"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/v1/api_keys" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "key-1",
+                        "customer_id": "customer-1",
+                        "prefix": "live",
+                        "secret_hash": APIKeyAuthenticator.hash_secret(key),
+                        "scopes": ["valuation:read"],
+                        "revoked": False,
+                        "expires_at": None,
+                        "daily_quota": 100,
+                    }
+                ],
+            )
+        if request.url.path == "/rest/v1/api_keys" and request.method == "PATCH":
+            return httpx.Response(500, json={"message": "write failed"})
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "allowed": True,
+                        "limit": 100,
+                        "remaining": 99,
+                        "reset_epoch": 1_800_000_000,
+                        "retry_after": 3600,
+                    }
+                ],
+            )
+        if request.url.path == "/rest/v1/rpc/record_usage_event":
+            return httpx.Response(200, json={"ok": True})
+        if request.url.path == "/rest/v1/ticker_snapshot_heads":
+            return httpx.Response(200, json=[])
+        if request.url.path == "/rest/v1/rpc/store_ticker_snapshot":
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected Supabase request: {request.url}")
+
+    supabase = SupabaseClient(
+        SupabaseConfig(url="https://example.supabase.co", service_role_key="service-key"),
+        transport=httpx.MockTransport(handler),
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    app = create_app(
+        fmp_client=fmp,
+        supabase_client=supabase,
+        authenticator=SupabaseAPIKeyAuthenticator(supabase),
+        finnhub_client=FakeFinnhubClient(),
+    )
+    with TestClient(app) as client:
+        response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+    assert response.status_code == 200
+
+
+def test_statements_and_the_live_price_are_fetched_concurrently():
+    """Performance item P2, proved by mutual dependency.
+
+    Each side waits for the other to start; if the route serialized them this
+    would time out instead of returning.
+    """
+    statements_started = asyncio.Event()
+    price_started = asyncio.Event()
+
+    async def fmp_handler(request: httpx.Request) -> httpx.Response:
+        statements_started.set()
+        await asyncio.wait_for(price_started.wait(), timeout=5)
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(200, json=load_fixture("AAPL")[endpoint])
+
+    class BlockingFinnhub(FakeFinnhubClient):
+        async def fetch_quote(self, ticker: str):
+            price_started.set()
+            await asyncio.wait_for(statements_started.wait(), timeout=5)
+            return await super().fetch_quote(ticker)
+
+    fmp = FMPClient(api_key="test-key", transport=httpx.MockTransport(fmp_handler))
+    app = create_app(fmp_client=fmp, finnhub_client=BlockingFinnhub(price=245.5))
+    with TestClient(app) as client:
+        response = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}")
+
+    assert response.status_code == 200
+    assert response.json()["current_price"] == 245.5
+
+
+def test_a_failing_ticker_still_returns_its_own_error_after_the_concurrent_fetch():
+    """The accepted P2 trade-off, pinned: the quote call is spent, and the
+    statements error - not the price - is what the customer sees."""
+    finnhub = FakeFinnhubClient()
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, finnhub_client=finnhub)) as client:
+        response = client.get(f"/v1/valuations/NOSUCH?{VALID_QUERY}")
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "ticker_not_found"
+    assert finnhub.calls == 1
+
+
+def test_a_price_failure_alongside_a_concurrent_fetch_still_degrades_to_null():
+    finnhub = FakeFinnhubClient(fail_with=ProviderError("finnhub is down"))
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport())
+    with TestClient(create_app(fmp_client=fmp, finnhub_client=finnhub)) as client:
+        body = client.get(f"/v1/valuations/AAPL?{VALID_QUERY}").json()
+
+    assert body["current_price"] is None
+    assert body["upside_pct"] is None
+    assert any("temporarily unavailable" in warning for warning in body["warnings"])
 
 
 def test_website_and_health_do_not_consume_valuation_limit():

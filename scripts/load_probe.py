@@ -13,6 +13,7 @@ Use --base-url to probe a running local server or deployed URL instead:
 import argparse
 import asyncio
 import json
+import os
 import statistics
 import sys
 import time
@@ -28,9 +29,22 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from app.api import create_app  # noqa: E402
+from app.auth import APIKeyAuthenticator  # noqa: E402
 from app.providers.fmp import FMPClient  # noqa: E402
 
 FIXTURES = ROOT / "tests" / "fixtures" / "fmp"
+
+# External-service credentials that must not influence a fixture-backed probe.
+_AMBIENT_SERVICE_ENV = (
+    "SUPABASE_URL",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "UPSTASH_REDIS_REST_URL",
+    "UPSTASH_REDIS_REST_TOKEN",
+    "KV_REST_API_URL",
+    "KV_REST_API_TOKEN",
+    "FINNHUB_API_KEY",
+    "CRON_SECRET",
+)
 
 VALUATION_PARAMS = {
     "wacc": "0.09",
@@ -115,9 +129,21 @@ async def _with_remote(base_url: str, burst: int) -> list[ProbeResult]:
 
 
 async def _with_fixture_app(burst: int) -> list[ProbeResult]:
+    # A developer .env with real SUPABASE_*/UPSTASH_*/FINNHUB_* values would
+    # otherwise flip create_app() into keyed-auth mode (every probe request
+    # 401s, measuring the auth gate instead of the valuation path) and point a
+    # local probe at the production database. Same isolation the test suite
+    # applies in tests/conftest.py.
+    for variable in _AMBIENT_SERVICE_ENV:
+        os.environ.pop(variable, None)
+
     call_log: list[tuple[str, str]] = []
     fmp = FMPClient(api_key="test-key", transport=fixture_transport(call_log))
-    app = create_app(fmp_client=fmp, daily_rate_limit=10_000)
+    app = create_app(
+        fmp_client=fmp,
+        daily_rate_limit=10_000,
+        authenticator=APIKeyAuthenticator(required=False),
+    )
 
     async def get(path: str) -> httpx.Response:
         return await asyncio.to_thread(test_client.get, path)
@@ -145,9 +171,12 @@ def main() -> None:
     for result in results:
         print(_summary(result))
 
-    failures = [code for result in results for code in result.status_codes if code >= 500]
-    if failures:
-        raise SystemExit(f"probe failed with server statuses: {failures}")
+    # Anything other than 200 means the probe measured something else — an auth
+    # gate, a quota rejection, a provider error. Latency numbers from those runs
+    # are worthless, so treat them as failures rather than printing them.
+    unexpected = sorted({code for result in results for code in result.status_codes if code != 200})
+    if unexpected:
+        raise SystemExit(f"probe did not measure the valuation path; statuses: {unexpected}")
 
 
 if __name__ == "__main__":

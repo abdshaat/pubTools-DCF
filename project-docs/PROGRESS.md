@@ -1,5 +1,295 @@
 # Progress Log
 
+## 2026-07-26 (later) — Env-pull dead end, instance identity, and performance items P1 + P2
+
+Owner ran `vercel env pull` to unblock TODO 4.1.
+
+- **The pull cannot deliver these credentials, at all.** It wrote the Upstash
+  variable *names* with **empty values**; the production pull did the same. So
+  did `SUPABASE_URL` and `FMP_API_KEY` — every variable in this project is
+  stored as Vercel *Sensitive* (write-only), so no local pull will ever expose
+  one. TODO 4.1 was rewritten around that fact with two real routes: paste the
+  two REST values from the Upstash dashboard, or (recommended) read the answer
+  out of production. The pulled file was deleted from scratch immediately.
+- **`instance` id added to logs, `/health`, and metrics.** One random id per
+  process. This is what makes route (b) above possible: "two different
+  instances served this ticker and only one of them called the provider" is now
+  directly visible in production logs, on the real fleet, without a credential
+  ever leaving Vercel. It also repairs the Slice 3 caveat that instance-local
+  metrics could not be attributed to an instance.
+- **P1 — `last_used_at` is off the critical path.** It was a blocking PATCH on
+  every keyed request, maintaining an informational field that no decision
+  reads. Now coalesced to at most once per key per 5 minutes per instance, and
+  best-effort (a failed bookkeeping write can no longer deny a caller whose key
+  just verified). Authorization and billing round trips are untouched — those
+  stay exact. **A warm keyed request now makes 3 Supabase round trips instead of
+  4**, asserted as an exact call sequence: cold `lookup, last_used, quota,
+  snapshot_read, snapshot_store, usage`; warm `lookup, quota, usage`.
+- **P2 — statements and the live price now fetch concurrently.** The quote feeds
+  no DCF input (ADR-008 made `BaseFinancials` price-free by construction), so
+  serializing them was adding the smaller latency to every request for nothing.
+  **Measured: 179.7 ms against a 227.7 ms sequential floor** with an
+  80 ms-per-endpoint provider and a 50 ms quote — the price fetch now hides
+  entirely inside the statement fetch. Overlap is proven by a mutual-dependency
+  test (each side waits for the other to start, so a serialized route would time
+  out). The accepted trade-off is pinned by its own test: a request whose ticker
+  then 404s has already spent one Finnhub call, bounded by auth and quota being
+  consumed pre-flight.
+- **Two process notes worth keeping.** (1) The same trap bit me twice: clearing
+  service env vars *before* importing `app.api` does nothing, because the import
+  calls `load_dotenv()` and puts them back. A measurement script written that
+  way silently talked to production — it consumed one anonymous quota slot and
+  wrote one usage event in the live database before I caught it (read-only
+  otherwise; no snapshot or ticker-head row was touched). The load probe already
+  had a comment about this ordering; the lesson is to clear *after* the import,
+  every time. (2) `t_statements_ms` and `t_price_ms` now overlap by design and
+  no longer sum to `duration_ms`.
+- **Verification: suite 451 → 457 passing, 94.88% coverage**; ruff lint + format
+  and mypy clean.
+- Next: P3 (fold the usage event into the quota RPC — needs migration 005 and
+  the usual migration-before-deploy gate), then Phase 12. Still owner-side: the
+  SLO sign-off, TODO 4.1's route (a) or (b), and 4b for Phase 10 Slice 2.
+
+## 2026-07-26 — Phase 8 Slice C closed: the daily refresh is confirmed running in production
+
+No code changed. Slice C's implementation has been complete since 2026-07-18;
+what stayed open was the one thing code cannot settle — whether the scheduled
+job actually runs on the real deployment. `CRON_SECRET` went in on 2026-07-20,
+so enough 6 PM Eastern windows have now passed to answer it. Read the production
+ledger directly (read-only queries with the service-role key already in `.env`):
+
+- **Five consecutive successful runs — 2026-07-21 through 2026-07-25.** Each
+  claimed its Eastern date, reconciled `total=attempted=succeeded=1,
+  failed=0`, and finished in roughly one second. `financial_refresh_claims`
+  holds exactly one claim per (ticker, date), all `succeeded`, with **no pending
+  claim ever left behind** — the durable signal that a ticker was skipped.
+- **The window guard works in the wild.** Every run recorded
+  `scheduled_window_at = 22:00 UTC` (6 PM EDT) and started 22:34–22:35 UTC:
+  two UTC schedules fire daily, exactly one passes the `America/New_York`
+  guard, and Vercel Hobby starts it somewhere inside the hour as documented.
+  EST (23:00 UTC) stays test-proven only until the November DST change — a
+  calendar dependency, not missing work.
+- **Content-addressed dedup proven in production.** After the original
+  2026-07-18 bootstrap plus five refreshes, `normalized_snapshots` still holds
+  **exactly one row** (one distinct `snapshot_version`), while the mutable head
+  advanced to `verified_at = last_refresh_success_at = 2026-07-25T22:35:09Z`
+  with `refresh_status = current_as_of_daily_refresh`. Re-confirming an
+  unchanged FY2025 filing updates the pointer and writes no new immutable row —
+  exactly the ADR-006 design, now observed rather than asserted.
+- **Capacity confirmed by measurement, not arithmetic:** ~1 s and 4 FMP calls
+  per run. The gate must be re-run before the manifest grows past one ticker.
+- **Production spot checks:** `/health` 200 at model 0.2.0; the internal cron
+  endpoint still returns 401 to an unauthenticated caller. (The apex still 308s
+  to `www` — `TODO.md` §1.4c, unchanged.)
+- **Closed with this evidence:** the Slice C live-verification item, plus four
+  Phase 8 exit criteria (snapshot dedup + head pointer, no customer-triggered
+  FMP for a stored ticker with at-most-one cycle per Eastern date, full-manifest
+  reconciliation, and the EDT half of the schedule guard). `issues.MD`'s Slice C,
+  scheduler, and capacity-gate boxes are closed.
+- **Still open in Phase 8, all of it Redis-side and owner-blocked by `TODO.md`
+  §4.1:** two-instance Redis sharing, Redis-down fail-open in a preview, and
+  cross-instance login limiting. The Upstash REST credentials exist only in
+  Vercel, so nothing local can reach the real instance. *(Note: Phase 11 Slice 4
+  fixed the identity that login limiter keys on — behind Vercel's proxy the
+  per-IP cap had been one shared bucket.)*
+- Next: nothing in Slice C. The remaining queue is the owner's SLO sign-off
+  (`RUNBOOKS.md` §6), §4.1 for the Redis observations, §4b for Phase 10 Slice 2,
+  and the P1–P3 round-trip optimizations.
+
+## 2026-07-25 (last) — Phase 11 Slice 4: trusted client addresses, stage timings, graceful shutdown, runbooks
+
+Phase 11 is now code-complete; one owner sign-off remains.
+
+- **Closed the 2026-07-12 security-review finding (`app/client_ip.py`).** The
+  per-IP sign-in cap keyed off `request.client.host`, which on Vercel is the
+  platform proxy — so the daily cap behaved as **one shared bucket for the whole
+  internet**, and any real per-IP abuse control was illusory. Trusting
+  `X-Forwarded-For` outright would have been worse (anyone could mint a fresh
+  bucket per request), so trust is now explicit: `TRUSTED_PROXY_HOPS` (default 1
+  on Vercel, 0 elsewhere) says how many proxies stand in front, and the caller is
+  the Nth entry from the right — everything left of it is caller-supplied and
+  ignored. A chain shorter than the configured hops is discarded in favor of the
+  peer, because failing back to a *narrower* identity can group callers but can
+  never split one caller into unlimited buckets. Entries are normalized (ports
+  stripped, IPv6 unbracketed) so one caller is one bucket. **18 tests**, pinning
+  both failure directions.
+- **Tracing, dependency-free.** Per-stage timings ride the existing log line —
+  `t_auth_ms`, `t_quota_ms`, `t_statements_ms`, `t_price_ms`, `t_compute_ms` —
+  reusing Slice 2's vocabulary. `duration_ms` says a request was slow; these say
+  which dependency made it slow. Live-verified: a cold request logged
+  `t_statements_ms=2.4` against `0.06` warm, with `t_compute_ms=0.03`
+  confirming again that the engine is not the cost. OpenTelemetry export stays
+  an explicit owner decision (a runtime dependency plus a collector), not a side
+  effect of wanting timings.
+- **Graceful shutdown.** `FundamentalsService.aclose()` drains in-flight loader
+  tasks under a bounded grace window, then cancels; the lifespan calls it before
+  closing the clients those loads depend on. This matters because
+  `get_base_financials` *shields* its loader so a disconnecting client cannot
+  kill a load other waiters share — which also meant shutdown could otherwise
+  tear down a cold bootstrap after its durable write but before its cache
+  publication. Audit captures need no draining (awaited in-request, never
+  detached).
+- **New `project-docs/RUNBOOKS.md`:** incident response keyed to the signals
+  Phase 11 emits, key rotation (including the destructive
+  `API_KEY_HASH_PEPPER` case and why `Settings` refuses to length-check it),
+  provider outage, migration ordering + bad-data rollback, model-version
+  rollback, a deployment checklist, and **proposed SLOs/alert thresholds
+  awaiting owner sign-off** (§6).
+- **Defect found by live verification, not by tests:** the log scrubber matched
+  any field name containing `code`, so `error_code` — the field naming *why* a
+  request failed — logged as `REDACTED`. Secret-name matching is now exact for
+  `code`/`key`/`email`/`state`/`otp` and substring only for names that are
+  secret however qualified (`token`, `secret`, `authorization`, …).
+  Regression-tested, then re-verified live: the same 422 now logs
+  `error_code=invalid_email`.
+- **Verification: suite 425 → 451 passing, 94.84% coverage**; ruff lint +
+  format and mypy clean. Live-verified against real uvicorn: forwarded-address
+  trust (`client_ip_source=forwarded` with a forged prefix ignored), stage
+  timings on cold and warm requests, and the corrected error-code logging.
+- **Remaining in Phase 11:** only the owner SLO sign-off (`RUNBOOKS.md` §6).
+  Still open elsewhere: P1–P3 round-trip optimizations, Phase 10 Slice 2
+  (`TODO.md` §4b), and the live Redis/cron observations.
+
+## 2026-07-25 (later still) — Phase 11 Slice 3: liveness/readiness split and metrics
+
+- **`/health` is now liveness only** (process up, no dependency call, no
+  provider spend; it also echoes the environment name). A liveness probe that
+  fails because a database is slow gets the instance killed for someone else's
+  outage — dependency state belongs at `/ready`.
+- **New `/ready` (`app/readiness.py`)** reports each dependency separately and
+  distinguishes *required* from *configured*: Supabase is fail-closed, so
+  unreachable → **503**; Redis is an accelerator whose loss costs latency, not
+  correctness (ADR-004's fail-open matrix), so unreachable → **degraded but
+  ready**; unconfigured dependencies never make an instance unready. **No probe
+  spends a provider call** — FMP (daily budget) and Finnhub (60/min) report
+  configuration only, because a polled endpoint that called them would let
+  monitoring exhaust the customer-facing quota. Supabase's probe is one bounded
+  `select id limit 1` on `api_keys`, which doubles as proof that migration 001
+  is applied. Results cache for `READINESS_CACHE_SECONDS` (default 5) and
+  concurrent checks collapse onto one in-flight probe under a lock, so a probe
+  storm cannot amplify into the database. The body carries names and statuses
+  only — the endpoint is unauthenticated, so it must not describe the
+  infrastructure.
+- **New `MetricsRegistry` + `GET /internal/metrics`** (Prometheus text, behind
+  `METRICS_TOKEN`, same generic-401 shape as the cron endpoint):
+  `dcf_http_requests_total{route,status}`, a duration histogram,
+  `dcf_cache_reads_total{outcome}`, `dcf_provider_calls_total{service}`,
+  `dcf_quota_rejections_total`, `dcf_errors_total{code}`, and
+  `dcf_price_lookups_total{result}`. They are fed from the **same telemetry the
+  access log emits**, so a metric and its log line cannot disagree. Counters are
+  instance-local by design; putting them in Redis would make monitoring a
+  request-path dependency that ADR-004 keeps it out of.
+- **Defect this slice caught in Slice 2's own work:** requests refused in the
+  pre-flight gate (401/403/429/503) never reach the router, so every one of them
+  was logged and counted as `route="unmatched"` — quota rejections and auth
+  failures were unattributable. `_route_template` now resolves the route from
+  the table by hand on that path only. Regression-tested in both suites.
+- **Tests: 17 new in `tests/test_health.py`** (suite 408 → 425 passing, 94.72%
+  coverage); ruff lint + format and mypy clean.
+- **Live-verified against real uvicorn and the real production Supabase:**
+  `/health` 200 in under 5 ms touching nothing; `/ready` 200 with
+  `supabase: ok (required)` after a genuine round trip; **four `/ready` requests
+  cost exactly two Supabase calls** (one per cache window — the rest returned
+  `cached: true`), which is the anti-amplification property proven end to end;
+  `/internal/metrics` 401 without the token and a full exposition with it; JSON
+  access lines carrying `supabase_calls` and the real `duration_ms`.
+- **New optional settings:** `METRICS_TOKEN` (unset → the endpoint 401s, so
+  metrics are closed by default) and `READINESS_CACHE_SECONDS`. Nothing is
+  required for the existing deployment to keep working.
+- Next: Slice 4 (trusted proxy/client-IP config, tracing, graceful shutdown
+  review, runbooks) — its SLO thresholds need the owner. P1–P3 performance items
+  and Phase 10 Slice 2 (`TODO.md` §4b) remain open.
+
+## 2026-07-25 (later) — Plan reconciliation, measured performance budgets, Phase 11 Slices 1–2
+
+Same day as the Phase 10 entry below. Three pieces: audit the plan against the
+code, give the plan real performance numbers, then implement the next phase.
+
+**Plan reconciliation — the plan disagreed with reality in two places.**
+
+- **Phase 9 was entirely unchecked** although Slices 1–2 shipped in `2a3b66e`
+  on 2026-07-16 and the site has been live on `ashaat.dev` since. Reconciled
+  every box against the working tree and the live site; the phase is now
+  correctly shown as blocked on exactly one thing nobody but the owner can do
+  (TODO §1.5, a sign-in round trip with the local server stopped).
+- **The Vercel release gates were stale:** eight items were `[ ]` though Phases
+  5–8 satisfied them (durable external state, lifespan-scoped clients, timeouts
+  under the function duration, no post-response work, bundle exclusions). Each
+  is now `[x]` *with the evidence*, and the four genuinely-open ones say what
+  closes them.
+- **Added "who can close an item" to the status rules.** Tasks are now tagged
+  `(code)`, `(owner)`, or `(live)`. The recurring confusion was a phase looking
+  stalled because a dashboard-only checkbox sat in a code list; an `(owner)`
+  item must also appear in `TODO.md`.
+
+**`scripts/load_probe.py` was measuring the wrong thing.** It inherited the
+developer `.env`, so `create_app` came up in keyed-auth mode and every probe
+request 401'd — and the probe's only guard was "no 5xx", so it exited 0 and
+printed the latency of *rejecting* requests. Fixed: it clears ambient service
+credentials, forces the unauthenticated authenticator, and fails on any
+non-200. Every number below is from the repaired probe.
+
+**New plan section: "Performance budgets and the measured baseline."** The plan
+had no targets, so "improve performance" was unfalsifiable. Now measured:
+warm valuation median **1.6 ms**, cold **6.5 ms** with exactly 4 provider calls,
+`/health` **0.64 ms**, `compute_dcf` **0.02 ms**, the 3×3 grid **0.21 ms**,
+response body **3.5 KB**. The conclusion that matters: **the engine is not the
+cost — compute is ~0.25 ms of a request and everything else is I/O.**
+
+Tracing the keyed path found where the time actually goes: **4 blocking round
+trips on a cache-warm request** (API-key lookup, `last_used_at` PATCH, quota
+RPC, Finnhub quote, then a usage RPC), measured at ~365 ms median from this
+machine against the real production Supabase. One of them buys nothing a
+customer can see. Recorded as evidence-backed work items P1–P4 with acceptance
+criteria: P1 take `last_used_at` off the critical path, P2 fetch statements and
+the quote concurrently (with the Finnhub-quota trade-off stated), P3 merge the
+usage RPC into the quota RPC, P4 publish the numbers. Also recorded what we
+deliberately will **not** do — caching API-key lookups, which trades fail-closed
+revocation for latency.
+
+**Phase 11 Slice 1 — typed settings (`app/settings.py`).** 14 `os.environ`
+reads across 8 modules, several per request, became one frozen `Settings`
+resolved and validated at startup; it composes the existing
+`SupabaseConfig`/`RedisConfig`/`FinnhubConfig` rather than replacing them, so
+feature auto-enable is untouched. Invalid values now fail at boot with **every**
+problem listed at once and each variable named. `create_app` stores it on
+`app.state.settings` and drives provider timeout/retries/concurrency, TTLs,
+quota, raw-capture retention, the cron secret, the Vercel check, and the
+auth-callback base URL from it; `api.py` no longer imports `os`. Explicit
+arguments still beat the environment. Two deliberate exceptions are documented
+in the module: `auth.py` keeps reading `API_KEY_HASH_PEPPER` at hash time (a
+rotation must apply to the next verification), and the pepper has **no length
+rule** — rejecting a weak one at boot would turn a weak setting into an outage.
+22 tests, including one proving a setting is actually applied end to end.
+
+**Phase 11 Slice 2 — structured logs (`app/observability.py`).** The service had
+no logging at all. Now one line per request: request id, route **template**,
+status, `duration_ms`, which cache layer answered (`l1`/`l2`/`database`/
+`provider`/`stale_after_provider_failure`), per-service round-trip counts from
+an httpx `event_hooks` counter installed by all five external clients, plus
+`quota`, `ticker`, `model_version`, and price availability. Telemetry rides a
+context variable, so layers far below the route annotate the request without
+new parameters. The access log is the **outermost** middleware, so 401/403/429
+short-circuits are logged too. Redaction is central and recursive: API keys,
+bearer tokens, credential URLs (reusing Phase 10's `redact_url`), emails, and
+any secret-looking field name. The raw path and query string are never logged.
+21 tests.
+
+- **Verification: suite 365 → 408 passing, 94.56% coverage**; ruff lint +
+  format and mypy clean. Probe re-run after the change: warm median 1.5 ms
+  (unchanged), cold 6.1 ms, 20-way burst p95 18.4–21.4 ms across four runs
+  versus 17.0 ms before — a few ms at high concurrency for permanent
+  observability, recorded in the budget table rather than glossed over.
+- **Deployment note:** boot validation now applies in production. Checked the
+  live project's variables — of the validated keys only `PUBLIC_BASE_URL`
+  (`https://ashaat.dev`) and `CRON_SECRET` (32 random bytes) are set and both
+  pass; every numeric setting falls back to its former default. No migration,
+  no new required configuration.
+- Next: Phase 11 Slice 3 (liveness/readiness split + metrics), then Slice 4
+  (trusted proxy/client IP, tracing, runbooks; SLO thresholds need the owner).
+  P1–P3 are ready to implement whenever performance beats observability in
+  priority. Phase 10 Slice 2 still waits on `TODO.md` §4b.
+
 ## 2026-07-25 — Phase 10 Slice 1: raw provider evidence (capture, redaction, retention, replay)
 
 Phase 8's and Phase 9's open items are all owner/live-observation work, so this
@@ -1299,8 +1589,11 @@ specs live in CLAUDE.md; this file is only the running state.
 
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **365 passing tests (94.40% coverage, 93% floor)**;
-  ruff/format/mypy clean. **ADR-008 and Slice C parts
+  verification, and **457 passing tests (94.88% coverage, 93% floor)**;
+  ruff/format/mypy clean. Performance items **P1** (last-used write coalesced
+  off the critical path) and **P2** (statements and live price fetched
+  concurrently) landed 2026-07-26: a warm keyed request now costs 3 Supabase
+  round trips, and the price fetch hides inside the statement fetch. **ADR-008 and Slice C parts
   1–2 are committed (`8e30cf4`), deployed, and live-verified; migration 003
   is applied to the production Supabase.** Supabase auth, quotas, and usage
   metering are live-verified end to end. CSRF enforcement
@@ -1325,7 +1618,10 @@ specs live in CLAUDE.md; this file is only the running state.
   needed env vars (incl. `FINNHUB_API_KEY`) are in Vercel Production.
   `project-docs/REQUEST_FLOW.md` predates ADR-008 on the price/response-cache
   path — trust `issues.MD`/ADRs where they disagree.
-- **In progress — Phase 8 Slice C.** State by part:
+- **Phase 8 Slice C is complete and confirmed live (2026-07-26): five
+  consecutive successful daily runs, clean claim reconciliation, and no
+  duplicate snapshot rows. Only the Redis-side observations remain, blocked
+  on `TODO.md` §4.1.** State by part:
   **Parts 1–2 (DB read-through + daily-refresh scheduler): committed in
   `8e30cf4`, deployed, and running in production.** Migration 003 is
   **applied** to the live Supabase (immutable `normalized_snapshots`, mutable
@@ -1362,9 +1658,26 @@ specs live in CLAUDE.md; this file is only the running state.
   request — and runs off the event loop. **Local only:** `_default_raw_sink()`
   still returns `None` on Vercel, so production has no evidence trail until
   Slice 2 picks a durable backend (`TODO.md` §4b — owner cost decision).
+- **Phase 11 is code-complete (Slices 1–4, 2026-07-25)**; only the owner's SLO
+  sign-off in `RUNBOOKS.md` §6 remains. `app/settings.py` is
+  the single typed, boot-validated source for every environment-driven value
+  (`app.state.settings`; explicit arguments still win), and
+  `app/observability.py` emits one scrubbed structured line per request with
+  latency, cache layer, and per-service round-trip counts. The implementation
+  plan now carries **measured performance budgets** and the evidence-backed
+  P1–P4 optimization items; `scripts/load_probe.py` was repaired (it had been
+  measuring 401s from an ambient `.env`). Slice 3 split liveness (`/health`)
+  from readiness (`/ready`, cached and storm-proof, never spending a provider
+  call) and added token-guarded Prometheus metrics at `/internal/metrics`, all
+  live-verified against real uvicorn + production Supabase. Slice 4 closed the
+  proxy/client-IP security finding (`TRUSTED_PROXY_HOPS`), added per-stage
+  request timings, drains in-flight statement loads on shutdown, and added
+  `project-docs/RUNBOOKS.md`.
 - **Not started:** the durable production evidence backend (Phase 10 Slice 2),
-  Phase 11 operations/observability, advanced DCF drivers, and Phase 15 (on
-  hold — separate frontend split, superseded in practice by Phase 9).
+  the P1–P3 round-trip optimizations, OpenTelemetry export (deliberately an
+  owner decision — it adds a runtime dependency), advanced DCF drivers, and
+  Phase 15 (on hold — separate frontend split, superseded in practice by
+  Phase 9).
 - **Run tests:** `./.venv313/Scripts/python -m pytest -q` (current Windows/OneDrive
   recovery environment; standard clean setups may use `.venv`).
 - **Run server:** `./.venv313/Scripts/uvicorn app.api:app --reload` (needs

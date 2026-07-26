@@ -38,6 +38,7 @@ from .exceptions import (
 )
 from .models import BaseFinancials
 from .normalization import normalize_fmp_fundamentals
+from .observability import record
 from .providers.fmp import FMPClient, FMPFundamentals
 from .redis_cache import REDIS_KEY_PREFIX, RedisBackend, get_envelope, set_envelope
 from .refresh_window import last_refresh_boundary, next_refresh_boundary
@@ -525,6 +526,7 @@ class FundamentalsService:
                     await self._remote_set(
                         "fund", ticker, _base_to_payload(value), self._max_statement_staleness
                     )
+                record(cache="l1")
                 return value
 
         remote_base = await self._remote_base(ticker)
@@ -532,6 +534,7 @@ class FundamentalsService:
             stale_age, stale_base = remote_base
             self._cache[ticker] = (self._now() - stale_age, stale_base)
         if stale_base is not None and stale_age is not None and self._is_current(stale_age):
+            record(cache="l2")
             return stale_base
 
         negative = self._negative.get(ticker)
@@ -559,6 +562,7 @@ class FundamentalsService:
         if self._snapshots is not None:
             from_store = await self._read_snapshot_store(ticker, stale_base, stale_age, lock_token)
             if from_store is not None:
+                record(cache="database")
                 return from_store
 
         try:
@@ -598,6 +602,7 @@ class FundamentalsService:
                 )
                 if lock_token is not None:
                     await self._release_distributed_lock(ticker, lock_token)
+                record(cache="stale_after_provider_failure")
                 return stale_with_warning
             if lock_token is not None:
                 await self._release_distributed_lock(ticker, lock_token)
@@ -628,6 +633,7 @@ class FundamentalsService:
         )
         if lock_token is not None:
             await self._release_distributed_lock(ticker, lock_token)
+        record(cache="provider")
         return normalized
 
     async def _persist_snapshot(
@@ -691,6 +697,23 @@ class FundamentalsService:
             task = asyncio.create_task(self._load_base_financials(ticker))
             self._track_inflight(ticker, task)
         return await asyncio.shield(task)
+
+    async def aclose(self, *, grace_seconds: float = 2.0) -> None:
+        """Let in-flight statement loads finish before dependencies close.
+
+        `get_base_financials` shields its loader task, so a disconnecting
+        client never kills a load that other waiters share. That same shield
+        means shutdown must drain deliberately: without this, a cold bootstrap
+        could be torn down mid-flight, after its durable write but before its
+        cache publication. Bounded by a grace window — a hung provider must not
+        hold the process open past the platform's shutdown budget.
+        """
+        pending = [task for task in self._inflight.values() if not task.done()]
+        if not pending:
+            return
+        _, still_running = await asyncio.wait(pending, timeout=grace_seconds)
+        for task in still_running:
+            task.cancel()
 
     def invalidate(self, ticker: str | None = None) -> None:
         if ticker is None:

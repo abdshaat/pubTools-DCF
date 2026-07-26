@@ -18,6 +18,8 @@ from typing import Any, Protocol
 
 import httpx
 
+from .observability import outbound_counter
+
 REDIS_KEY_PREFIX = "dcf:v1:"
 ENVELOPE_VERSION = 1
 _COMPARE_AND_DELETE = (
@@ -85,6 +87,7 @@ class UpstashRedisClient:
             headers={"Authorization": f"Bearer {config.token}"},
             timeout=config.timeout_seconds,
             transport=transport,
+            event_hooks=outbound_counter("redis"),
         )
 
     async def _command(self, *parts: str | int) -> Any:

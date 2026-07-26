@@ -133,8 +133,9 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
   `compute_dcf`, identical ETag, still metered; generation-aware key ready
   for Slice C's rotation) and `RedisLoginRateLimiter`. 292 tests passing,
   94.04% coverage.
-- [ ] **Slice C — DB read-through plus immutable normalized snapshots and
-  migration 003.** Added 2026-07-13: cache miss order is L1 → Redis → latest
+- [x] **Slice C — DB read-through plus immutable normalized snapshots and
+  migration 003.** *(Closed 2026-07-26: the scheduler has been observed running
+  successfully in production for five consecutive days — details below.)* Added 2026-07-13: cache miss order is L1 → Redis → latest
   verified Supabase snapshot → provider; provider success writes the immutable
   snapshot/current ticker head before publishing cache and returning. See
   ADR-006 and Phase 8 for freshness and database-failure behavior.
@@ -143,7 +144,12 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
   the daily-refresh scheduler below is what keeps this box open. ⚠️ Apply
   migration 003 before deploying this code — with Supabase configured, a
   missing table is a storage error (503 on cold tickers), not a miss.
-- [ ] **Daily all-database-ticker refresh scheduler.** ADR-007 requires one
+- [x] **Daily all-database-ticker refresh scheduler.** *(Closed 2026-07-26 by
+  reading the production ledger: runs for 2026-07-21…2026-07-25 all `succeeded`,
+  one claim per (ticker, date), `total=attempted=succeeded=1, failed=0`, and
+  `normalized_snapshots` still holds exactly one row — an unchanged filing
+  re-confirmed daily updates the head and creates no new immutable row. The two
+  UTC schedules produced exactly one claimed run per Eastern date.)* ADR-007 requires one
   complete statements/profile FMP cycle (no quote — ADR-008) for every ticker
   in `ticker_snapshot_heads` during each day's 6 PM Eastern window.
   **Code implemented 2026-07-18** (`app/refresh.py`, the CRON_SECRET-protected
@@ -153,7 +159,11 @@ and "Sign out" buttons do nothing at all — no error, no network activity.
   PROGRESS.md). Box stays open until it runs live: needs migration 003
   applied, `CRON_SECRET` in Vercel Production (TODO §4.2), the capacity gate
   below, and a deployed observation of one real run.
-- [ ] **Daily refresh capacity gate.** Before deployment, prove the FMP plan and
+- [x] **Daily refresh capacity gate.** *(Verified 2026-07-20 by calculation and
+  confirmed 2026-07-26 by five real runs: the one-ticker manifest completes in
+  about one second and spends 4 FMP calls, far inside the ~250/day allowance and
+  the function duration. Re-run this gate before growing the manifest.)*
+  Original wording: before deployment, prove the FMP plan and
   runtime can process the entire ticker manifest (including multiple endpoints
   and bounded retries). Insufficient capacity must fail visibly and trigger an
   upgrade/durable-worker decision; it must not silently omit tickers.

@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 
 from ..exceptions import ProviderAuthError, ProviderError, TickerNotFoundError
+from ..observability import outbound_counter
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
 # Well under the Vercel function budget: one quote attempt, no retries.
@@ -54,7 +55,12 @@ class FinnhubClient:
                 "no Finnhub API key: set FINNHUB_API_KEY in the environment or "
                 "pass api_key= directly"
             )
-        self._client = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=timeout)
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            transport=transport,
+            timeout=timeout,
+            event_hooks=outbound_counter("finnhub"),
+        )
 
     async def aclose(self) -> None:
         await self._client.aclose()

@@ -164,6 +164,67 @@ The test suite — engine, data layer, API, auth, quota, and Supabase integratio
 contracts — runs against recorded fixture payloads (`tests/fixtures/fmp/`) and
 mock transports. No network required.
 
+### Configuration and logs
+
+All environment-driven behavior is resolved once at startup by
+`app/settings.py`, and an invalid value stops the app at boot with the variable
+named rather than surfacing on a customer's request. Everything below is
+optional — the defaults are the values the service used before they were
+configurable.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `PUBLIC_BASE_URL` | `http://127.0.0.1:8000` | must be an absolute http(s) URL; sign-in redirects are built from it |
+| `CRON_SECRET` | unset | required for the internal refresh endpoint; rejected under 16 characters |
+| `DAILY_RATE_LIMIT` | `100` | per-key daily valuation quota when the key carries no explicit quota |
+| `FUNDAMENTALS_TTL_SECONDS` / `PROFILE_TTL_SECONDS` | `14400` / `86400` | statement and profile cache freshness |
+| `PROVIDER_TIMEOUT_SECONDS` / `PROVIDER_MAX_RETRIES` / `PROVIDER_CONCURRENCY` | `6.0` / `2` / `3` | FMP transport budget; keep the worst case under the function timeout |
+| `RAW_CAPTURE_RETENTION_DAYS` / `RAW_CAPTURE_MAX_PER_ENDPOINT` | `30` / `25` | local audit-capture retention |
+| `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` on Vercel, `text` locally | one structured line per request |
+| `METRICS_TOKEN` | unset | bearer token for `GET /internal/metrics`; without it the endpoint 401s |
+| `READINESS_CACHE_SECONDS` | `5` | how long `/ready` reuses a dependency check |
+| `TRUSTED_PROXY_HOPS` | `1` on Vercel, `0` elsewhere | how many proxies stand in front; decides whether `X-Forwarded-For` is believed |
+
+Each request emits a single log line carrying the request id, route template,
+status, duration, which cache layer answered, and how many round trips it made
+to each external service:
+
+```
+INFO GET /v1/valuations/{ticker} -> 200 request_id=… duration_ms=4.36
+     quota=allowed fmp_calls=4 cache=provider ticker=AAPL model_version=0.2.0
+```
+
+API keys, bearer tokens, cookies, credential-bearing URLs, and email addresses
+are scrubbed before anything is written, and the raw path and query string are
+never logged.
+
+### Operational endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | liveness — process up; touches no dependency and spends no provider call |
+| `GET /ready` | readiness — per-dependency status; 503 when Supabase (fail-closed) is unreachable, 200 with `degraded` when Redis is; cached for a few seconds so polling cannot amplify |
+| `GET /internal/metrics` | Prometheus text exposition for this instance, behind `METRICS_TOKEN` |
+
+Readiness deliberately reports FMP and Finnhub as *configured or not* rather
+than calling them: both are metered budgets (FMP daily, Finnhub 60/min) and a
+polled probe must never spend the customer-facing quota. Metrics counters are
+per instance, so a scrape describes the instance that answered it.
+
+Operational procedures — incident response, key rotation, provider outage,
+bad-data and model-version rollback, and the deployment checklist — live in
+[`project-docs/RUNBOOKS.md`](project-docs/RUNBOOKS.md).
+
+### Client addresses behind a proxy
+
+Per-IP sign-in limits need to know which address is the caller's. With
+`TRUSTED_PROXY_HOPS = N`, exactly N proxies are assumed to stand in front, so
+the caller is the Nth `X-Forwarded-For` entry from the right and anything to its
+left — which the caller controls — is ignored. `0` believes no header and uses
+the socket peer. Set it to match the deployment: on Vercel that is 1, and a
+wrong value either merges callers into one bucket or lets one caller mint
+unlimited buckets.
+
 ### Configure Supabase auth and quotas
 
 Run `supabase/migrations/001_phase5_auth_usage.sql` in your Supabase project,

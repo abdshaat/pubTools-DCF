@@ -34,6 +34,7 @@ from ..exceptions import (
     TickerNotCoveredError,
     TickerNotFoundError,
 )
+from ..observability import outbound_counter
 from ..raw_store import RawCapture
 from ..request_context import current_request_id
 
@@ -104,7 +105,12 @@ class FMPClient:
         self._semaphore = asyncio.Semaphore(provider_concurrency)
         self._max_retry_after = max_retry_after_seconds
         self._jitter = jitter
-        self._client = httpx.AsyncClient(base_url=base_url, transport=transport, timeout=timeout)
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            transport=transport,
+            timeout=timeout,
+            event_hooks=outbound_counter("fmp"),
+        )
 
     def _retry_delay(self, response: httpx.Response | None, attempt: int) -> float:
         retry_after = response.headers.get("Retry-After") if response is not None else None
