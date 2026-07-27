@@ -20,7 +20,7 @@ dependencies = [
     # database (Windows dev machines). Linux (Vercel) ships its own; the
     # marker keeps production installs unchanged. Needed for the daily
     # refresh's America/New_York window guard (Phase 8 Slice C).
-    "tzdata>=2024.1; platform_system == 'Windows'",
+    "tzdata>=2026.3; platform_system == 'Windows'",
 ]
 
 [project.optional-dependencies]
