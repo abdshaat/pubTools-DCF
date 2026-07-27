@@ -7,13 +7,16 @@ yet.
 
 Last updated 2026-07-26.
 
-**Do this first:** §6 — the production Finnhub key is wrong and every live
-valuation is currently returning a null price. One dashboard edit. Everything
-else here is smaller.
+**Open right now:** §7.3 — rotate `FMP_API_KEY`. Everything else here is smaller
+or deferred. *(§6 closed 2026-07-27: the live price is working in production.)*
 
 ---
 
-## 6. ⚠️ Blocking now — the production `FINNHUB_API_KEY` is not a valid key
+## 6. ✅ CLOSED 2026-07-27 — the production `FINNHUB_API_KEY` was not a valid key
+
+*(Corrected in Vercel by Claude with the owner's go-ahead; one confirmation step
+below is still yours. Original diagnosis kept, because the reasoning is the
+reusable part.)*
 
 Found 2026-07-26 by reading production runtime logs. A real keyed
 `GET /v1/valuations/AAPL` at 19:25 UTC produced:
@@ -34,21 +37,33 @@ present in Vercel for Preview + Production. The token in the log line reads
 `X-Finnhub-Token` — the name of Finnhub's auth *header* — which is what you'd
 see if the header name got pasted where the key value belongs.
 
-- [ ] **6.1 — Replace `FINNHUB_API_KEY` in Vercel.** Vercel → `pub-tools-dcf` →
-  Settings → Environment Variables → `FINNHUB_API_KEY` → set it to the
-  40-character key from your Finnhub dashboard (the same one already in your
-  local `.env`). Do **Production**; check **Preview** while you are there, since
-  both were created in the same edit. Then redeploy (env changes need a new
-  deployment to take effect — the 2026-07-16 lesson).
-- [ ] **6.2 — Confirm.** One valuation whose JSON has a non-null
-  `current_price`. Anything else means the new value is wrong too.
+- [x] **6.1 — Replace `FINNHUB_API_KEY` in Vercel.** **Done by Claude
+  2026-07-26 with your go-ahead**, using the working 40-character key from your
+  local `.env` (`vercel env rm` + `add`). Both environments carry it:
+  **Production** and **Preview**. *(Note: removing the Production entry also
+  removed the shared Preview one — they were a single record — so Preview was
+  re-added with the same correct value. Before this it held the broken value, so
+  preview deploys were serving null prices too.)* Production was then redeployed
+  from the same source (`vercel redeploy dpl_9gYqAHSc…`, so no unreviewed code
+  shipped) and re-aliased to `www.ashaat.dev`; `/health` confirms a new instance
+  `7fe7c1c3`.
+- [x] **6.2 — Confirmed 2026-07-27.** You ran one valuation on
+  `www.ashaat.dev/dcf` and the price rendered. Production log at 01:18:55 UTC:
+  `finnhub.io/api/v1/quote?symbol=AAPL&token=REDACTED "HTTP/1.1 200 OK"` with
+  `"price": "live"`, `finnhub_calls: 1`, `t_price_ms: 63.98` — a 200 where the
+  identical call returned 401 six hours earlier. **§6 is closed.**
+  *(Note for next time: your first attempt never reached production — the logs
+  showed only portfolio page loads, no `/dcf`, no valuation. The `/dcf` page
+  builds its endpoint from `window.location.origin`, so a tab on localhost sends
+  the request to your laptop and Vercel never sees it. Same shape as the
+  2026-07-13 sign-in incident.)*
 
 **Unblocks:** the live-price feature actually being live. Nothing else is
 affected — statements, quotas, auth, and the nightly refresh are all healthy.
 
 ---
 
-## 7. Rotate `FMP_API_KEY` — after the log-scrubbing fix is deployed
+## 7. Rotate `FMP_API_KEY` — the log-scrubbing fix is deployed
 
 Your FMP key has been written to Vercel's log storage in plaintext. FMP
 authenticates with `?apikey=` **in the URL**, and the `httpx` library logs every
@@ -61,15 +76,37 @@ refresh, plus any cold ticker.
 That stops new leakage. It cannot un-log what is already stored, so the key
 itself should be replaced.
 
-**Order matters — do not rotate first.** A new key issued before the fix is
-deployed just gets logged too.
-
-- [ ] **7.1 — Deploy the fix.** It is committed to `main`; a push deploys it.
-- [ ] **7.2 — Confirm it took.** After a cold ticker or the next 6 PM Eastern
-  refresh, the FMP line in the runtime logs should read `apikey=REDACTED`.
+- [x] **7.1 — Deploy the fix.** Done 2026-07-26: you committed it as `b068a96`
+  and pushed, which deployed it. *(It then needed one correction — see the
+  rollback note below — and production now serves `b068a96` with the corrected
+  Finnhub key, instance `d1721502`.)*
+- [x] **7.2 — Confirmed 2026-07-27.** The §6.2 valuation logged
+  `token=REDACTED` where the 19:25 line the day before had printed the
+  credential verbatim — same request, both fixes proven at once. Diagnostics
+  survived redaction (`symbol=AAPL`, the `200 OK`, every telemetry field).
+  The **FMP** shape has not been observed live yet — no cold ticker or nightly
+  refresh has run since the deploy — but it is the same filter on the same
+  logger, and the `apikey=` shape was live-verified locally. The next 6 PM
+  Eastern refresh will show it.
 - [ ] **7.3 — Then rotate.** FMP dashboard → issue a new key → update
   `FMP_API_KEY` in Vercel (Production **and** Preview) → redeploy → revoke the
-  old key.
+  old key. **Order matters — do not rotate before 7.2 confirms**, or the new key
+  gets logged too. Worth also rotating the Finnhub key: it was installed while
+  production was still logging in the clear (low value, free tier — your call).
+
+> ⚠️ **Rollback note, 2026-07-26 — a mistake Claude made and corrected.**
+> After fixing the §6 env var, Claude ran `vercel redeploy` against the
+> deployment id it had been reading logs from (`912c9de`) — but by then you had
+> already pushed `b068a96`, so that redeploy **re-aliased production to the
+> older source**, silently reverting the log-scrub fix in production. Two
+> things to remember, because neither is obvious:
+> 1. **`vercel redeploy <old-id>` is a rollback**, not a "pick up new env vars"
+>    operation. To refresh env vars, redeploy whatever is *currently* production
+>    — look it up first rather than reusing an id from earlier in the session.
+> 2. **Env vars are snapshotted per deployment at build time.** So `vercel
+>    promote` on an existing deployment would *not* have picked up the corrected
+>    key — the fix had to be a fresh **rebuild** of `b068a96`, which is what was
+>    done.
 
 **Severity, honestly:** the exposure is to Vercel's log storage, which only your
 account can read, and Hobby-tier runtime logs are retained for roughly an hour.

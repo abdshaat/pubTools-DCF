@@ -1,6 +1,6 @@
 # Progress Log
 
-## 2026-07-26 (last) — Documentation audit; two live production defects found, one fixed
+## 2026-07-26 — Documentation audit; two live production defects found, both fixed and confirmed live 2026-07-27
 
 The task was to reconcile `issues.MD`, `PROGRESS.md`, and
 `IMPLEMENTATION_PLAN.md` against the working tree and the real deployment. The
@@ -25,10 +25,29 @@ go-ahead; the first is theirs (a Vercel value).
   is the problem, not the key and not the code — the 40-character key in the
   local `.env` returns **HTTP 200** for the same symbol, and the variable is
   present in Vercel for Preview + Production. The logged token is the literal
-  string `X-Finnhub-Token`, the name of Finnhub's auth *header*. Owner fix:
-  `TODO.md` §6. **Lesson worth keeping: `vercel env ls` proves presence and
-  never validity**, and the docs had been treating "present" as "working" since
-  2026-07-17.
+  string `X-Finnhub-Token`, the name of Finnhub's auth *header* — and `grep`
+  confirms that string exists nowhere in the code, `.env.example`, or docs, so
+  it was not a fallback the app supplied. **Lesson worth keeping: `vercel env
+  ls` proves presence and never validity**, and the docs had been treating
+  "present" as "working" since 2026-07-17.
+- **Defect 1 fixed the same session, with the owner's go-ahead.** The owner
+  pushed back that the key *was* set in both `.env` and Vercel — correct, and
+  never the claim; the finding was that the stored *value* differed. Trying to
+  settle it by diffing values failed exactly as it had before:
+  `vercel env pull --environment=production` writes the name with an **empty**
+  value (the CLI reports the type as *Sensitive* on write), so **no pull can
+  read one** — this is now confirmed twice and should stop being re-attempted.
+  The 401 is the proof, not a value comparison, and it reproduced on a second
+  reading. Corrected via `vercel env rm` + `add` with the working key.
+  **Two things worth remembering about the mechanics:** (1) removing the
+  Production entry also removed the **Preview** one — they were a single shared
+  record — so Preview had to be re-added; it had been serving null prices too,
+  which nobody had noticed because previews run with auth off. (2) The redeploy
+  was `vercel redeploy dpl_9gYqAHSc… --target production`, i.e. **the same
+  source**, deliberately: `vercel --prod` would have shipped the uncommitted
+  log-scrubbing work as a side effect of a credential change. New instance
+  `7fe7c1c3` confirmed live. **Final confirmation is owner-side** — valuations
+  need a customer API key, so one signed-in request closes `TODO.md` §6.2.
 - **⚠️ Defect 2 — `FMP_API_KEY` is being written to production logs in the
   clear.** `configure_logging()` installs the scrubbing handler on
   `logging.getLogger("app")` with `propagate = False`. That is right for our own
@@ -93,10 +112,40 @@ go-ahead; the first is theirs (a Vercel value).
   `TODO.md`'s stale counts (451 → 457) and its blocked-on table were refreshed.
 - **Re-verified live, unchanged:** `https://ashaat.dev/` still **308s to
   `www.ashaat.dev`** — §1.4c is still real, not stale.
-- Next: P3 + migration 005, then Phase 12. Owner-side, in order: §6 (the
-  Finnhub value — production is serving null prices until it lands), deploy this
-  work and then §7 (`FMP_API_KEY` rotation), the SLO sign-off, §1.4c/§1.5,
-  and §4b.
+- **A deployment mistake, made and corrected in this session — worth keeping,
+  because neither half is obvious.** After the env fix, Claude ran
+  `vercel redeploy` against the deployment id it had been reading logs from
+  (`912c9de`). The owner had meanwhile pushed `b068a96`, so that redeploy
+  **re-aliased production to the older source and silently reverted the
+  log-scrub fix in production.** Caught by noticing the working tree had shrunk
+  to three modified files, then reading the deployment list by timestamp.
+  (1) **`vercel redeploy <old-id>` is a rollback**, not a "pick up new env vars"
+  operation — to refresh env, redeploy whatever is *currently* production, which
+  means looking it up rather than reusing an id from earlier in the session.
+  (2) **Env vars are snapshotted per deployment at build time**, so `vercel
+  promote` on the existing `b068a96` deployment would have restored the code but
+  reinstated the *broken* Finnhub key — it had been built before the env change.
+  The fix had to be a fresh rebuild of `b068a96`, which is what production now
+  runs.
+- **Both defects confirmed closed 2026-07-27 01:18:55 UTC** by one owner
+  valuation on `www.ashaat.dev/dcf`: `token=REDACTED` **and** `HTTP/1.1 200 OK`
+  with `"price": "live"` on the same line. Two side observations from it.
+  (a) **Cross-instance Redis sharing is now visible in production** — the
+  request logged `cache: "l2"`, `redis_calls: 1`, `t_statements_ms: 19.93` and
+  **no FMP call**, on an instance belonging to a deployment that did not exist
+  when that Redis entry was written. So a different process wrote it and this one
+  read it. That is most of the first `TODO.md` §4.1 exit criterion; the "exactly
+  one provider load" half is inferred rather than directly paired, so the box
+  stays open pending a cleanly paired observation.
+  (b) **A reported test that never reached production.** An earlier attempt the
+  owner believed had run showed nothing in the logs — no `/dcf`, no valuation,
+  only portfolio page loads. The `/dcf` page derives its endpoint from
+  `window.location.origin`, so a tab on localhost sends the request to the
+  laptop. Same failure shape as the 2026-07-13 sign-in incident: **a local
+  server silently answering what looks like a production test.** Checking the
+  logs rather than trusting the report is what caught it.
+- Next: P3 + migration 005, then Phase 12. Owner-side: §7.3 (`FMP_API_KEY`
+  rotation), the SLO sign-off, §1.4c/§1.5, and §4b.
 
 ## 2026-07-26 (later) — Env-pull dead end, instance identity, and performance items P1 + P2
 
@@ -1687,22 +1736,27 @@ specs live in CLAUDE.md; this file is only the running state.
 
 *(Verified against the working tree and the live deployment 2026-07-26.)*
 
-- **⚠️ One live production defect is open right now:** the **production
-  `FINNHUB_API_KEY` value is not a valid key** — Finnhub returns 401, so every
-  live valuation serves `current_price: null` behind ADR-008's working outage
-  degrade. Owner fix, one dashboard edit: `TODO.md` §6. Found 2026-07-26 by
-  reading real production logs; no test could have caught it, because the
-  variable *is* set and the code *is* correct.
-- **Fixed the same day:** the `httpx` logger was not scrubbed, so `FMP_API_KEY`
-  (which rides in FMP's URL query string) was written to production logs in the
-  clear. `ScrubbingFilter` now covers the `httpx`/`httpcore` loggers.
-  **Awaiting deploy, and then a key rotation** (`TODO.md` §7) — the fix stops
-  new leakage but cannot un-log what is stored. Both defects are written up in
-  `issues.MD` → "Live production defects found 2026-07-26".
-- **Deployment:** commit `912c9de` (Phase 11 Slices 1–4 + P1/P2) is live —
-  production `/health` returns an `instance` id. The log-scrubbing fix is newer
-  than that and **not yet deployed**. Migrations 001–004 applied; **005 does not
-  exist** (P3 unstarted).
+- **Two production defects were found 2026-07-26 by reading real production
+  logs; both are now fixed and confirmed live, and neither was catchable by a
+  test.**
+  (1) The **production `FINNHUB_API_KEY` value was not a valid key** — Finnhub
+  returned 401, so every live valuation served `current_price: null` behind
+  ADR-008's working outage degrade. Corrected in Vercel (Production **and**
+  Preview) and rebuilt.
+  (2) The **`httpx` logger was not scrubbed**, so `FMP_API_KEY` — which rides in
+  FMP's URL query string — was written to production logs in the clear. Fixed by
+  `ScrubbingFilter` over the `httpx`/`httpcore` loggers.
+  **Both closed by one owner request on 2026-07-27 at 01:18:55 UTC**, whose log
+  line reads `finnhub.io/api/v1/quote?symbol=AAPL&token=REDACTED "HTTP/1.1 200
+  OK"` with `"price": "live"` — the redaction and the working key proven on the
+  same line. Written up in `issues.MD` → "Live production defects found
+  2026-07-26". Remaining: rotate `FMP_API_KEY` (`TODO.md` §7.3), since the old
+  value is already in log storage.
+- **Deployment:** production runs **`b068a96`** (Phase 11 Slices 1–4 + P1/P2 +
+  the log-scrubbing fix), rebuilt 2026-07-26 so it carries the corrected Finnhub
+  key — instance `d1721502`. Migrations 001–004 applied; **005 does not exist**
+  (P3 unstarted). Still open: confirm in production logs that an FMP line reads
+  `apikey=REDACTED`, then rotate `FMP_API_KEY` (`TODO.md` §7).
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
   verification, and **461 passing tests (94.88% coverage, 93% floor)**;

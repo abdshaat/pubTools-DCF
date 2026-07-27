@@ -1,13 +1,276 @@
 # Issues
 
+## Safety & security audit — 2026-07-26
+
+Scope: the whole application (`app/`, `docs/`, `scripts/`, `supabase/migrations/`,
+CI workflows, repo hygiene), read for **security**, **null safety**, and
+**unhandled runtime errors**, with the fact that **this is a public repository**
+treated as a standing assumption — anyone can read the code, the migrations, the
+validation bounds, and the error taxonomy, so nothing here may rely on the source
+being private.
+
+Baseline at audit time: **461 tests passing, 94.88% coverage**, ruff + mypy clean.
+Everything below is a defect the green suite did not catch.
+
+**Findings are ranked by severity. Each one states how it was verified.** Items
+marked *(reproduced)* were executed against the real code, not read off the page.
+
+### What was checked and found clean
+
+Recording this so the next audit does not redo it:
+
+- **No secret has ever been committed.** `git log --all -S<value>` for every
+  value in the local `.env`/`.env.local` (8 credentials) returns nothing but
+  `PUBLIC_BASE_URL`, which is not a secret. `.gitignore` covers `.env*`, `data/`,
+  `.vercel/`, and key/cert extensions. No secret-shaped literal in any tracked
+  file (only deliberate fakes in `tests/test_observability.py`). `.mcp.json` is
+  tracked and holds a URL, no token. `scripts/create_api_key.py` reads its
+  credentials from the environment.
+- **Path traversal on `/Pics/{filename}` is genuinely closed** *(reproduced:
+  `/Pics/..` → 404, `/Pics/blob.png` → 200)*. Starlette decodes `%2F` before
+  routing, so the segment cannot span directories, and the `resolve()` +
+  `_PICS_DIR not in target.parents` check catches the rest.
+- **No DOM XSS in the three shipped pages.** Every value that reaches the DOM
+  goes through `textContent`; the only `innerHTML` uses assign the empty string
+  to clear a container.
+- **Database lockdown is correct.** RLS is enabled on all Phase 5/6 tables, and
+  every `SECURITY DEFINER` function has `set search_path = public` plus an
+  explicit `revoke execute … from public` / `grant … to service_role`, so the
+  publishable anon key cannot reach the RPCs over PostgREST.
+- **CI is not a supply-chain hole.** Both workflows are `permissions: contents:
+  read`, neither uses `pull_request_target`, and neither consumes a secret.
+- **The constant-time comparisons that matter are correct** — `hmac.compare_digest`
+  on bytes for the cron secret and the metrics token, on the API-key hash digest,
+  and one generic 401 for every internal-endpoint failure mode.
+
+---
+
+### 🔴 HIGH
+
+- [x] **H1 — The sensitivity grid turns documented-valid requests into 422s.**
+  `app/dcf_engine.py:246` (`compute_sensitivity_grid`). The grid shifts WACC by
+  ±0.01 and terminal growth by ±0.005 and calls `compute_dcf` for each cell, but
+  the only guard before that call is the Gordon condition (`wacc <= 0 or growth
+  >= wacc`). `compute_dcf` re-runs the **full public bounds check**, so a shifted
+  cell that falls outside `MIN_WACC…MAX_WACC` or `MIN_TERMINAL_GROWTH…
+  MAX_TERMINAL_GROWTH` raises `DCFValidationError` — which propagates out of the
+  grid and fails **the entire request**. `sensitivity` defaults to `true`, so
+  this is the default path. *(Reproduced — every one of these is inside the
+  documented input range and every one 422s:)*
+
+  | Request | Result |
+  | --- | --- |
+  | `wacc=0.50` (documented max) | 422 `wacc: must be between 0.001 and 0.5` |
+  | `terminal_growth=-0.10` (documented min) | 422 `terminal_growth: must be between -0.1 and 0.1` |
+  | `terminal_growth=0.10` (documented max) | 422 `terminal_growth: must be between -0.1 and 0.1` |
+  | `wacc=0.0105` | 422 `wacc: must be between 0.001 and 0.5` |
+
+  Two things make this worse than a plain bug. The error **blames the caller's
+  own input**, which is valid — the rejected value is one the server invented.
+  And it contradicts the function's own docstring ("combinations that would break
+  the Gordon formula … come back as None rather than erroring, so one bad corner
+  doesn't cost the caller the whole grid") — the intent was already right, only
+  the Gordon condition was implemented. Quota is consumed pre-flight, so every
+  one of these failures also costs the customer a request.
+  **Fix:** treat a cell that fails validation exactly like a cell that breaks
+  Gordon — `None`, not an exception.
+
+- [x] **H2 — Any non-ASCII CSRF token is an unauthenticated unhandled
+  exception.** `app/accounts.py:163` (`csrf_tokens_match`). `hmac.compare_digest`
+  raises `TypeError: comparing strings with non-ASCII characters is not
+  supported` when given `str` arguments outside ASCII, and Starlette decodes both
+  headers and cookies as **latin-1** — so any byte ≥ 0x80 in `X-CSRF-Token` **or**
+  in the `pt_csrf` cookie produces a non-ASCII `str` and raises. *(Reproduced
+  end-to-end through the ASGI app: `POST /v1/auth/logout` with
+  `X-CSRF-Token: caf\xe9` → `TypeError` escaping the application; same for the
+  cookie; the ASCII control case returns 200.)*
+
+  Reachable **without any credential** on every CSRF-protected route:
+  `/v1/auth/email/login`, `/v1/auth/logout`, and all four
+  `/v1/account/keys/*` endpoints. Consequences: the request bypasses the entire
+  error contract (no JSON `error` body, no `X-Request-ID`, no
+  `Cache-Control: no-store`, no security headers), it is logged at **ERROR** with
+  a traceback on every hit, and it counts as a 5xx in the metrics — so a trivial
+  loop inflates the error budget, floods log storage, and trips any SLO alert
+  built on `dcf_http_requests_total{status="500"}`.
+  **Fix:** compare the two tokens as bytes, and reject anything that isn't a
+  plausible token before comparing at all.
+
+---
+
+### 🟠 MEDIUM
+
+- [x] **M1 — `/docs` and `/redoc` execute third-party JavaScript on the same
+  origin as the signed-in account UI, with no CSP.** *(Verified live:
+  `https://www.ashaat.dev/docs` → 200 with **no** `Content-Security-Policy`
+  header; the page loads `cdn.jsdelivr.net` scripts and styles.)* The three
+  first-party pages carry `_LANDING_PAGE_CSP`; FastAPI's generated docs pages do
+  not, because they never pass through those routes. That origin is the same one
+  that serves `/dcf`, holds the cookie-authenticated key-management API, and sets
+  the **non-`HttpOnly`** `pt_csrf` cookie (it has to be readable by JS for the
+  double-submit check). So a compromised CDN asset — or anything that can inject
+  into those pages — gets same-origin script execution with everything it needs
+  to mint an API key for any visitor who is signed in: read `pt_csrf`, `POST
+  /v1/account/keys` with the browser's `pt_session` cookie attached
+  automatically, exfiltrate the returned key.
+  **Fix:** serve the docs pages through routes that attach a tight CSP —
+  crucially `connect-src 'self'`, which blocks exfiltration to a third-party
+  host even if a script does run. Residual risk (a hostile script acting
+  *within* the origin) is stated below; turning the docs off entirely is an
+  owner decision, recorded in `TODO.md`.
+
+- [x] **M2 — An unauthenticated caller can drive unbounded Supabase Auth round
+  trips.** `app/api.py:718` (`_account_context`) → `app/accounts.py:294`
+  (`get_current_customer`). Send any junk `pt_session` cookie to `/v1/auth/me`
+  (or any account route) and the app calls Supabase `/auth/v1/user`; add a junk
+  `pt_refresh` and it also calls `/auth/v1/token` and then `/auth/v1/user`
+  again — **three upstream calls per unauthenticated request**. The per-IP daily
+  login limiter guards only `/v1/auth/github/login` and `/v1/auth/email/login`;
+  nothing guards this path. That is a 3× amplifier against the auth provider's
+  own rate limits and against Vercel function billing, available to anyone.
+  **Fix:** count *failed* session verifications against the same per-IP daily
+  budget, and refuse the upstream call once that budget is spent. Successful
+  sessions are never counted, so real users are unaffected.
+
+- [x] **M3 — Dependencies have no upper bound, no lockfile, and no scanning.**
+  `pyproject.toml`: `httpx>=0.27`, `fastapi>=0.115`, and eight `dev` deps with
+  open ranges. There is no `requirements.txt`, no lock, and no
+  `.github/dependabot.yml`. Every Vercel build re-resolves to whatever is newest
+  at build time, so a broken or malicious release reaches production **with no
+  commit of ours** — and, this being a public repo, the exact dependency surface
+  is published for anyone to watch. A green CI run proves nothing about the set
+  of packages the next deploy will install.
+  **Fix:** bound the majors, and add Dependabot so upgrades arrive as reviewable
+  PRs instead of as silent build-time drift.
+
+- [x] **M4 — Vercel labels the cookie-setting page `Cache-Control: public`.**
+  *(Verified live: `GET https://www.ashaat.dev/dcf` returns
+  `Cache-Control: public, max-age=0, must-revalidate` **and**
+  `Set-Cookie: pt_csrf=…`.)* The app sets no `Cache-Control` on its HTML routes,
+  so Vercel supplies that default — and `public` on a `Set-Cookie` response is
+  exactly what a shared cache is not supposed to store. `max-age=0,
+  must-revalidate` keeps the practical risk low (a cache must revalidate before
+  reuse), but the app should not be relying on a platform default to decide the
+  cacheability of a response that carries a per-visitor token.
+  **Fix:** the app states its own `Cache-Control` on every HTML and schema route
+  rather than inheriting one.
+
+- [ ] **M5 — CSRF is unsigned double-submit on a non-`__Host-` cookie.**
+  `app/accounts.py:146`. `pt_csrf` is set with `Secure; SameSite=lax; Path=/` but
+  **no `__Host-` prefix**, and the token is not bound to the session. Cookies
+  can be written across a registrable domain: anything able to set a cookie for
+  `ashaat.dev` — a hostile or compromised sibling subdomain, now or in the
+  future — can inject a `pt_csrf` value of its choosing and then send the
+  matching header, satisfying the check. `SameSite=lax` is the real protection
+  today (these are all `POST`s), which means the CSRF token is currently the
+  *weaker* of the two defenses, not a second independent one.
+  **Left open deliberately:** the fix is a cookie **rename** (`__Host-pt_csrf`,
+  which browsers refuse to accept from a subdomain) or an HMAC binding the token
+  to the session, and either one invalidates the token every live browser
+  currently holds. It is a coordinated change to `docs/index.html` plus the
+  server, not a mid-audit edit. Tracked in `TODO.md` §8.
+
+---
+
+### 🟡 LOW
+
+- [x] **L1 — Fail-closed storage errors can surface as unhandled 500s instead.**
+  `app/supabase.py:161` reads `payload["allowed"]`, `payload["limit"]`,
+  `payload["remaining"]`, `payload["reset_epoch"]`, `payload["retry_after"]` off
+  the quota RPC result. A shape change raises `KeyError`, which the middleware's
+  `except SupabaseError` does **not** catch — so the request 500s instead of
+  returning the intended 503 `auth_storage_unavailable`. Same class of gap:
+  `_parse_datetime` raising `ValueError` on a malformed `expires_at`
+  (`app/supabase.py:709`), and `int(record.get("daily_quota") or 100)` on a
+  non-numeric column. The quota RPC is the one that decides whether a caller may
+  be served, so its failure mode should never be "unhandled".
+
+- [x] **L2 — `fetch_fundamentals` does not type-check the profile element.**
+  `app/providers/fmp.py:270`. For the non-`limit` endpoint (`profile`) a list
+  payload is reduced with `results[endpoint] = payload[0]` and no `isinstance`
+  check, so a non-dict element flows into `normalize_fmp_fundamentals`, which
+  calls `f.profile.get("sector")` → `AttributeError` → unhandled 500. The sibling
+  method `fetch_profile` already has exactly this check; `fetch_fundamentals`
+  is the copy that lost it.
+
+- [x] **L3 — Unvalidated path text is written to the database.**
+  `app/api.py:313` (`_valuation_ticker_from_path`) slices the ticker out of the
+  **raw** path in the middleware, before FastAPI's `^[A-Za-z][A-Za-z.\-]*$` /
+  `max_length=10` route validation runs. A request to `/v1/valuations/<junk>`
+  that then 422s still writes that junk into `usage_events.ticker`, bounded only
+  by the platform's URL limit. Not injectable (PostgREST parameterizes it), but
+  it means the metering table and the `ticker` telemetry field can disagree, and
+  it lets a caller choose what goes in a row of our database.
+
+- [x] **L4 — In-process caches have no bound.** `app/fundamentals.py:284`:
+  `_cache`, `_raw_cache`, `_profile_cache`, and `_negative` are plain dicts with
+  no cap and no sweep — an entry is only ever evicted when *the same ticker* is
+  asked for again. The negative cache is the exposed one: a caller spending
+  quota on distinct nonexistent tickers adds an entry per ticker for the life of
+  the process. Same shape in `app/supabase.py:674` (`_last_used_writes`, one
+  entry per key id, forever). Serverless instance churn hides this in production
+  today; a long-lived process is what it would bite.
+
+- [x] **L5 — API-key prefixes are interpolated into PostgREST filters
+  unvalidated.** `app/supabase.py:113` builds `params={"prefix": f"eq.{prefix}"}`
+  where `prefix` is whatever the caller put between the first two underscores of
+  `X-API-Key` — never charset-checked (`app/auth.py:121` only checks the
+  three-part shape). httpx percent-encodes the value, so a second filter cannot
+  be injected **today**; the defense rests entirely on the encoder rather than on
+  the input being what it claims to be.
+
+- [x] **L6 — The FMP client interpolates transport-error text; the Finnhub
+  client deliberately does not.** `app/providers/fmp.py:177` builds
+  `f"transport error: {exc}"` and carries it into the final `ProviderError`
+  message. `app/providers/finnhub.py:92` chains instead, with the comment "httpx
+  error text can embed the request URL, which carries the token" — and FMP
+  authenticates with `?apikey=` in the query string, which is precisely the same
+  exposure. The message never reaches a customer (503s carry fixed text), so this
+  is defense in depth, but the two clients should not disagree about a rule one
+  of them wrote down.
+
+- [ ] **L7 — No `SECURITY.md`.** A public repository with a live production
+  service and no stated vulnerability-reporting channel leaves a finder with
+  nowhere to send a report. *(Owner decision — needs a contact address;
+  `TODO.md` §8.)*
+
+- [ ] **L8 — The app emits no HSTS of its own.** *(Verified live: Vercel injects
+  `Strict-Transport-Security: max-age=63072000`, so **production is covered** —
+  this is informational.)* It is worth knowing that the header is the platform's,
+  not the application's: the same code served anywhere else has no HSTS, and the
+  Vercel default carries neither `includeSubDomains` nor `preload`.
+
+- [ ] **L9 — `connect-src` allows `http://127.0.0.1:*` and `http://localhost:*`
+  from the production page.** Deliberate — it is what lets the `/dcf` endpoint
+  builder call a developer's local server — and it is also the reason a pasted
+  API key cannot be exfiltrated to a third-party host by that page. Recorded as
+  an accepted trade-off, not a defect.
+
+---
+
+### Not defects, but worth knowing
+
+- **`API_KEY_HASH_PEPPER` unset is not a weakness here.** Keys carry 32 bytes
+  from `secrets.token_urlsafe`, so an unpeppered SHA-256 is not brute-forceable;
+  the pepper defends against a stolen-hash-table + weak-key scenario that does
+  not apply to generated keys.
+- **Timing on API-key lookup** distinguishes "unknown prefix" (returns before
+  hashing) from "known prefix, wrong secret". Both paths make one Supabase round
+  trip, so network noise dominates the hash comparison by orders of magnitude.
+- **`/openapi.json`, `/health`, and `/ready` are unauthenticated by design.**
+  `/ready` reports names and statuses only, caches for 5 s, and collapses
+  concurrent probes onto one check, so it cannot be used to amplify into the
+  database.
+
 ## ⚠️ Live production defects found 2026-07-26 (doc/state audit)
 
 Both were found by reading the real production runtime logs (Vercel MCP,
 `pub-tools-dcf` production, deployment `dpl_9gYqAHSc…` = commit `912c9de`).
 Neither is visible from tests, which is why they survived a green suite.
 
-- [ ] **(owner) The production `FINNHUB_API_KEY` value is not a valid key —
-  every production valuation is returning a null price.** A real keyed
+- [x] **The production `FINNHUB_API_KEY` value is not a valid key — every
+  production valuation is returning a null price.** **Corrected 2026-07-26**
+  (see the resolution note at the end of this item). A real keyed
   `GET /v1/valuations/AAPL` on 2026-07-26 19:25 UTC logged
   `GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=X-Finnhub-Token
   "HTTP/1.1 401 Unauthorized"` and closed with `"price": "unavailable"`. So
@@ -23,6 +286,50 @@ Neither is visible from tests, which is why they survived a green suite.
   `FINNHUB_API_KEY` (Production, and check Preview) with the 40-character key
   from the Finnhub dashboard, then redeploy. Confirm with one valuation whose
   response carries a non-null `current_price`. Also in `TODO.md` §6.
+
+  **Resolution (2026-07-26).** The owner confirmed the variable was set in both
+  `.env` and Vercel — which was true and never in dispute; the finding was that
+  the *stored value* differed from the working one. An attempt to settle it by
+  diffing the values failed the same way as before:
+  `vercel env pull --environment=production` writes `FINNHUB_API_KEY` with an
+  **empty** value (the CLI reports the type as *Sensitive* on write), so no pull
+  can read it. **The 401 is therefore the proof, not a value comparison** — and
+  it reproduced on a second reading of the logs. Two supporting facts: the local
+  key returned **HTTP 200** for the same symbol at the same moment, and the
+  transmitted token was the 15-character literal `X-Finnhub-Token`, which
+  `grep` confirms appears nowhere in the code, `.env.example`, or docs — so it
+  was not a fallback the app supplied.
+  **Fixed with the owner's go-ahead** via `vercel env rm` + `vercel env add`
+  using the working key. Note that removing the Production entry also removed
+  the **Preview** one — they were a single shared record — so Preview was
+  re-added with the correct value; it had been serving null prices too.
+  Production was redeployed **from the same source**
+  (`vercel redeploy dpl_9gYqAHSc… --target production`) so that no unreviewed
+  working-tree code shipped alongside a credential change; it re-aliased to
+  `www.ashaat.dev` and `/health` reported a new instance. **Final confirmation
+  is owner-side** (`TODO.md` §6.2): valuations require a customer API key, which
+  Claude does not have, so one signed-in request is what closes this.
+  ⚠️ **One correction along the way.** The first redeploy targeted the
+  deployment id Claude had been reading logs from (`912c9de`), by which time the
+  owner had pushed `b068a96` — so it **re-aliased production to the older
+  source**, reverting the log-scrub fix in production. Corrected by rebuilding
+  `b068a96` (a rebuild, not a `promote`: env vars are snapshotted per deployment
+  at build time, so promoting the existing `b068a96` deployment would have
+  restored the code while reinstating the broken key). Production now runs
+  `b068a96` with the corrected key, instance `d1721502`. See `TODO.md` §7 for
+  the two reusable lessons.
+
+  ✅ **Confirmed live 2026-07-27 01:18:55 UTC.** The owner ran one valuation on
+  `www.ashaat.dev/dcf`. Production logged
+  `GET https://finnhub.io/api/v1/quote?symbol=AAPL&token=REDACTED "HTTP/1.1 200
+  OK"` with `"price": "live"`, `finnhub_calls: 1`, `t_price_ms: 63.98` — a 200
+  where the same call returned 401 six hours earlier. **This box is closed.**
+  *(An earlier attempt the owner reported had not reached production at all: the
+  retained log window showed only portfolio page loads, no `/dcf` and no
+  `/v1/valuations/*`. The likely cause was a tab pointed at a local server — the
+  page derives its endpoint from `window.location.origin`. Worth remembering,
+  because it is the same failure shape as the 2026-07-13 sign-in incident: a
+  local server silently answering what looks like a production test.)*
 - [x] **The `httpx` INFO log prints full outbound request URLs, and the FMP key
   rides in the URL query string — so `FMP_API_KEY` is written to production
   logs in the clear.** **Fixed 2026-07-26** (same session, details below the
@@ -72,8 +379,17 @@ Neither is visible from tests, which is why they survived a green suite.
   script deliberately avoided importing `app.api`, because that path calls
   `load_dotenv()` and would restore real credentials — the trap recorded in
   `PROGRESS.md` on 2026-07-26.)*
-  ⚠️ **Still owner-side: rotate `FMP_API_KEY` after this deploys** — the current
-  value has already been written to Vercel's log storage. `TODO.md` §7.
+  ✅ **Confirmed in production 2026-07-27 01:18:55 UTC**, on the same log line
+  that closed the Finnhub item above: `token=REDACTED` where the 19:25 line had
+  printed the credential verbatim. Deployment `dpl_AuLcbsNjps…` (`b068a96`).
+  Redaction and diagnostics both intact — `symbol=AAPL`, the `200 OK`, and every
+  telemetry field survived.
+  ⚠️ **Still owner-side: rotate `FMP_API_KEY`** — the old value was written to
+  Vercel's log storage before this shipped, and no code fix can un-log it.
+  `TODO.md` §7.3. The FMP path itself has not yet been *observed* redacted (no
+  cold ticker or nightly refresh has run since the deploy), but it is the same
+  filter on the same logger — and the local live-verification covered the
+  `apikey=` shape directly.
 
 # Production sign-in investigation (2026-07-13)
 

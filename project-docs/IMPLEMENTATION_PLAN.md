@@ -1642,8 +1642,16 @@ Exit criteria:
   readable from this session (a real keyed valuation logged `redis_calls: 6`,
   `cache: database`, and several distinct `instance` ids appear across the
   fleet). What is missing is the composed observation, not access. Caveat:
-  Vercel Hobby retains runtime logs for roughly an hour, so it must be captured
-  close to the traffic that produces it.
+  retention is short (roughly 2–3 hours observed on this plan), so it must be
+  captured close to the traffic that produces it.
+  **Partial live evidence, 2026-07-27 01:18:55 UTC:** a production valuation
+  logged `cache: "l2"` with `redis_calls: 1`, `t_statements_ms: 19.93`, and
+  **no FMP call**, served by instance `27c0ed9c` on a deployment that did not
+  exist when that Redis entry was written — so a *different* process wrote the
+  statements and this one read them. That establishes cross-instance Redis
+  sharing with no provider load on the reading side. It does not yet pair the
+  two halves in one observation (the writing instance's line had already aged
+  out of retention), which is why this stays open.
 - [ ] **(live)** A total Redis outage changes latency/cost only:
   valuations still succeed, auth/quota still fail closed via Supabase.
   Test-proven; live confirmation still needs either the REST credentials
