@@ -64,7 +64,13 @@ def _parse_datetime(value: Any) -> datetime | None:
     if not isinstance(value, str):
         raise SupabaseError("Supabase timestamp field was not a string")
     normalized = value.replace("Z", "+00:00")
-    parsed = datetime.fromisoformat(normalized)
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError as exc:
+        # A malformed stored timestamp is a storage problem, and every caller
+        # is already prepared for SupabaseError. Letting the raw ValueError out
+        # would make one bad row a 500 on the authentication path.
+        raise SupabaseError("Supabase timestamp field was not a valid timestamp") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed
@@ -159,13 +165,21 @@ class SupabaseClient:
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], dict):
             raise SupabaseError("Supabase quota RPC returned an unexpected payload shape")
         payload = rows[0]
-        return RateLimitResult(
-            allowed=bool(payload["allowed"]),
-            limit=int(payload["limit"]),
-            remaining=int(payload["remaining"]),
-            reset_epoch=int(payload["reset_epoch"]),
-            retry_after=max(1, int(payload["retry_after"])),
-        )
+        # Every field, or SupabaseError. This is the call that decides whether a
+        # request may be served, and the middleware fails closed on
+        # SupabaseError only -- a bare KeyError or ValueError from a changed RPC
+        # shape would sail past that handler and 500 instead of 503, turning a
+        # deliberate fail-closed path into an unhandled one.
+        try:
+            return RateLimitResult(
+                allowed=bool(payload["allowed"]),
+                limit=int(payload["limit"]),
+                remaining=int(payload["remaining"]),
+                reset_epoch=int(payload["reset_epoch"]),
+                retry_after=max(1, int(payload["retry_after"])),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SupabaseError("Supabase quota RPC returned unusable fields") from exc
 
     async def record_usage_event(
         self,
@@ -656,6 +670,10 @@ class SupabaseAPIKeyAuthenticator:
     """
 
     DEFAULT_LAST_USED_INTERVAL_SECONDS = 300.0
+    # Far more distinct keys than any instance sees inside one coalescing
+    # window; the cap exists so the map cannot grow without limit, not to
+    # ration anything.
+    MAX_TRACKED_KEYS = 4096
 
     def __init__(
         self,
@@ -679,7 +697,14 @@ class SupabaseAPIKeyAuthenticator:
         previous = self._last_used_writes.get(key_id)
         if previous is not None and now - previous < self._last_used_interval:
             return False
+        # Bounded: one entry per key id, and nothing ever removed them. Only
+        # verified keys get in, so this was never attacker-driven, but an
+        # unbounded map in a long-lived process is a leak either way. Dropping
+        # the oldest entry costs at most one redundant bookkeeping write.
+        self._last_used_writes.pop(key_id, None)
         self._last_used_writes[key_id] = now
+        while len(self._last_used_writes) > self.MAX_TRACKED_KEYS:
+            del self._last_used_writes[next(iter(self._last_used_writes))]
         return True
 
     @property
@@ -717,7 +742,16 @@ class SupabaseAPIKeyAuthenticator:
         if required_scope not in scopes:
             raise AuthFailure(AuthFailureReason.INSUFFICIENT_SCOPE)
 
-        key_id = str(record["id"])
+        try:
+            key_id = str(record["id"])
+            customer_id = str(record["customer_id"])
+            prefix = str(record["prefix"])
+            daily_quota = int(record.get("daily_quota") or 100)
+        except (KeyError, TypeError, ValueError) as exc:
+            # A key row we cannot read is a storage fault, not a bad request:
+            # SupabaseError is what the middleware turns into a fail-closed 503.
+            raise SupabaseError("Supabase API-key row was unusable") from exc
+
         if self._should_record_use(key_id):
             # Best effort: a failed bookkeeping write must not deny a caller
             # whose key just verified. The next request through this instance
@@ -726,10 +760,10 @@ class SupabaseAPIKeyAuthenticator:
                 await self._client.mark_key_used(key_id)
         return AuthenticatedPrincipal(
             key_id=key_id,
-            customer_id=str(record["customer_id"]),
-            prefix=str(record["prefix"]),
+            customer_id=customer_id,
+            prefix=prefix,
             scopes=scopes,
-            daily_quota=int(record.get("daily_quota") or 100),
+            daily_quota=daily_quota,
         )
 
 

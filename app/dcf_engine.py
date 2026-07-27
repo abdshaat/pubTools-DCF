@@ -246,10 +246,29 @@ TERMINAL_GROWTH_OFFSETS = (-0.005, 0.0, 0.005)
 def compute_sensitivity_grid(base: BaseFinancials, assumptions: Assumptions) -> SensitivityGrid:
     """3x3 grid of intrinsic value per share around the caller's WACC and
     terminal growth. Pure like compute_dcf. The center cell always equals
-    the point estimate; combinations that would break the Gordon formula
-    (g >= WACC, or WACC <= 0) come back as None rather than erroring, so
-    one bad corner doesn't cost the caller the whole grid.
+    the point estimate; any cell the engine cannot value comes back as None
+    rather than erroring, so one bad corner doesn't cost the caller the
+    whole grid.
+
+    A cell is unvaluable for two different reasons, and both must yield None:
+
+      - the Gordon formula breaks (g >= WACC, or WACC <= 0); and
+      - the *shifted* value falls outside the public assumption bounds.
+
+    The second case is the one that used to escape. The offsets are applied
+    to values the caller is allowed to send, so shifting a legal input can
+    land outside the legal range all by itself: wacc=0.50 shifts to 0.51,
+    terminal_growth=-0.10 shifts to -0.105. `compute_dcf` re-validates every
+    cell against the same public bounds, so those raised DCFValidationError
+    and failed the entire request with a 422 that blamed the caller for a
+    value the server had invented.
+
+    The caller's own assumptions are still validated up front, so genuinely
+    invalid input raises here exactly as before — only *derived* cells are
+    allowed to come back empty.
     """
+    _validate(base, assumptions)
+
     # round() strips float-add artifacts (0.09 - 0.01 = 0.07999...) so the
     # echoed axis values are clean
     wacc_values = tuple(round(assumptions.wacc + o, 10) for o in WACC_OFFSETS)
@@ -263,9 +282,15 @@ def compute_sensitivity_grid(base: BaseFinancials, assumptions: Assumptions) -> 
         for growth in growth_values:
             if wacc <= 0 or growth >= wacc:
                 row.append(None)
-            else:
-                shifted = replace(assumptions, wacc=wacc, terminal_growth=growth)
+                continue
+            shifted = replace(assumptions, wacc=wacc, terminal_growth=growth)
+            try:
                 row.append(compute_dcf(base, shifted).intrinsic_value_per_share)
+            except DCFValidationError:
+                # Out-of-bounds shifted corner. Empty like a broken-Gordon
+                # cell: the caller asked for a valuation, not for the grid's
+                # edges to be a validation error about inputs they never sent.
+                row.append(None)
         rows.append(tuple(row))
 
     return SensitivityGrid(

@@ -340,3 +340,129 @@ def test_get_daily_quota_usage_raises_on_error_or_malformed_payload():
                 await client.aclose()
 
     _run(exercise())
+
+
+# ---------------------------------------------------------------------------
+# Safety/security audit regressions (2026-07-26)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("rows", "case"),
+    [
+        ([{"allowed": True, "limit": 100}], "fields missing from the row"),
+        (
+            [
+                {
+                    "allowed": True,
+                    "limit": "many",
+                    "remaining": 1,
+                    "reset_epoch": 1,
+                    "retry_after": 1,
+                }
+            ],
+            "a field that will not convert",
+        ),
+        (
+            [{"allowed": True, "limit": None, "remaining": 1, "reset_epoch": 1, "retry_after": 1}],
+            "a null where a number belongs",
+        ),
+    ],
+)
+def test_unusable_quota_rpc_payload_raises_supabase_error(rows, case):
+    """The quota RPC decides whether a request may be served, and the
+    middleware fails closed on SupabaseError *only* -- a bare KeyError or
+    ValueError from a changed RPC shape used to sail past that handler and
+    500 instead of 503."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json=rows)
+
+    client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+    with pytest.raises(SupabaseError):
+        asyncio.run(client.consume_daily_quota(subject_id="k", limit=10, window="2026-07-26"))
+
+
+def test_malformed_expires_at_fails_closed_instead_of_500ing():
+    """One bad timestamp in a key row is a storage fault, not an unhandled
+    ValueError on the authentication path."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "key-1",
+                    "customer_id": "cust-1",
+                    "prefix": "abcd1234",
+                    "secret_hash": APIKeyAuthenticator.hash_secret("dcf_abcd1234_secret"),
+                    "scopes": ["valuation:read"],
+                    "revoked": False,
+                    "expires_at": "whenever",
+                    "daily_quota": 100,
+                }
+            ],
+        )
+
+    client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+    authenticator = SupabaseAPIKeyAuthenticator(client)
+    with pytest.raises(SupabaseError):
+        asyncio.run(authenticator.authenticate("dcf_abcd1234_secret"))
+
+
+def test_unusable_key_row_fields_fail_closed():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json=[
+                {
+                    "id": "key-1",
+                    "prefix": "abcd1234",  # customer_id absent
+                    "secret_hash": APIKeyAuthenticator.hash_secret("dcf_abcd1234_secret"),
+                    "scopes": ["valuation:read"],
+                    "revoked": False,
+                    "daily_quota": 100,
+                }
+            ],
+        )
+
+    client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+    with pytest.raises(SupabaseError):
+        asyncio.run(SupabaseAPIKeyAuthenticator(client).authenticate("dcf_abcd1234_secret"))
+
+
+def test_last_used_tracking_is_bounded():
+    client = SupabaseClient(_config(), transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+    authenticator = SupabaseAPIKeyAuthenticator(client)
+    for i in range(SupabaseAPIKeyAuthenticator.MAX_TRACKED_KEYS + 100):
+        assert authenticator._should_record_use(f"key-{i}") is True
+    assert len(authenticator._last_used_writes) == SupabaseAPIKeyAuthenticator.MAX_TRACKED_KEYS
+
+
+@pytest.mark.parametrize(
+    "presented",
+    [
+        "dcf_ab*cd_secret",  # charset
+        "dcf_AB12_secret",  # issued prefixes are lowercase
+        "dcf_" + "a" * 33 + "_secret",  # longer than any issued prefix
+        "dcf_a.b_secret",  # a PostgREST operator character
+        "dcf_" + "a" * 300 + "_secret",  # oversized overall
+    ],
+)
+def test_implausible_key_prefixes_are_refused_before_any_query(presented):
+    """The prefix is interpolated into a PostgREST filter to find the
+    candidate row. httpx encodes it, so nothing escapes today -- but that puts
+    the whole defense on the encoder. Issued prefixes are 8 lowercase
+    alphanumerics; anything else never reaches a query."""
+    queried: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        queried.append(request)
+        return httpx.Response(200, json=[])
+
+    client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
+    with pytest.raises(AuthFailure) as exc:
+        asyncio.run(SupabaseAPIKeyAuthenticator(client).authenticate(presented))
+
+    assert exc.value.reason is AuthFailureReason.MALFORMED
+    assert queried == [], "a refused key must not cost a database round trip"

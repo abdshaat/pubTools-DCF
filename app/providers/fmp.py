@@ -166,6 +166,7 @@ class FMPClient:
     ) -> Any:
         query = {"symbol": ticker, "apikey": self._api_key, **params}
         last_error: str | None = None
+        last_exception: BaseException | None = None
 
         for attempt in range(self._max_retries + 1):
             response: httpx.Response | None = None
@@ -174,7 +175,14 @@ class FMPClient:
                 async with self._semaphore:
                     response = await self._client.get(f"/{endpoint}", params=query)
             except httpx.TransportError as exc:
-                last_error = f"transport error: {exc}"
+                # The class name, never the exception text. This client
+                # authenticates with `?apikey=` in the query string, so any
+                # httpx message that happens to include the request URL would
+                # put a live credential in an error string -- the same reason
+                # app/providers/finnhub.py chains instead of interpolating.
+                # The cause is chained, so a traceback still has everything.
+                last_error = f"transport error ({type(exc).__name__})"
+                last_exception = exc
             else:
                 if response.status_code in (401, 403):
                     raise ProviderAuthError(
@@ -231,7 +239,7 @@ class FMPClient:
         raise ProviderError(
             f"FMP request failed after {self._max_retries + 1} attempts "
             f"({endpoint}/{ticker}): {last_error}"
-        )
+        ) from last_exception
 
     async def fetch_fundamentals(
         self,
@@ -267,6 +275,15 @@ class FMPClient:
                         )
                     results[endpoint] = tuple(payload)
                 else:
+                    # The single-record endpoint (profile). Checking the element
+                    # matters as much as checking the container: a non-dict here
+                    # reaches normalization as `f.profile`, where `.get("sector")`
+                    # is an AttributeError and an unhandled 500. `fetch_profile`
+                    # below already guards this; only this path had lost it.
+                    if not isinstance(payload[0], dict):
+                        raise ProviderError(
+                            f"FMP returned malformed {endpoint} payload for {ticker}"
+                        )
                     results[endpoint] = payload[0]
             elif needs_limit:
                 if not isinstance(payload, dict):

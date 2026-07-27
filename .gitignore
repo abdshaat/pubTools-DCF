@@ -83,12 +83,16 @@ supabase/.env.*
 *~
 
 # --- Local notes / editor ---
-# Ignore root/local Markdown notes by default. Publish the public README and
-# every documentation file under project-docs/.
+# Ignore root/local Markdown notes by default. Publish the public README, the
+# security policy, and every documentation file under project-docs/.
 *.md
 *.MD
 !README.md
 !README.MD
+# GitHub only surfaces the "Report a vulnerability" flow when this file is
+# committed; the blanket rule above had been swallowing it.
+!SECURITY.md
+!SECURITY.MD
 !project-docs/
 !project-docs/*.md
 !project-docs/*.MD

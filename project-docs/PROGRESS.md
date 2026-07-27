@@ -1,5 +1,110 @@
 # Progress Log
 
+## 2026-07-26 (last) — Safety & security audit: 2 HIGH, 4 MEDIUM, 6 LOW found and fixed
+
+Full-application audit for security, null safety, and unhandled runtime errors,
+with "this is a public repo" as a standing assumption. New section at the top of
+`issues.MD` ranks every finding by severity and records how each was verified;
+everything marked fixed there has a regression test that fails against the old
+code. **Suite 461 → 492 passing, 94.68% coverage**; ruff/format/mypy clean.
+
+- **Clean, and recorded as clean so nobody re-derives it:** no secret has ever
+  been committed (`git log --all -S` over all 8 local credentials — only
+  `PUBLIC_BASE_URL` appears, which is not one); the `/Pics` traversal guard
+  genuinely holds; no DOM XSS (everything reaching the DOM goes through
+  `textContent`); RLS on every table with `EXECUTE` revoked from `PUBLIC` on
+  every `SECURITY DEFINER` function; CI uses no secrets and no
+  `pull_request_target`.
+- **🔴 H1 — the sensitivity grid was turning valid requests into 422s, by
+  default.** The grid shifts WACC ±1% and terminal growth ±0.5% and calls
+  `compute_dcf` per cell, but guarded only the Gordon condition — while
+  `compute_dcf` re-validates against the *public bounds*. So a shifted corner
+  leaving the legal range raised out of the grid and failed the whole request:
+  **`wacc=0.50`, `terminal_growth=±0.10`, and any `wacc<0.011` all 422'd**, each
+  one blaming the caller for a value the server had invented, and each one
+  costing the customer a quota unit. `sensitivity` defaults to true, so this was
+  the default path. The docstring already described the correct behavior ("one
+  bad corner doesn't cost the caller the whole grid") — only the Gordon half had
+  been implemented. Now an out-of-bounds cell is `None` like a broken-Gordon
+  cell, **with the caller's own assumptions still validated up front** so
+  genuinely invalid input keeps raising (pinned by its own test). Re-checked
+  through the real route: 200 with 3/9 corners null, ordinary case 9/9,
+  `wacc=0.6` still 422.
+- **🔴 H2 — any non-ASCII CSRF token was an unauthenticated unhandled
+  exception.** `hmac.compare_digest` raises `TypeError` on non-ASCII `str`, and
+  Starlette decodes headers *and* cookies as latin-1 — so one byte ≥ 0x80 in
+  `X-CSRF-Token` or the `pt_csrf` cookie escaped the ASGI app entirely on every
+  CSRF-protected route, with no credential required. It bypassed the whole error
+  contract (no JSON body, no request id, no `no-store`, no security headers) and
+  logged an ERROR traceback per hit, so a trivial loop would inflate the error
+  budget and trip any 5xx alert. Fixed by comparing UTF-8 **bytes** behind a
+  token-shape check. Verified end to end: 403 `csrf_failed` with the full
+  contract restored.
+- **🟠 M1 — `/docs` and `/redoc` ran CDN JavaScript on the session origin with
+  no CSP at all** (verified live). Replaced FastAPI's built-in docs routes with
+  equivalents that attach one; the load-bearing directive is `connect-src
+  'self'`, which stops a hostile script from shipping what it stole off the
+  origin. Residual risk (third-party script acting *within* the origin) is
+  stated rather than hidden, with three options for the owner in `TODO.md` §8.2.
+- **🟠 M2 — the service was an amplifier against Supabase Auth, and the first
+  fix was wrong.** Junk session cookies bought **2 outbound auth calls per
+  unauthenticated request** (measured: `["/auth/v1/user", "/auth/v1/token"]`).
+  A per-address failure budget was written first and **rejected after a test
+  showed it signing out a real user** — the budget must be checked *before* the
+  session is verified, so a prober behind a shared address could log out
+  everyone behind it. What shipped has no false-positive mode: Supabase access
+  tokens are JWTs, so a `pt_session` that is not a decodable JWT with an
+  unexpired `exp` **cannot** be accepted upstream, and asking is pure waste.
+  Screened locally; the claims are read as untrusted JSON and used only to
+  decide whether the call is worth making — never for authorization. Junk now
+  costs **zero** upstream calls. *This also fixed the test double, which had
+  been handing out opaque ids like `access-1` where real Supabase issues JWTs —
+  so no test had ever exercised the real cookie shape.*
+- **🟠 M3/M4 — supply chain and cacheability.** Every dependency was unbounded
+  (`fastapi>=0.115`, `httpx>=0.27`) with no lockfile: each Vercel build
+  re-resolved to whatever was newest, so a bad release could reach production
+  with no commit behind it. Bounded at the next major + added
+  `.github/dependabot.yml`. Separately, Vercel was labelling `/dcf` — the
+  response that carries a per-visitor `Set-Cookie: pt_csrf` — `Cache-Control:
+  public` (verified live), because the app set none. The app now states its own,
+  and the middleware **defaults to `private, no-store`** with public routes
+  opting in: an unclassified response is far more likely to be per-customer than
+  shareable, so the silent case must be the safe one.
+- **🟡 Six LOW fixes.** A malformed quota-RPC payload or a bad stored timestamp
+  raised `KeyError`/`ValueError` past the middleware's `except SupabaseError`,
+  turning a deliberate fail-closed 503 into an unhandled 500 (this is the call
+  that decides whether a request may be served). `fetch_fundamentals` never
+  type-checked the profile element, so a non-dict reached
+  `f.profile.get("sector")` → AttributeError → 500, a check its sibling
+  `fetch_profile` already had. The middleware wrote **unvalidated raw path text**
+  into `usage_events.ticker`, letting a caller pick a database row's contents.
+  Four ticker-keyed in-process caches and the `last_used_at` map had no bound.
+  API-key prefixes went into a PostgREST filter unvalidated, leaving the whole
+  defense on httpx's encoder. And the FMP client interpolated httpx error text
+  into an exception message while the Finnhub client deliberately chains — for
+  exactly the reason FMP needs it, since its key rides in the query string.
+- **Also added:** `SECURITY.md`, routed through GitHub private vulnerability
+  reporting so no personal email has to be published. Writing it surfaced that
+  the repo's blanket `*.md` ignore rule was **swallowing the file** — GitHub only
+  offers "Report a vulnerability" when it is committed. `.gitignore` now exempts
+  it; the owner still has to flip the Settings toggle (`TODO.md` §8.1).
+- **Left open deliberately:** `pt_csrf` is unsigned double-submit on a
+  non-`__Host-` cookie, so a hostile *sibling subdomain* could inject one. Both
+  fixes (a `__Host-` rename, or an HMAC binding to the session) invalidate every
+  live browser token and touch page + server together, so it is the owner's call
+  — `TODO.md` §8.3. Low urgency today; it becomes real the day a second
+  subdomain exists.
+- **Correction worth keeping:** the audit's first draft called out a missing
+  HSTS header. Checking the live site disproved it — Vercel injects
+  `max-age=63072000`. Recorded as informational, and the same check is what
+  found M4. *Reading production beat reading the code twice in one session.*
+- **Not yet deployed.** All of the above is in the working tree only. No
+  migration and no new configuration is required; the OpenAPI snapshot changed
+  by exactly one description field.
+- Next: unchanged — P3 + migration 005, then Phase 12. Owner-side, in order:
+  §7.3 (`FMP_API_KEY` rotation), §8.1 (one click), the SLO sign-off, §1.4c/§1.5,
+  §4b, and the two audit decisions in §8.2/§8.3.
+
 ## 2026-07-26 — Documentation audit; two live production defects found, both fixed and confirmed live 2026-07-27
 
 The task was to reconcile `issues.MD`, `PROGRESS.md`, and
@@ -1736,6 +1841,19 @@ specs live in CLAUDE.md; this file is only the running state.
 
 *(Verified against the working tree and the live deployment 2026-07-26.)*
 
+- **⚠️ Undeployed work in the tree: the 2026-07-26 safety & security audit.**
+  Two HIGH, four MEDIUM and six LOW findings fixed; suite **492 passing, 94.68%
+  coverage**, ruff/format/mypy clean. The two that matter most to a customer:
+  the **sensitivity grid was returning 422 for documented-valid inputs**
+  (`wacc=0.50`, `terminal_growth=±0.10`, `wacc<0.011` — and `sensitivity`
+  defaults to true, so it was the default path), and **any non-ASCII CSRF token
+  was an unauthenticated unhandled exception** on every CSRF-protected route.
+  Also: a CSP on `/docs`/`/redoc`, no more auth-call amplification from junk
+  session cookies, bounded dependencies + Dependabot, app-stated cache
+  directives, and a `SECURITY.md`. **No migration, no new configuration**; the
+  OpenAPI snapshot moved by exactly one description field. Full ranking and
+  verification in `issues.MD` → "Safety & security audit". Owner items in
+  `TODO.md` §8.
 - **Two production defects were found 2026-07-26 by reading real production
   logs; both are now fixed and confirmed live, and neither was catchable by a
   test.**

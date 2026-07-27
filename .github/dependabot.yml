@@ -1,0 +1,34 @@
+# Dependency updates arrive as reviewable pull requests instead of as
+# build-time drift. `pyproject.toml` bounds every dependency at the next major,
+# so a compromised or breaking release cannot reach a Vercel build on its own --
+# but that only helps if somebody is actually watching for the updates those
+# bounds hold back. This is that watch.
+#
+# The repo is public, so the dependency surface is public too: anyone can read
+# exactly what this service installs. Patch latency is part of the threat model.
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # One PR for the dev toolchain: linters and test tooling move often, and
+      # a failing CI run is the whole review. Runtime dependencies (httpx,
+      # fastapi) stay individual -- those reach production.
+      dev-tooling:
+        patterns:
+          - pytest*
+          - ruff
+          - mypy
+          - hypothesis
+          - build
+          - uvicorn
+
+  # The workflows themselves pin third-party actions; those need updating too.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

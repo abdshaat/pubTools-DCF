@@ -8,6 +8,7 @@ caller secret against every stored key.
 import hashlib
 import hmac
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -15,6 +16,12 @@ from enum import StrEnum
 VALUATION_SCOPE = "valuation:read"
 LEGACY_SHA256_PREFIX = "sha256"
 PEPPERED_SHA256_PREFIX = "hmac-sha256-v1"
+
+# `dcf_{8 lowercase alphanumerics}_{43 url-safe base64 chars}` is what this
+# service issues, so a generous ceiling still rejects a caller trying to make us
+# hash or transmit something enormous.
+MAX_PRESENTED_KEY_LENGTH = 256
+_PREFIX_PATTERN = re.compile(r"\A[a-z0-9]{1,32}\Z")
 
 
 class AuthFailureReason(StrEnum):
@@ -123,8 +130,18 @@ class APIKeyAuthenticator:
             raise AuthFailure(AuthFailureReason.MISSING)
 
         stripped = presented_key.strip()
+        if len(stripped) > MAX_PRESENTED_KEY_LENGTH:
+            raise AuthFailure(AuthFailureReason.MALFORMED)
         parts = stripped.split("_", 2)
         if len(parts) != 3 or parts[0] != "dcf" or not parts[1] or not parts[2]:
+            raise AuthFailure(AuthFailureReason.MALFORMED)
+        # The prefix is caller-controlled and is interpolated into a PostgREST
+        # filter (`prefix=eq.{prefix}`) to find the candidate row. httpx encodes
+        # the value, so an injected second filter does not survive the wire
+        # today -- but that leaves the whole defense resting on the encoder.
+        # Issued prefixes are 8 lowercase alphanumerics (`_generate_prefix`), so
+        # anything else is refused here and never reaches a query at all.
+        if not _PREFIX_PATTERN.match(parts[1]):
             raise AuthFailure(AuthFailureReason.MALFORMED)
         return parts[1], stripped
 

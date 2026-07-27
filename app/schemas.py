@@ -66,8 +66,9 @@ class YearProjectionOut(BaseModel):
 
 class SensitivityOut(BaseModel):
     """Intrinsic value per share across WACC (rows) x terminal growth
-    (columns). null cells mark combinations where the Gordon formula is
-    undefined (terminal growth >= WACC)."""
+    (columns). null cells mark combinations this model cannot value: the
+    Gordon formula is undefined (terminal growth >= WACC), or the shifted
+    corner falls outside the supported assumption range."""
 
     wacc_values: list[float]
     terminal_growth_values: list[float]

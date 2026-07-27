@@ -26,8 +26,10 @@ see project-docs/IMPLEMENTATION_PLAN.md Phase 6).
 
 import asyncio
 import base64
+import binascii
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -160,10 +162,31 @@ def clear_csrf_cookie(response: Response) -> None:
     response.delete_cookie(CSRF_COOKIE)
 
 
+# A token this module minted is `secrets.token_urlsafe(32)`: 43 URL-safe base64
+# characters. Anything that cannot be one is rejected before it is compared, so
+# the comparison only ever sees text of a shape we produce.
+CSRF_TOKEN_MAX_LENGTH = 256
+# `\Z`, not `$`: `$` also matches before a trailing newline, which would let a
+# token through the shape check carrying a character it is not allowed to have.
+_CSRF_TOKEN_PATTERN = re.compile(rf"\A[A-Za-z0-9._~+/=-]{{1,{CSRF_TOKEN_MAX_LENGTH}}}\Z")
+
+
 def csrf_tokens_match(*, cookie_token: str | None, header_token: str | None) -> bool:
+    """Constant-time double-submit check that cannot itself raise.
+
+    `hmac.compare_digest` accepts `str` only when both sides are ASCII, and
+    raises `TypeError` otherwise. Headers and cookies are decoded latin-1 by
+    Starlette, so a single byte >= 0x80 anywhere in `X-CSRF-Token` or the
+    `pt_csrf` cookie used to turn an unauthenticated request into an unhandled
+    exception that escaped the whole error contract. Comparing UTF-8 *bytes*
+    removes the ASCII precondition entirely; the shape check in front of it
+    means a malformed token is a plain `False` rather than work.
+    """
     if not cookie_token or not header_token:
         return False
-    return hmac.compare_digest(cookie_token, header_token)
+    if not _CSRF_TOKEN_PATTERN.match(cookie_token) or not _CSRF_TOKEN_PATTERN.match(header_token):
+        return False
+    return hmac.compare_digest(cookie_token.encode("utf-8"), header_token.encode("utf-8"))
 
 
 def build_github_login(auth_client: SupabaseAuthClient) -> tuple[str, str]:
@@ -291,14 +314,61 @@ async def _account_from_user(
     )
 
 
+# Supabase issues its own refresh tokens; the shape is opaque to us, so this is
+# only a "could this ever be one" filter, not validation.
+_REFRESH_TOKEN_PATTERN = re.compile(r"\A[A-Za-z0-9._~+/=-]{8,512}\Z")
+
+
+def is_plausible_access_token(token: str) -> bool:
+    """Could Supabase possibly accept this as an access token?
+
+    Supabase access tokens are JWTs, so anything that is not a decodable JWT
+    with an unexpired `exp` would be rejected upstream with certainty. Asking
+    anyway turns one unauthenticated request into an outbound auth call, which
+    makes this service an amplifier: a caller with no credential at all could
+    spend our Supabase budget at their chosen rate.
+
+    This is a "don't bother asking" filter and **never** an authorization
+    decision -- the claims here are unverified attacker-supplied JSON, and a
+    token that passes is still verified in full by Supabase. Rejecting can only
+    ever turn an upstream 401 into a local one, so it has no false positives.
+    """
+    segments = token.split(".")
+    if len(segments) != 3 or not all(segments):
+        return False
+    payload_segment = segments[1]
+    try:
+        decoded = base64.urlsafe_b64decode(payload_segment + "=" * (-len(payload_segment) % 4))
+        claims = json.loads(decoded)
+    except (ValueError, TypeError, binascii.Error):
+        return False
+    if not isinstance(claims, dict):
+        return False
+    expires_at = claims.get("exp")
+    if not isinstance(expires_at, (int, float)) or isinstance(expires_at, bool):
+        return False
+    # Already expired: Supabase would reject it, and the refresh path below is
+    # where this request is actually going to be answered.
+    return float(expires_at) > datetime.now(UTC).timestamp()
+
+
+def is_plausible_refresh_token(token: str) -> bool:
+    return bool(_REFRESH_TOKEN_PATTERN.match(token))
+
+
 async def get_current_customer(
     *, auth_client: SupabaseAuthClient, supabase_client: SupabaseClient, request: Request
 ) -> tuple[CustomerAccount, AuthSession | None]:
     """Returns (account, refreshed_session). `refreshed_session` is not None
     only when the access token was silently refreshed, in which case the
-    caller must set new session cookies on whatever response it returns."""
+    caller must set new session cookies on whatever response it returns.
+
+    Both cookies are screened locally first (see `is_plausible_access_token`),
+    so a request carrying credentials that could not possibly verify costs no
+    upstream round trip at all.
+    """
     access_token = request.cookies.get(SESSION_COOKIE)
-    if access_token:
+    if access_token and is_plausible_access_token(access_token):
         try:
             user = await auth_client.get_user(access_token=access_token)
             return await _account_from_user(supabase_client, user), None
@@ -306,7 +376,7 @@ async def get_current_customer(
             pass
 
     refresh_token = request.cookies.get(REFRESH_COOKIE)
-    if not refresh_token:
+    if not refresh_token or not is_plausible_refresh_token(refresh_token):
         raise AccountAuthError("not signed in")
 
     try:

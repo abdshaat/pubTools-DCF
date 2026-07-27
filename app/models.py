@@ -97,8 +97,11 @@ class YearProjection:
 @dataclass(frozen=True)
 class SensitivityGrid:
     """Intrinsic value per share across WACC (rows) x terminal growth
-    (columns) around the caller's assumptions. Cells where the combination
-    is invalid (terminal growth >= WACC, or WACC <= 0) are None.
+    (columns) around the caller's assumptions. A cell is None when the
+    shifted combination cannot be valued -- either the Gordon formula breaks
+    (terminal growth >= WACC, or WACC <= 0) or the shifted value falls
+    outside the public assumption bounds, which the offsets can do to an
+    input that was itself perfectly legal.
     """
 
     wacc_values: tuple[float, ...]

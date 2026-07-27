@@ -17,7 +17,14 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app import MODEL_VERSION
-from app.accounts import CSRF_COOKIE, CSRF_HEADER, LOGIN_ATTEMPTS_DAILY_LIMIT
+from app.accounts import (
+    CSRF_COOKIE,
+    CSRF_HEADER,
+    CSRF_TOKEN_MAX_LENGTH,
+    LOGIN_ATTEMPTS_DAILY_LIMIT,
+    csrf_tokens_match,
+    generate_csrf_token,
+)
 from app.api import _default_raw_sink, create_app
 from app.auth import APIKeyAuthenticator, APIKeyRecord
 from app.exceptions import ProviderError, TickerNotFoundError
@@ -30,7 +37,7 @@ from app.supabase import (
     SupabaseClient,
     SupabaseConfig,
 )
-from tests.fake_supabase import FakeSupabaseBackend
+from tests.fake_supabase import FakeSupabaseBackend, make_access_token
 from tests.test_data_layer import fixture_transport, load_fixture
 
 VALID_QUERY = (
@@ -1235,6 +1242,139 @@ def test_email_login_requires_csrf_token():
     assert missing.json()["error"]["code"] == "csrf_failed"
     assert mismatched.status_code == 403
     assert backend.otp_requests == []
+
+
+@pytest.mark.parametrize(
+    ("headers", "case"),
+    [
+        ({b"x-csrf-token": b"caf\xe9", b"cookie": b"pt_csrf=abc"}, "header"),
+        ({b"x-csrf-token": b"abc", b"cookie": b"pt_csrf=caf\xe9"}, "cookie"),
+        ({b"x-csrf-token": b"\xff\xfe", b"cookie": b"pt_csrf=\xff\xfe"}, "both"),
+    ],
+)
+def test_non_ascii_csrf_token_is_a_403_not_an_unhandled_exception(headers, case):
+    """A byte >= 0x80 in either half of the double-submit pair.
+
+    Starlette decodes headers and cookies latin-1, and `hmac.compare_digest`
+    raises TypeError on non-ASCII `str`. So this used to be an unauthenticated
+    unhandled exception on every CSRF-protected route: no error body, no request
+    id, no `no-store`, and an ERROR-level traceback per request. It must be an
+    ordinary rejection.
+    """
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.post("/v1/auth/logout", headers=headers)
+
+    assert response.status_code == 403, case
+    assert response.json()["error"]["code"] == "csrf_failed"
+    # The contract the escaping exception used to skip.
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["X-Request-ID"]
+    assert response.headers["X-Content-Type-Options"] == "nosniff"
+
+
+@pytest.mark.parametrize(
+    ("cookie", "case"),
+    [
+        ("pt_session=junk; pt_refresh=junk", "neither is a possible credential"),
+        ("pt_session=not.a.jwt", "three segments but not decodable"),
+        ("pt_session=" + make_access_token(expires_in=-60), "valid JWT, already expired"),
+        ("pt_refresh=short", "refresh token too short to be one"),
+        ("pt_session=" + "x" * 400, "one long opaque blob"),
+    ],
+)
+def test_impossible_session_cookies_cost_no_upstream_auth_call(cookie, case):
+    """The amplification fix (M2).
+
+    Verifying a session cookie used to mean calling Supabase Auth no matter
+    what the cookie contained, so one unauthenticated request bought two
+    outbound auth calls and this service became an amplifier for anyone.
+    Credentials that Supabase could not possibly accept are now rejected
+    locally, and the caller still gets the same 401.
+    """
+    backend = FakeSupabaseBackend()
+    with TestClient(_accounts_app(backend)) as test_client:
+        response = test_client.get("/v1/auth/me", headers={"cookie": cookie})
+
+    assert response.status_code == 401, case
+    assert response.json()["error"]["code"] == "not_signed_in"
+    assert backend.auth_calls == [], f"{case}: spent {backend.auth_calls}"
+
+
+def test_a_real_but_stale_session_still_refreshes_upstream():
+    """The screen must not break the silent-refresh path.
+
+    An access token that has genuinely expired is exactly the case the refresh
+    cookie exists for, so it has to reach Supabase — this is the test that
+    would fail if the local screen were too eager.
+    """
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-1", user_id="user-1", user_name="octocat", email="octocat@example.com"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="code-1")
+        # Expire the access token the way time would, leaving the refresh
+        # token untouched.
+        test_client.cookies.set("pt_session", make_access_token(expires_in=-60))
+        backend.auth_calls.clear()
+        me = test_client.get("/v1/auth/me")
+
+    assert me.status_code == 200
+    assert me.json()["email"] == "octocat@example.com"
+    # Straight to the refresh, then the user lookup it enables. The doomed
+    # get_user on the expired token is skipped.
+    assert backend.auth_calls == ["/auth/v1/token", "/auth/v1/user"]
+
+
+def test_a_valid_session_is_never_screened_out():
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "code-1", user_id="user-1", user_name="octocat", email="octocat@example.com"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="code-1")
+        backend.auth_calls.clear()
+        me = test_client.get("/v1/auth/me")
+
+    assert me.status_code == 200
+    assert me.json()["email"] == "octocat@example.com"
+    assert backend.auth_calls == ["/auth/v1/user"]
+
+
+def test_only_a_plausible_ticker_is_metered_from_the_raw_path():
+    """The middleware reads the ticker off the raw path, before FastAPI has
+    validated anything, and hands it to the usage meter -- so junk in the path
+    of a request that then 422s used to be written into `usage_events.ticker`,
+    letting a caller pick the contents of a database row.
+    """
+    from app.api import _valuation_ticker_from_path
+
+    assert _valuation_ticker_from_path("/v1/valuations/AAPL") == "AAPL"
+    assert _valuation_ticker_from_path("/v1/valuations/brk.b") == "BRK.B"
+    assert _valuation_ticker_from_path("/health") is None
+    for junk in (
+        "/v1/valuations/" + "A" * 500,
+        "/v1/valuations/1AAPL",
+        "/v1/valuations/A APL",
+        "/v1/valuations/",
+        "/v1/valuations/<script>",
+    ):
+        assert _valuation_ticker_from_path(junk) is None, junk
+
+
+def test_csrf_tokens_match_rejects_malformed_tokens_without_raising():
+    minted = generate_csrf_token()
+    assert csrf_tokens_match(cookie_token=minted, header_token=minted) is True
+    assert csrf_tokens_match(cookie_token=minted, header_token=minted + "x") is False
+    assert csrf_tokens_match(cookie_token=None, header_token=minted) is False
+    assert csrf_tokens_match(cookie_token="", header_token="") is False
+    # Non-ASCII, and shapes a minted token can never have.
+    assert csrf_tokens_match(cookie_token="café", header_token="café") is False
+    assert csrf_tokens_match(cookie_token="a b", header_token="a b") is False
+    assert csrf_tokens_match(cookie_token="tok\n", header_token="tok") is False
+    over_long = "a" * (CSRF_TOKEN_MAX_LENGTH + 1)
+    assert csrf_tokens_match(cookie_token=over_long, header_token=over_long) is False
 
 
 def test_email_and_github_login_share_the_same_rate_limit_bucket():

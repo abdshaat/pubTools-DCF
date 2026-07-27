@@ -7,8 +7,84 @@ yet.
 
 Last updated 2026-07-26.
 
-**Open right now:** §7.3 — rotate `FMP_API_KEY`. Everything else here is smaller
-or deferred. *(§6 closed 2026-07-27: the live price is working in production.)*
+**Open right now:** §7.3 — rotate `FMP_API_KEY`, and §8.1 — one click to turn on
+private vulnerability reporting. Everything else here is smaller or deferred.
+*(§6 closed 2026-07-27: the live price is working in production.)*
+
+---
+
+## 8. From the safety & security audit (2026-07-26)
+
+The audit is in `issues.MD` → "Safety & security audit". Two HIGH and four
+MEDIUM findings were **already fixed in code**; these four are the ones that
+need you. None is urgent — the urgent ones are already done.
+
+### 8.1 Turn on private vulnerability reporting (one click)
+
+GitHub → this repo → **Settings** → **Security** → **Private vulnerability
+reporting** → *Enable*.
+
+`.github/SECURITY.md` now ships in the repo and tells finders to use that flow, which
+is deliberately the one channel that needs no personal email address published
+on a public repository. **Until the toggle is on, the button it points at does
+not exist**, and someone with a real finding is left with a public issue as
+their only option — which discloses the bug to everyone at the moment it is
+reported.
+
+### 8.2 Decide: keep `/docs` and `/redoc` on the CDN, or cut the dependency
+
+Those two pages run Swagger UI / ReDoc from `cdn.jsdelivr.net`. They now carry
+a strict Content-Security-Policy (they previously had **none**), and the
+important line is `connect-src 'self'`: a hostile script could no longer send
+anything it stole to an outside host. What a CSP cannot fix is that the script
+is still *third-party code executing on the origin that holds customer
+sessions* — it could still act as a signed-in user within that origin.
+
+Your options, in increasing order of effort:
+
+1. **Leave it.** Reasonable — the CSP does most of the work, and jsdelivr is
+   widely trusted. This is the current state; no action needed.
+2. **Vendor the assets.** Download the Swagger UI JS/CSS into `docs/` and serve
+   them from `/`, then tighten `script-src` to `'self'`. Removes the third
+   party entirely. Costs a few hundred KB in the bundle and a manual bump
+   whenever you want a newer Swagger UI.
+3. **Turn the pages off in production.** `/openapi.json` and the hand-written
+   reference at `/dcf` already cover what customers need.
+
+Tell me which and I'll implement it.
+
+### 8.3 Decide: harden the CSRF cookie (needs a coordinated change)
+
+`pt_csrf` is an unsigned double-submit token on a cookie with no `__Host-`
+prefix. Anything able to set a cookie for `ashaat.dev` — a hostile or
+compromised **sibling subdomain**, now or in future — could inject a value and
+then send the matching header, satisfying the check. `SameSite=Lax` is what
+actually stops cross-site POSTs today, which means the CSRF token is currently
+the weaker of your two defenses rather than an independent second one.
+
+Not fixed mid-audit because either fix **invalidates the token in every browser
+currently holding one**, and it touches `docs/index.html` and the server
+together:
+
+- **`__Host-pt_csrf`** — browsers refuse to accept a `__Host-` cookie from a
+  subdomain. Smallest change; a rename plus the JS that reads it.
+- **Bind the token to the session** with an HMAC. Strictly stronger, slightly
+  more code.
+
+Low urgency: it needs an attacker who already controls a subdomain of
+`ashaat.dev`. Worth doing before you add any subdomain (a staging host, a docs
+host, a marketing page) — that is the day the assumption changes.
+
+### 8.4 Nothing to do — recorded so it isn't re-litigated
+
+- **HSTS**: Vercel injects `Strict-Transport-Security: max-age=63072000` on
+  production responses, so you are covered. The application itself does not emit
+  it, which only matters if this ever runs somewhere other than Vercel. Vercel's
+  header includes neither `includeSubDomains` nor `preload`.
+- **`connect-src` allows `http://localhost:*`** on the production page. That is
+  deliberate — it lets the `/dcf` endpoint builder call a developer's local
+  server — and it is also what stops that page from being able to send a pasted
+  API key to any third-party host.
 
 ---
 

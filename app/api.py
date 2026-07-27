@@ -18,6 +18,7 @@ callers handle one shape.
 
 import asyncio
 import hmac
+import re
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
@@ -29,7 +30,8 @@ from uuid import uuid4
 from fastapi import FastAPI, Path, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.routing import Match
 
 from . import MODEL_VERSION
@@ -59,7 +61,7 @@ from .accounts import (
     set_session_cookies,
 )
 from .auth import VALUATION_SCOPE, APIKeyAuthenticator, AuthFailure, AuthFailureReason
-from .client_ip import FORWARDED_FOR_HEADER, resolve_client_identity
+from .client_ip import FORWARDED_FOR_HEADER, ClientIdentity, resolve_client_identity
 from .dcf_engine import DCFValidationError, compute_dcf, compute_sensitivity_grid
 from .exceptions import (
     NormalizationError,
@@ -214,6 +216,67 @@ _LANDING_PAGE_CSP = "; ".join(
     ]
 )
 
+# FastAPI's generated docs load Swagger UI / ReDoc from a public CDN, which puts
+# third-party JavaScript on the same origin as the signed-in account UI — the
+# origin that holds the `pt_session` cookie and the deliberately JS-readable
+# `pt_csrf` cookie. Left bare (FastAPI ships them with no CSP at all) a
+# compromised CDN asset could read the CSRF token, call `/v1/account/keys` with
+# the browser's session cookie, and post the new key anywhere.
+#
+# `default-src 'none'` + an explicit allowlist is what closes most of that, and
+# `connect-src 'self'` is the load-bearing line: even a hostile script that does
+# run cannot ship what it stole off this origin. `script-src` stays pinned to the
+# one CDN; the font/style hosts ReDoc needs cannot execute anything.
+#
+# Residual risk, stated rather than hidden: a hostile script inside the origin
+# can still act as the user. Removing the CDN entirely (vendored assets, or
+# turning these pages off) is an owner decision — see `TODO.md` §8.
+_DOCS_CDN = "https://cdn.jsdelivr.net"
+_FASTAPI_ASSETS = "https://fastapi.tiangolo.com"
+
+_SWAGGER_PAGE_CSP = "; ".join(
+    [
+        "default-src 'none'",
+        "base-uri 'none'",
+        "connect-src 'self'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        f"img-src 'self' data: {_DOCS_CDN} {_FASTAPI_ASSETS}",
+        "object-src 'none'",
+        f"script-src {_DOCS_CDN} 'unsafe-inline'",
+        f"style-src {_DOCS_CDN} 'unsafe-inline'",
+    ]
+)
+
+# ReDoc additionally pulls Google Fonts and builds its search index in a
+# blob: worker. Stylesheets and font files cannot execute script, so allowing
+# those two hosts does not widen the script surface.
+_REDOC_PAGE_CSP = "; ".join(
+    [
+        "default-src 'none'",
+        "base-uri 'none'",
+        "child-src blob:",
+        "connect-src 'self'",
+        "font-src https://fonts.gstatic.com data:",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+        f"img-src 'self' data: {_DOCS_CDN} {_FASTAPI_ASSETS}",
+        "object-src 'none'",
+        f"script-src {_DOCS_CDN} 'unsafe-inline'",
+        f"style-src {_DOCS_CDN} https://fonts.googleapis.com 'unsafe-inline'",
+        "worker-src blob:",
+    ]
+)
+
+# Every HTML/schema route states its own cacheability. Left unset, Vercel
+# supplies `public, max-age=0, must-revalidate` — and it was applying `public`
+# to `/dcf`, the response that carries a per-visitor `Set-Cookie: pt_csrf=…`.
+# `must-revalidate` kept that from being exploitable in practice, but which
+# responses are shareable is the application's decision to make, not a
+# platform default's.
+REVALIDATE = "public, max-age=0, must-revalidate"
+PRIVATE_NO_STORE = "private, no-store"
+
 
 def _rate_limit_headers(result: RateLimitResult) -> dict[str, str]:
     headers = {
@@ -310,12 +373,22 @@ async def _resolve(value: Any) -> Any:
     return value
 
 
+# The same shape the route's path parameter enforces. The middleware reads the
+# ticker off the *raw* path, before FastAPI has validated anything, and hands it
+# to the usage meter -- so without this a request to `/v1/valuations/<junk>`
+# that then 422s still wrote that junk into `usage_events.ticker`, letting a
+# caller choose the contents of a row in our database (bounded only by the
+# platform's URL limit). Anything that could not be a real ticker is metered as
+# "no ticker" rather than stored verbatim.
+_TICKER_PATTERN = re.compile(r"\A[A-Z][A-Z.\-]{0,9}\Z")
+
+
 def _valuation_ticker_from_path(path: str) -> str | None:
     prefix = "/v1/valuations/"
     if not path.startswith(prefix):
         return None
-    ticker = path[len(prefix) :].split("/", 1)[0]
-    return ticker.upper() or None
+    ticker = path[len(prefix) :].split("/", 1)[0].upper()
+    return ticker if _TICKER_PATTERN.match(ticker) else None
 
 
 def create_app(
@@ -442,6 +515,12 @@ def create_app(
             "Outputs are model estimates, not investment recommendations."
         ),
         lifespan=lifespan,
+        # The built-in docs routes are replaced below by equivalents that carry
+        # a Content-Security-Policy. FastAPI's own emit no headers, and these
+        # pages run CDN-hosted JavaScript on the origin that holds the customer
+        # session — see _SWAGGER_PAGE_CSP.
+        docs_url=None,
+        redoc_url=None,
     )
     if authenticator is None and configured_supabase_client is not None:
         authenticator = SupabaseAPIKeyAuthenticator(configured_supabase_client, required=True)
@@ -550,6 +629,12 @@ def create_app(
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
         response.headers.update(_SECURITY_HEADERS)
+        # Default to not-shareable and let the routes that are safe to share say
+        # so (the public pages, the images). A response nobody classified is far
+        # more likely to be per-customer — an account's key list, an error naming
+        # a request id — than a public asset, so the silent case must be the safe
+        # one. Without this the platform picked, and it picked `public`.
+        response.headers.setdefault("Cache-Control", PRIVATE_NO_STORE)
 
         if is_valuation and consumed is not None:
             # Quota headers are safe again now that valuation responses are
@@ -769,16 +854,19 @@ def create_app(
             message="Sign-in is not configured.",
         )
 
-    async def _login_limit_response(request: Request) -> JSONResponse | None:
+    def _client_identity(request: Request) -> ClientIdentity:
         # Behind a proxy the socket peer is the platform, not the caller, so the
         # per-IP cap would be one shared bucket; trusting the header blindly
         # would let anyone mint a fresh bucket per request. app/client_ip.py
         # resolves it under an explicit hop count (Phase 11 Slice 4).
-        identity = resolve_client_identity(
+        return resolve_client_identity(
             peer=request.client.host if request.client else None,
             forwarded_for=request.headers.get(FORWARDED_FOR_HEADER),
             trusted_proxy_hops=resolved.trusted_proxy_hops,
         )
+
+    async def _login_limit_response(request: Request) -> JSONResponse | None:
+        identity = _client_identity(request)
         # The source, never the address: the source proves the configuration is
         # right, while the address is personal data that logs should not keep.
         record(client_ip_source=identity.source)
@@ -804,27 +892,56 @@ def create_app(
     async def portfolio_page() -> FileResponse:
         return FileResponse(
             _DOCS_DIR / "portfolio.html",
-            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+            headers={"Content-Security-Policy": _LANDING_PAGE_CSP, "Cache-Control": REVALIDATE},
         )
 
     @app.get("/apis", include_in_schema=False)
     async def api_directory_page() -> FileResponse:
         return FileResponse(
             _DOCS_DIR / "apis.html",
-            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+            headers={"Content-Security-Policy": _LANDING_PAGE_CSP, "Cache-Control": REVALIDATE},
         )
 
     @app.get("/dcf", include_in_schema=False)
     async def dcf_page(request: Request) -> FileResponse:
         # The account UI lives on this page, so this is where the CSRF token is
         # minted (it moved from `/` when the portfolio took that route over).
+        # It mints a per-visitor token, so the response is never shareable —
+        # stated here rather than inherited from the platform's `public` default.
         response = FileResponse(
             _DOCS_DIR / "index.html",
-            headers={"Content-Security-Policy": _LANDING_PAGE_CSP},
+            headers={
+                "Content-Security-Policy": _LANDING_PAGE_CSP,
+                "Cache-Control": PRIVATE_NO_STORE,
+            },
         )
         if not request.cookies.get(CSRF_COOKIE):
             set_csrf_cookie(response)
         return response
+
+    # --- API reference (Swagger UI / ReDoc) ---
+    # Hand-rolled rather than FastAPI's built-ins purely so the pages can carry
+    # a CSP and a cache directive; the rendered HTML is FastAPI's own.
+
+    @app.get("/docs", include_in_schema=False)
+    async def swagger_ui() -> HTMLResponse:
+        page = get_swagger_ui_html(
+            openapi_url=str(app.openapi_url),
+            title=f"{app.title} — API reference",
+        )
+        page.headers["Content-Security-Policy"] = _SWAGGER_PAGE_CSP
+        page.headers["Cache-Control"] = REVALIDATE
+        return page
+
+    @app.get("/redoc", include_in_schema=False)
+    async def redoc_ui() -> HTMLResponse:
+        page = get_redoc_html(
+            openapi_url=str(app.openapi_url),
+            title=f"{app.title} — API reference",
+        )
+        page.headers["Content-Security-Policy"] = _REDOC_PAGE_CSP
+        page.headers["Cache-Control"] = REVALIDATE
+        return page
 
     @app.get("/Pics/{filename}", include_in_schema=False)
     async def portfolio_image(filename: str) -> Response:

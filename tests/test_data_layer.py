@@ -1198,3 +1198,91 @@ def test_shutdown_with_nothing_in_flight_is_a_no_op():
             await FundamentalsService(client).aclose()
 
     asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# Safety/security audit regressions (2026-07-26)
+# ---------------------------------------------------------------------------
+
+
+def test_non_dict_profile_element_is_a_provider_error_not_an_attribute_error():
+    """A list-wrapped profile whose element is not an object.
+
+    `fetch_profile` had this check and `fetch_fundamentals` did not, so the
+    value reached normalization as `f.profile` and `.get("sector")` raised
+    AttributeError -- an unhandled 500 instead of the 502 the taxonomy defines
+    for unusable provider data.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        endpoint = request.url.path.rsplit("/", 1)[-1]
+        if endpoint == "profile":
+            return httpx.Response(200, json=["not-an-object"])
+        payload = load_fixture("AAPL")
+        return httpx.Response(200, json=payload[endpoint])
+
+    async def scenario():
+        async with make_client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(ProviderError) as exc:
+                await client.fetch_fundamentals("AAPL")
+            return exc.value
+
+    error = asyncio.run(scenario())
+    assert "profile" in str(error)
+    assert not isinstance(error, TickerNotFoundError)
+
+
+def test_transport_error_text_never_reaches_the_provider_error_message():
+    """The FMP key rides in the query string, so httpx error text -- which can
+    carry the request URL -- must not be interpolated into an error message
+    that may be logged. The cause is chained instead."""
+    secret = "super-secret-key-value"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"failed connecting to {request.url}", request=request)
+
+    async def scenario():
+        async with make_client(
+            api_key=secret,
+            transport=httpx.MockTransport(handler),
+            max_retries=0,
+            sleep=_no_sleep,
+        ) as client:
+            with pytest.raises(ProviderError) as exc:
+                await client.fetch_fundamentals("AAPL")
+            return exc.value
+
+    error = asyncio.run(scenario())
+    assert secret not in str(error)
+    assert "apikey" not in str(error)
+    # Classified, and the original still reachable for a traceback.
+    assert "ConnectError" in str(error)
+    assert isinstance(error.__cause__, httpx.ConnectError)
+
+
+async def _no_sleep(_seconds: float) -> None:
+    return None
+
+
+def test_in_process_caches_are_bounded():
+    """Every one of these is keyed by a caller-supplied ticker and was only
+    ever evicted by a repeat request for the same ticker."""
+    from app.fundamentals import _MAX_CACHE_ENTRIES, _MAX_RAW_CACHE_ENTRIES, _bounded_set
+
+    cache: dict[str, int] = {}
+    for i in range(_MAX_CACHE_ENTRIES + 500):
+        _bounded_set(cache, f"T{i}", i, _MAX_CACHE_ENTRIES)
+    assert len(cache) == _MAX_CACHE_ENTRIES
+    # Oldest evicted, newest kept.
+    assert "T0" not in cache
+    assert f"T{_MAX_CACHE_ENTRIES + 499}" in cache
+
+    # Re-writing a key keeps it recent rather than aging it out.
+    hot: dict[str, int] = {}
+    _bounded_set(hot, "AAPL", 0, 3)
+    for i in range(10):
+        _bounded_set(hot, f"X{i}", i, 3)
+        _bounded_set(hot, "AAPL", i, 3)
+    assert "AAPL" in hot
+    assert len(hot) == 3
+    assert _MAX_RAW_CACHE_ENTRIES < _MAX_CACHE_ENTRIES  # raw payloads are heavier

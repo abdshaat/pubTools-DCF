@@ -6,11 +6,33 @@ call. One instance's `transport()` can back both a SupabaseAuthClient and a
 SupabaseClient in the same test, since it's the same fake project.
 """
 
+import base64
 import json
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
+
+
+def make_access_token(*, subject: str = "user-1", expires_in: int = 3600, jti: str = "1") -> str:
+    """A structurally real (unsigned) Supabase-shaped access token.
+
+    Signature verification happens at Supabase, never here, so an unsigned
+    token is enough for a double -- what matters is that it is a decodable JWT
+    carrying an `exp`, because that is what the app screens on before deciding
+    a token is worth an upstream call. `expires_in` may be negative to mint an
+    already-expired token; `jti` keeps two tokens minted within the same second
+    distinguishable, the way re-issued tokens really are.
+    """
+
+    def segment(payload: dict[str, Any]) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    issued_at = int(datetime.now(UTC).timestamp())
+    header = segment({"alg": "HS256", "typ": "JWT"})
+    claims = segment({"sub": subject, "jti": jti, "iat": issued_at, "exp": issued_at + expires_in})
+    return f"{header}.{claims}.{'s' * 32}"
 
 
 class FakeSupabaseBackend:
@@ -26,6 +48,9 @@ class FakeSupabaseBackend:
         self.audit_events: list[dict[str, Any]] = []
         self.usage_events: list[dict[str, Any]] = []
         self.otp_requests: list[dict[str, Any]] = []
+        # Every GoTrue call this backend served, in order. Lets a test assert
+        # how many upstream auth round trips a request pattern actually costs.
+        self.auth_calls: list[str] = []
         # (subject_id, quota_window) -> request_count
         self.quota_counters: dict[tuple[str, str], int] = {}
         # Phase 8 Slice C durable statement store: ticker -> head row,
@@ -91,7 +116,12 @@ class FakeSupabaseBackend:
         return f"{prefix}-{self._counter}"
 
     def _mint_session(self, user: dict[str, Any]) -> dict[str, Any]:
-        access_token = self._next_id("access")
+        # A JWT, like the real thing. The app screens obviously-impossible
+        # access tokens locally before spending an upstream auth call, so a
+        # double that handed out opaque ids would not exercise the real path.
+        access_token = make_access_token(
+            subject=str(user["id"]), expires_in=3600, jti=self._next_id("access")
+        )
         refresh_token = self._next_id("refresh")
         self.sessions[access_token] = user
         self.refreshable[refresh_token] = user
@@ -105,6 +135,9 @@ class FakeSupabaseBackend:
     async def handler(self, request: httpx.Request) -> httpx.Response:
         path = request.url.path
         method = request.method
+
+        if path.startswith("/auth/v1/"):
+            self.auth_calls.append(path)
 
         if path == "/auth/v1/token" and request.url.params.get("grant_type") == "pkce":
             body = json.loads(request.content)

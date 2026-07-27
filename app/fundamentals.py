@@ -25,7 +25,7 @@ from contextlib import suppress
 from dataclasses import asdict, dataclass, replace
 from datetime import UTC, date, datetime
 from math import isfinite
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 from uuid import uuid4
 
 from .exceptions import (
@@ -62,6 +62,18 @@ _SNAPSHOT_DOCUMENT_VERSION = 1
 
 # A head verified this far in the future is corrupt, not merely clock-skewed.
 _FUTURE_VERIFIED_TOLERANCE_SECONDS = 300.0
+
+# Ceilings on the in-process caches. Every one of these is keyed by ticker, and
+# a ticker is caller-supplied: an entry is otherwise only ever evicted when the
+# *same* ticker is asked for again, so a caller spending quota on distinct
+# nonexistent symbols grew the negative cache for the life of the process. The
+# real universe this service covers is a few thousand symbols, so these bounds
+# are far above any legitimate working set and only ever bite on abuse or on a
+# process that lives much longer than a serverless instance does.
+_MAX_CACHE_ENTRIES = 2048
+# Raw provider payloads are the heavy ones (four full statement responses per
+# ticker), so they get a tighter ceiling than the normalized snapshots.
+_MAX_RAW_CACHE_ENTRIES = 256
 
 
 @dataclass(frozen=True)
@@ -223,6 +235,22 @@ def _base_from_payload(payload: Any) -> BaseFinancials | None:
         return base
     except (TypeError, ValueError):
         return None
+
+
+_CacheValue = TypeVar("_CacheValue")
+
+
+def _bounded_set(cache: dict[str, _CacheValue], key: str, value: _CacheValue, limit: int) -> None:
+    """Store `value`, evicting the least recently written entry past `limit`.
+
+    Dicts keep insertion order, so popping the first key evicts the oldest
+    write; deleting before re-inserting makes a refreshed ticker count as
+    recent rather than aging out while it is actively in use.
+    """
+    cache.pop(key, None)
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
 
 
 def _error_to_payload(error: Exception) -> dict[str, str]:
@@ -397,7 +425,7 @@ class FundamentalsService:
             cached = await self._remote_base(ticker)
             if cached is not None and self._is_current(cached[0]):
                 age, base = cached
-                self._cache[ticker] = (self._now() - age, base)
+                _bounded_set(self._cache, ticker, (self._now() - age, base), _MAX_CACHE_ENTRIES)
                 return base
         return None
 
@@ -475,12 +503,12 @@ class FundamentalsService:
                     "refresh (scheduled refresh pending).",
                 ),
             )
-        self._cache[ticker] = (self._now() - age, base)
+        _bounded_set(self._cache, ticker, (self._now() - age, base), _MAX_CACHE_ENTRIES)
         # Hydrate Redis with the head's true verified time (not "now"), so a
         # pre-boundary snapshot re-cached here still reads as pre-boundary on
         # every instance and cannot masquerade as current (ADR-007).
         if profile is not None:
-            self._profile_cache[ticker] = (self._now(), profile)
+            _bounded_set(self._profile_cache, ticker, (self._now(), profile), _MAX_CACHE_ENTRIES)
             await self._remote_set(
                 "profile", ticker, profile, self._profile_ttl, stored_at=verified_wall
             )
@@ -519,9 +547,16 @@ class FundamentalsService:
                     refreshed_profile = await self._client.fetch_profile(ticker)
                     raw = replace(raw_cached[1], profile=refreshed_profile)
                     value = normalize_fmp_fundamentals(raw)
-                    self._cache[ticker] = (fetched_at, value)
-                    self._raw_cache[ticker] = (raw_cached[0], raw)
-                    self._profile_cache[ticker] = (self._now(), refreshed_profile)
+                    _bounded_set(self._cache, ticker, (fetched_at, value), _MAX_CACHE_ENTRIES)
+                    _bounded_set(
+                        self._raw_cache, ticker, (raw_cached[0], raw), _MAX_RAW_CACHE_ENTRIES
+                    )
+                    _bounded_set(
+                        self._profile_cache,
+                        ticker,
+                        (self._now(), refreshed_profile),
+                        _MAX_CACHE_ENTRIES,
+                    )
                     await self._remote_set("profile", ticker, refreshed_profile, self._profile_ttl)
                     await self._remote_set(
                         "fund", ticker, _base_to_payload(value), self._max_statement_staleness
@@ -532,7 +567,9 @@ class FundamentalsService:
         remote_base = await self._remote_base(ticker)
         if remote_base is not None and (stale_age is None or remote_base[0] < stale_age):
             stale_age, stale_base = remote_base
-            self._cache[ticker] = (self._now() - stale_age, stale_base)
+            _bounded_set(
+                self._cache, ticker, (self._now() - stale_age, stale_base), _MAX_CACHE_ENTRIES
+            )
         if stale_base is not None and stale_age is not None and self._is_current(stale_age):
             record(cache="l2")
             return stale_base
@@ -546,7 +583,7 @@ class FundamentalsService:
         remote_negative = await self._remote_error(ticker)
         if remote_negative is not None and remote_negative[0] < self._negative_ttl:
             age, error = remote_negative
-            self._negative[ticker] = (self._now() - age, error)
+            _bounded_set(self._negative, ticker, (self._now() - age, error), _MAX_CACHE_ENTRIES)
             raise error
 
         redis_reachable, lock_token = await self._try_distributed_lock(ticker)
@@ -573,7 +610,7 @@ class FundamentalsService:
                 if remote_profile is not None and isinstance(remote_profile[1], dict):
                     age, profile_value = remote_profile
                     profile = (self._now() - age, profile_value)
-                    self._profile_cache[ticker] = profile
+                    _bounded_set(self._profile_cache, ticker, profile, _MAX_CACHE_ENTRIES)
                 elif remote_profile is not None:
                     await self._remote_delete("profile", ticker)
             if profile is not None and self._now() - profile[0] < self._profile_ttl:
@@ -582,7 +619,7 @@ class FundamentalsService:
             raw = await self._client.fetch_fundamentals(ticker, profile_override=profile_override)
             normalized = normalize_fmp_fundamentals(raw)
         except _CACHEABLE_REJECTIONS as exc:
-            self._negative[ticker] = (self._now(), exc)
+            _bounded_set(self._negative, ticker, (self._now(), exc), _MAX_CACHE_ENTRIES)
             await self._remote_set("neg", ticker, _error_to_payload(exc), self._negative_ttl)
             if lock_token is not None:
                 await self._release_distributed_lock(ticker, lock_token)
@@ -622,9 +659,9 @@ class FundamentalsService:
                     await self._release_distributed_lock(ticker, lock_token)
                 raise SnapshotStoreError(ticker) from exc
 
-        self._cache[ticker] = (self._now(), normalized)
-        self._raw_cache[ticker] = (self._now(), raw)
-        self._profile_cache[ticker] = (self._now(), raw.profile)
+        _bounded_set(self._cache, ticker, (self._now(), normalized), _MAX_CACHE_ENTRIES)
+        _bounded_set(self._raw_cache, ticker, (self._now(), raw), _MAX_RAW_CACHE_ENTRIES)
+        _bounded_set(self._profile_cache, ticker, (self._now(), raw.profile), _MAX_CACHE_ENTRIES)
         await self._remote_set("profile", ticker, raw.profile, self._profile_ttl)
         # Publish `fund:` last: lock losers poll it as the commit marker and
         # must not observe the snapshot before its companion caches exist.
@@ -680,9 +717,9 @@ class FundamentalsService:
         raw = await self._client.fetch_fundamentals(ticker)
         normalized = normalize_fmp_fundamentals(raw)
         normalized = await self._persist_snapshot(ticker, raw, normalized, refresh_status)
-        self._cache[ticker] = (self._now(), normalized)
-        self._raw_cache[ticker] = (self._now(), raw)
-        self._profile_cache[ticker] = (self._now(), raw.profile)
+        _bounded_set(self._cache, ticker, (self._now(), normalized), _MAX_CACHE_ENTRIES)
+        _bounded_set(self._raw_cache, ticker, (self._now(), raw), _MAX_RAW_CACHE_ENTRIES)
+        _bounded_set(self._profile_cache, ticker, (self._now(), raw.profile), _MAX_CACHE_ENTRIES)
         await self._remote_set("profile", ticker, raw.profile, self._profile_ttl)
         await self._remote_set(
             "fund", ticker, _base_to_payload(normalized), self._max_statement_staleness

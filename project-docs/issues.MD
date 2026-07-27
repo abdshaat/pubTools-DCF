@@ -119,18 +119,37 @@ Recording this so the next audit does not redo it:
   *within* the origin) is stated below; turning the docs off entirely is an
   owner decision, recorded in `TODO.md`.
 
-- [x] **M2 — An unauthenticated caller can drive unbounded Supabase Auth round
-  trips.** `app/api.py:718` (`_account_context`) → `app/accounts.py:294`
-  (`get_current_customer`). Send any junk `pt_session` cookie to `/v1/auth/me`
-  (or any account route) and the app calls Supabase `/auth/v1/user`; add a junk
-  `pt_refresh` and it also calls `/auth/v1/token` and then `/auth/v1/user`
-  again — **three upstream calls per unauthenticated request**. The per-IP daily
-  login limiter guards only `/v1/auth/github/login` and `/v1/auth/email/login`;
-  nothing guards this path. That is a 3× amplifier against the auth provider's
-  own rate limits and against Vercel function billing, available to anyone.
-  **Fix:** count *failed* session verifications against the same per-IP daily
-  budget, and refuse the upstream call once that budget is spent. Successful
-  sessions are never counted, so real users are unaffected.
+- [x] **M2 — An unauthenticated caller could make this service an amplifier
+  against Supabase Auth.** `_account_context` → `get_current_customer`. Send any
+  junk `pt_session` + `pt_refresh` to `/v1/auth/me` (or any account route) and
+  the app dutifully asked Supabase about them: `/auth/v1/user`, then
+  `/auth/v1/token`. *(Measured, not estimated: exactly `["/auth/v1/user",
+  "/auth/v1/token"]` per request — 2 outbound auth calls bought with 1 inbound
+  request and no credential. A valid refresh token makes it 3.)* The per-IP
+  login limiter covers only `/v1/auth/github/login` and `/v1/auth/email/login`;
+  nothing covered this path.
+
+  **Fix shipped — local screening, not a rate limit.** A per-address budget was
+  written first and **rejected after a test caught it signing out a real user**:
+  the budget has to be checked *before* the session is verified, so a prober
+  sharing an address (a NAT, an office, a mobile carrier) could log out
+  everyone behind it — a worse defect than the one being fixed. What shipped
+  instead has no false-positive mode at all: Supabase access tokens are JWTs, so
+  a `pt_session` that is not a decodable JWT with an unexpired `exp` **cannot**
+  be accepted upstream, and asking is pure waste. `is_plausible_access_token`
+  (`app/accounts.py`) rejects those locally; the `pt_refresh` cookie gets the
+  same cheap shape check. Rejecting can only ever convert an upstream 401 into a
+  local one, so no reachable session is affected. The claims are read as
+  untrusted attacker-supplied JSON and used **only** to decide whether the call
+  is worth making — every token that passes is still verified in full by
+  Supabase.
+  **Effect:** junk credentials now cost **zero** upstream calls; the worst case
+  for a well-formed forgery is one outbound call per inbound request, so the
+  amplification is gone. Capping absolute volume is a platform/WAF concern, not
+  the application's, and is not claimed here.
+  *(This also fixed the test double: `FakeSupabaseBackend` was handing out
+  opaque ids like `access-1` where real Supabase issues JWTs, so no test had
+  ever exercised the real cookie shape.)*
 
 - [x] **M3 — Dependencies have no upper bound, no lockfile, and no scanning.**
   `pyproject.toml`: `httpx>=0.27`, `fastapi>=0.115`, and eight `dev` deps with
@@ -229,10 +248,16 @@ Recording this so the next audit does not redo it:
   is defense in depth, but the two clients should not disagree about a rule one
   of them wrote down.
 
-- [ ] **L7 — No `SECURITY.md`.** A public repository with a live production
-  service and no stated vulnerability-reporting channel leaves a finder with
-  nowhere to send a report. *(Owner decision — needs a contact address;
-  `TODO.md` §8.)*
+- [x] **L7 — No `SECURITY.md`.** A public repository with a live production
+  service and no stated reporting channel leaves a finder with nowhere to send
+  a report except a public issue — which discloses the bug to everyone the
+  moment it is filed. Added at `.github/SECURITY.md` (GitHub only detects a policy at the repo root, `.github/`, or `docs/` — `project-docs/` would be invisible), routed through **private vulnerability
+  reporting** so no personal contact address has to be published; scope,
+  out-of-scope, and testing guidance are stated so a researcher does not have to
+  guess. *(Found while writing it: the repo's blanket `*.md` ignore rule was
+  swallowing the file — GitHub only offers "Report a vulnerability" when it is
+  actually committed. `.gitignore` now exempts it. One owner step remains: the
+  feature must be switched on in **Settings → Security**, `TODO.md` §8.)*
 
 - [ ] **L8 — The app emits no HSTS of its own.** *(Verified live: Vercel injects
   `Strict-Transport-Security: max-age=63072000`, so **production is covered** —
@@ -245,6 +270,34 @@ Recording this so the next audit does not redo it:
   builder call a developer's local server — and it is also the reason a pasted
   API key cannot be exfiltrated to a third-party host by that page. Recorded as
   an accepted trade-off, not a defect.
+
+---
+
+### Verification of the fixes
+
+Everything above marked `[x]` was implemented in this session and is covered by
+a regression test that fails against the old code.
+
+- **Suite 461 → 492 passing, 94.68% coverage**; ruff lint + format and mypy
+  clean; the OpenAPI contract snapshot was regenerated deliberately after
+  confirming the diff was **exactly one field** (`SensitivityOut.description`,
+  which now documents the wider set of null cells).
+- **H1 re-checked through the real HTTP route**, not just the engine: every
+  boundary case that used to 422 now returns **200** with a partially-filled
+  grid (3 of 9 corners null), the ordinary case returns a full 9/9 grid, and
+  `wacc=0.6` — genuinely outside the bounds — still returns 422
+  `invalid_assumptions`. Swallowing per-cell errors did not swallow real ones.
+- **H2 re-checked end to end**: a non-ASCII token in the header, in the cookie,
+  or in both now returns **403 `csrf_failed`** carrying `Cache-Control:
+  no-store`, `X-Request-ID`, and the security headers — the contract the
+  escaping `TypeError` used to skip.
+- **M2 is asserted as a measurement**, not a description: the test pins the
+  exact upstream call list per request, so a future change that reintroduces a
+  wasted auth round trip fails a test rather than quietly costing money.
+
+Two findings were left open on purpose (**M5**, **L8/L9** are informational);
+both are in `TODO.md` §8 with the reason. One proposed fix was **written and
+then rejected** — see M2 — because a test showed it would sign real users out.
 
 ---
 

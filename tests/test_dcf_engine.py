@@ -5,6 +5,9 @@ from hypothesis import assume, given, settings
 from hypothesis import strategies as st
 
 from app.dcf_engine import (
+    MAX_TERMINAL_GROWTH,
+    MAX_WACC,
+    MIN_TERMINAL_GROWTH,
     DCFValidationError,
     compute_dcf,
     compute_sensitivity_grid,
@@ -392,6 +395,42 @@ def test_grid_marks_gordon_breaking_cells_none_instead_of_erroring(
     assert low_wacc_row[1] is None and low_wacc_row[2] is None
     assert low_wacc_row[0] is not None  # g=0.019 < 0.02 still computes
     assert grid.per_share_values[1][1] is not None  # center always present
+
+
+# The grid's offsets are applied to values the caller is allowed to send, so a
+# shifted corner can leave the public bounds on its own. That used to raise out
+# of the grid and 422 the whole request, blaming the caller for a value the
+# server invented -- and `sensitivity` defaults to true, so it was the default
+# path. Every assumption below is inside the documented range.
+@pytest.mark.parametrize(
+    ("wacc", "terminal_growth", "corner"),
+    [
+        (MAX_WACC, 0.02, "wacc+1% = 0.51 exceeds MAX_WACC"),
+        (0.09, MIN_TERMINAL_GROWTH, "g-0.5% = -0.105 is below MIN_TERMINAL_GROWTH"),
+        (0.20, MAX_TERMINAL_GROWTH, "g+0.5% = 0.105 exceeds MAX_TERMINAL_GROWTH"),
+        (0.0105, -0.05, "wacc-1% = 0.0005 is below MIN_WACC"),
+    ],
+)
+def test_grid_marks_out_of_bounds_corners_none_instead_of_failing_the_request(
+    base_financials: BaseFinancials, wacc: float, terminal_growth: float, corner: str
+):
+    assumptions = _grid_assumptions(wacc=wacc, terminal_growth=terminal_growth)
+    point = compute_dcf(base_financials, assumptions)  # the input itself is valid
+
+    grid = compute_sensitivity_grid(base_financials, assumptions)
+
+    assert grid.per_share_values[1][1] == pytest.approx(point.intrinsic_value_per_share), corner
+    assert any(cell is None for row in grid.per_share_values for cell in row), corner
+
+
+def test_grid_still_raises_for_assumptions_the_caller_actually_got_wrong(
+    base_financials: BaseFinancials,
+):
+    # Swallowing per-cell errors must not swallow the caller's own: an input
+    # outside the public bounds is still a 422, not a grid full of nulls.
+    with pytest.raises(DCFValidationError) as exc:
+        compute_sensitivity_grid(base_financials, _grid_assumptions(wacc=MAX_WACC + 0.01))
+    assert exc.value.field == "wacc"
 
 
 # ---------------------------------------------------------------------------
