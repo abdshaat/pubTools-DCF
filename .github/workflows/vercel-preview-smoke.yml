@@ -19,7 +19,7 @@ jobs:
         ${{ github.event.deployment_status.environment_url ||
             github.event.deployment_status.target_url }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ github.event.deployment.sha }}
       - uses: actions/setup-python@v5
