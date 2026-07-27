@@ -727,14 +727,15 @@ system per product).
   `SupabaseClient.get_daily_quota_usage()` (read-only lookup against
   `daily_quota_counters` by `subject_id`/`quota_window`, no increment);
   `app/accounts.py::list_keys()` now enriches each non-revoked key with
-  `requests_used_today` (revoked keys skip the lookup, report `None`);
+  `requests_used_today` (revoked keys skip the lookup — as of 2026-07-26 they
+  are dropped from the listing entirely, so the lookup can never reach one);
   `create_key()` returns `requests_used_today: 0` for a freshly created key
   without an extra query. `ApiKeySummaryOut` exposes the new field;
   `docs/index.html` shows "`N`/`daily_quota` today" instead of the static
   limit. Verified against the real Supabase project's schema (not just
   mocks) via a direct live query. Tested:
   `test_list_keys_enriches_active_keys_with_todays_usage`,
-  `test_list_keys_does_not_look_up_usage_for_revoked_keys`,
+  `test_list_keys_omits_revoked_keys_and_spends_no_quota_lookup_on_them`,
   `test_create_key_returns_zero_requests_used_today_without_a_quota_lookup`,
   `test_account_keys_list_reports_requests_used_today`, plus
   `SupabaseClient.get_daily_quota_usage` unit tests.

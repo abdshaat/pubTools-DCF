@@ -1,5 +1,48 @@
 # Progress Log
 
+## 2026-07-26 — UI fix: revoked API keys now disappear from the account list
+
+Owner report: after revoking a key, it stays on the page. That was the built
+behaviour rather than a malfunction — `GET /v1/account/keys` returned every key
+the customer had ever created, and `renderKeys()` drew revoked ones as a row
+reading "revoked" with its action buttons suppressed. The row was permanently
+inert: a revoked key cannot authenticate, rotate, or be renamed, so it
+accumulated forever with nothing the owner could do about it.
+
+- **Fixed at the source, not just in the DOM.** `app/accounts.py::list_keys()`
+  now drops revoked rows before enrichment, so the endpoint stops sending them
+  at all. Filtering only in the browser would have left the revoked rows on the
+  wire and kept the account UI as the sole thing standing between a dead key and
+  the screen.
+- **The listing hides the key; it does not delete it.** `revoked = true` stays in
+  `api_keys` — that column is what makes the *authenticator* reject the secret
+  (`AuthFailureReason.REVOKED`), so deleting the row would turn revocation into
+  "prefix is free to reissue." Revocation history stays in the audit log
+  (`account.key_revoked`). Both properties are asserted in the new tests.
+- **A second filter in `renderKeys()`, deliberately not redundant**, and placed
+  *before* the empty-state check — that ordering is what makes revoking your last
+  key say "No API keys yet." rather than render an empty box. It also means a
+  stale or replayed response can't resurrect a row. With revoked keys unable to
+  reach the renderer, the `key.revoked ? "revoked"` branch and the
+  `if (!key.revoked)` guard around the three buttons became dead and were
+  removed.
+- **A quota lookup was already being skipped for revoked keys**; that branch in
+  `_with_usage_today` is now unreachable and was deleted, with the docstring
+  moved to say why (`list_keys` filters first).
+- **Verification: suite 461 → 463 passing, 94.87% coverage**; ruff lint + format
+  and mypy clean. Route-level test creates two keys, revokes one, and asserts the
+  other survives the listing while the revoked row keeps `revoked = true` in the
+  backend. The **front-end half was executed, not eyeballed**: a harness extracts
+  the real `renderKeys()` source out of `docs/index.html` by brace-matching and
+  runs it against a DOM stub, confirming all-revoked → empty state, mixed →
+  only the active row, and that the surviving row keeps its quota/last-used text
+  and all three buttons. Both inline `<script>` blocks pass `node --check`.
+- **Docs:** the stale `IMPLEMENTATION_PLAN.md` note claiming revoked keys are
+  listed with `requests_used_today: None` was corrected, along with the renamed
+  test it cited.
+- Next: unchanged — P3 + migration 005, then Phase 12. Owner-side: §7.3
+  (`FMP_API_KEY` rotation), the SLO sign-off, §1.4c/§1.5, and §4b.
+
 ## 2026-07-26 — Documentation audit; two live production defects found, both fixed and confirmed live 2026-07-27
 
 The task was to reconcile `issues.MD`, `PROGRESS.md`, and
@@ -1759,7 +1802,7 @@ specs live in CLAUDE.md; this file is only the running state.
   `apikey=REDACTED`, then rotate `FMP_API_KEY` (`TODO.md` §7).
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **461 passing tests (94.88% coverage, 93% floor)**;
+  verification, and **463 passing tests (94.87% coverage, 93% floor)**;
   ruff/format/mypy clean. Performance items **P1** (last-used write coalesced
   off the critical path) and **P2** (statements and live price fetched
   concurrently) landed 2026-07-26: a warm keyed request now costs 3 Supabase
@@ -1770,7 +1813,9 @@ specs live in CLAUDE.md; this file is only the running state.
   (`pt_csrf`/`X-CSRF-Token`) and peppered API-key hashing are implemented.
   **Phase 6** (GitHub OAuth + email magic-link sign-in, self-service key
   list/create/rotate/revoke/rename) is functionally complete and confirmed
-  live, except explicitly deferred email-verification/CAPTCHA items.
+  live, except explicitly deferred email-verification/CAPTCHA items. As of
+  2026-07-26 the key listing returns **active keys only** — revoking one removes
+  it from the account UI instead of leaving an inert "revoked" row.
   **Phase 9 public site is committed and live on `ashaat.dev`** (portfolio at
   `/`, `/apis` directory, DCF at `/dcf`). **ADR-008 is implemented, deployed,
   and live-verified (model 0.2.0):** the market price is fetched **live from

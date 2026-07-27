@@ -400,7 +400,7 @@ def test_list_keys_enriches_active_keys_with_todays_usage():
     _run(exercise())
 
 
-def test_list_keys_does_not_look_up_usage_for_revoked_keys():
+def test_list_keys_omits_revoked_keys_and_spends_no_quota_lookup_on_them():
     backend = FakeSupabaseBackend()
     client = SupabaseClient(_config(), transport=backend.transport())
     backend.customers.append(
@@ -412,11 +412,32 @@ def test_list_keys_does_not_look_up_usage_for_revoked_keys():
         await revoke_key(client, customer_id="cust-1", key_id=record["id"])
 
         rows = await list_keys(client, customer_id="cust-1")
-        assert len(rows) == 1
-        assert rows[0]["revoked"] is True
-        assert rows[0]["requests_used_today"] is None
+        assert rows == []
+        # the row is still in the table -- it's the listing that hides it, so
+        # revocation stays durable rather than becoming a delete
+        assert backend.keys[0]["revoked"] is True
         # no counter row was ever created/queried for the revoked key
         assert backend.quota_counters == {}
+
+    _run(exercise())
+
+
+def test_list_keys_keeps_active_keys_when_a_sibling_is_revoked():
+    """Revoking one key must not disturb the others in the listing."""
+    backend = FakeSupabaseBackend()
+    client = SupabaseClient(_config(), transport=backend.transport())
+    backend.customers.append(
+        {"id": "cust-1", "name": "alice", "email": None, "auth_user_id": "gh-1"}
+    )
+
+    async def exercise():
+        doomed, _ = await create_key(client, customer_id="cust-1", label="doomed")
+        keeper, _ = await create_key(client, customer_id="cust-1", label="keeper")
+        await revoke_key(client, customer_id="cust-1", key_id=doomed["id"])
+
+        rows = await list_keys(client, customer_id="cust-1")
+        assert [row["id"] for row in rows] == [keeper["id"]]
+        assert rows[0]["requests_used_today"] == 0
 
     _run(exercise())
 

@@ -1536,14 +1536,18 @@ FMP_API_KEY=your-key-here</code></pre>
   function renderKeys(keys) {
     var box = $("account-keys");
     box.textContent = "";
-    if (!keys.length) {
+    // The API already omits revoked keys; filtering again here means a stale
+    // or replayed response can't resurrect one, and it happens before the
+    // empty-state check so revoking your last key says "No API keys yet."
+    var active = keys.filter(function (key) { return !key.revoked; });
+    if (!active.length) {
       var empty = document.createElement("p");
       empty.className = "hint";
       empty.textContent = "No API keys yet.";
       box.appendChild(empty);
       return;
     }
-    keys.forEach(function (key) {
+    active.forEach(function (key) {
       var row = document.createElement("div");
       row.className = "metric";
       row.style.marginBottom = "8px";
@@ -1557,46 +1561,45 @@ FMP_API_KEY=your-key-here</code></pre>
         : key.daily_quota + "/day";
       var value = document.createElement("span");
       value.className = "value";
-      value.textContent = key.revoked
-        ? "revoked"
-        : quotaText + (key.last_used_at ? ", last used " + timeAgo(key.last_used_at) : ", never used");
+      value.textContent =
+        quotaText + (key.last_used_at ? ", last used " + timeAgo(key.last_used_at) : ", never used");
 
       row.appendChild(label);
       row.appendChild(value);
 
-      if (!key.revoked) {
-        var renameBtn = document.createElement("button");
-        renameBtn.type = "button";
-        renameBtn.className = "run";
-        renameBtn.style.marginLeft = "12px";
-        renameBtn.style.background = "var(--panel)";
-        renameBtn.style.color = "var(--ink)";
-        renameBtn.style.border = "1px solid var(--line)";
-        renameBtn.textContent = "Rename";
-        renameBtn.title = "Change this key's label. Does not affect the secret or quota.";
-        renameBtn.addEventListener("click", function () { renameKey(key.id, key.label); });
-        row.appendChild(renameBtn);
+      var renameBtn = document.createElement("button");
+      renameBtn.type = "button";
+      renameBtn.className = "run";
+      renameBtn.style.marginLeft = "12px";
+      renameBtn.style.background = "var(--panel)";
+      renameBtn.style.color = "var(--ink)";
+      renameBtn.style.border = "1px solid var(--line)";
+      renameBtn.textContent = "Rename";
+      renameBtn.title = "Change this key's label. Does not affect the secret or quota.";
+      renameBtn.addEventListener("click", function () { renameKey(key.id, key.label); });
+      row.appendChild(renameBtn);
 
-        var rotateBtn = document.createElement("button");
-        rotateBtn.type = "button";
-        rotateBtn.className = "run";
-        rotateBtn.style.marginLeft = "8px";
-        rotateBtn.style.background = "var(--panel)";
-        rotateBtn.style.color = "var(--ink)";
-        rotateBtn.style.border = "1px solid var(--line)";
-        rotateBtn.textContent = "Rotate";
-        rotateBtn.title = "Generate a new secret for this key; the old one stops working immediately.";
-        rotateBtn.addEventListener("click", function () { rotateKey(key.id); });
-        row.appendChild(rotateBtn);
+      var rotateBtn = document.createElement("button");
+      rotateBtn.type = "button";
+      rotateBtn.className = "run";
+      rotateBtn.style.marginLeft = "8px";
+      rotateBtn.style.background = "var(--panel)";
+      rotateBtn.style.color = "var(--ink)";
+      rotateBtn.style.border = "1px solid var(--line)";
+      rotateBtn.textContent = "Rotate";
+      rotateBtn.title = "Generate a new secret for this key; the old one stops working immediately.";
+      rotateBtn.addEventListener("click", function () { rotateKey(key.id); });
+      row.appendChild(rotateBtn);
 
-        var revokeBtn = document.createElement("button");
-        revokeBtn.type = "button";
-        revokeBtn.className = "run";
-        revokeBtn.style.marginLeft = "8px";
-        revokeBtn.textContent = "Revoke";
-        revokeBtn.addEventListener("click", function () { revokeKey(key.id); });
-        row.appendChild(revokeBtn);
-      }
+      var revokeBtn = document.createElement("button");
+      revokeBtn.type = "button";
+      revokeBtn.className = "run";
+      revokeBtn.style.marginLeft = "8px";
+      revokeBtn.textContent = "Revoke";
+      revokeBtn.title = "Permanently disable this key. It disappears from this list and stops working immediately.";
+      revokeBtn.addEventListener("click", function () { revokeKey(key.id); });
+      row.appendChild(revokeBtn);
+
       box.appendChild(row);
     });
   }

@@ -1528,8 +1528,43 @@ def test_self_service_keys_are_isolated_between_customers():
             f"/v1/account/keys/{alice_key['id']}/revoke", headers=_csrf_headers(alice)
         )
         assert own_revoke.status_code == 200
+        # a revoked key drops out of the listing entirely -- it can't
+        # authenticate, rotate, or be renamed, so the account UI has nothing
+        # left to show for it
         alice_list_after = alice.get("/v1/account/keys")
-        assert alice_list_after.json()["keys"][0]["revoked"] is True
+        assert alice_list_after.json()["keys"] == []
+
+
+def test_revoked_key_disappears_from_the_listing_but_siblings_remain():
+    """Regression: a revoked key used to stay in `GET /v1/account/keys`
+    forever, so the account UI kept rendering a permanently inert row for it.
+    Revoking one key must remove exactly that key from the listing.
+    """
+    backend = FakeSupabaseBackend()
+    backend.register_login_code(
+        "good-code", user_id="gh-1", email="a@example.com", user_name="octocat"
+    )
+    with TestClient(_accounts_app(backend)) as test_client:
+        _login(test_client, code="good-code")
+        doomed = test_client.post(
+            "/v1/account/keys", json={"label": "doomed"}, headers=_csrf_headers(test_client)
+        ).json()
+        keeper = test_client.post(
+            "/v1/account/keys", json={"label": "keeper"}, headers=_csrf_headers(test_client)
+        ).json()
+
+        assert len(test_client.get("/v1/account/keys").json()["keys"]) == 2
+
+        revoke = test_client.post(
+            f"/v1/account/keys/{doomed['id']}/revoke", headers=_csrf_headers(test_client)
+        )
+        assert revoke.status_code == 200
+
+        remaining = test_client.get("/v1/account/keys").json()["keys"]
+
+    assert [key["id"] for key in remaining] == [keeper["id"]]
+    # revocation is still durable -- the row is hidden, not deleted
+    assert [row["revoked"] for row in backend.keys if row["id"] == doomed["id"]] == [True]
 
 
 def test_bob_cannot_rotate_alices_key():

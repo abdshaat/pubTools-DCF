@@ -331,12 +331,10 @@ def _today_window() -> str:
 
 
 async def _with_usage_today(supabase_client: SupabaseClient, row: dict[str, Any]) -> dict[str, Any]:
-    """Attaches `requests_used_today` to a copy of a key row. Revoked keys
-    don't consume quota anymore, so their usage isn't looked up."""
+    """Attaches `requests_used_today` to a copy of a key row. Only ever called
+    for active keys -- `list_keys` drops revoked ones first, so no quota lookup
+    is spent on a key that can no longer consume quota."""
     enriched = dict(row)
-    if row.get("revoked"):
-        enriched["requests_used_today"] = None
-        return enriched
     enriched["requests_used_today"] = await supabase_client.get_daily_quota_usage(
         subject_id=str(row["id"]), window=_today_window()
     )
@@ -344,8 +342,14 @@ async def _with_usage_today(supabase_client: SupabaseClient, row: dict[str, Any]
 
 
 async def list_keys(supabase_client: SupabaseClient, *, customer_id: str) -> list[dict[str, Any]]:
+    """Lists a customer's *active* keys. A revoked key is dead -- it cannot
+    authenticate, be rotated, or be renamed -- so leaving it in the listing
+    only left a permanently inert row in the account UI. Revocation history
+    stays in the audit log (`account.key_revoked`), which is where it belongs.
+    """
     rows = await supabase_client.list_customer_keys(customer_id)
-    return list(await asyncio.gather(*(_with_usage_today(supabase_client, row) for row in rows)))
+    active = [row for row in rows if not row.get("revoked")]
+    return list(await asyncio.gather(*(_with_usage_today(supabase_client, row) for row in active)))
 
 
 async def create_key(
