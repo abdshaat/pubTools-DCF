@@ -32,6 +32,7 @@ from .providers.finnhub import FinnhubConfig
 from .raw_store import DEFAULT_MAX_CAPTURES_PER_ENDPOINT, DEFAULT_RETENTION_DAYS
 from .readiness import DEFAULT_READINESS_CACHE_SECONDS
 from .redis_cache import RedisConfig
+from .response_cache import DEFAULT_VALUATION_CACHE_TTL_SECONDS
 from .supabase import SupabaseConfig
 
 DEFAULT_PUBLIC_BASE_URL = "http://127.0.0.1:8000"
@@ -76,6 +77,7 @@ class Settings:
     log_format: str
     readiness_cache_seconds: float
     trusted_proxy_hops: int
+    valuation_cache_ttl_seconds: float
     supabase: SupabaseConfig | None
     redis: RedisConfig | None
     finnhub: FinnhubConfig | None
@@ -172,6 +174,18 @@ class Settings:
                 0,
                 errors,
             ),
+            # ADR-010. `0` (the default) disables the valuation response cache
+            # outright, so an untouched deployment keeps ADR-008's behavior:
+            # every request recomputes against a live price. Any positive value
+            # is the full staleness bound on the price a caller may be served —
+            # deliberately a number the owner sets, not one the code picks.
+            valuation_cache_ttl_seconds=_float(
+                env,
+                "VALUATION_CACHE_TTL_SECONDS",
+                DEFAULT_VALUATION_CACHE_TTL_SECONDS,
+                0.0,
+                errors,
+            ),
             supabase=SupabaseConfig.from_env(),
             redis=RedisConfig.from_env(),
             finnhub=FinnhubConfig.from_env(),
@@ -206,6 +220,7 @@ class Settings:
             "log_format": self.log_format,
             "readiness_cache_seconds": self.readiness_cache_seconds,
             "trusted_proxy_hops": self.trusted_proxy_hops,
+            "valuation_cache_ttl_seconds": self.valuation_cache_ttl_seconds,
             # Features report enabled/disabled only: the configs hold service
             # URLs and service-role keys, and this dict exists to be logged.
             "supabase": _presence(self.supabase),

@@ -313,3 +313,74 @@ there), production still has no evidence trail — Phase 10's exit criterion
 needs an off-box backend, which is a separate decision (cost and retention are
 the owner's call). Everything except the writer is backend-agnostic, so that
 slice reuses the record, redaction, retention, and replay code unchanged.
+
+## ADR-010 — Bounded-staleness valuation response cache, off by default
+
+Date: 2026-07-28
+
+Context: the owner reported that two identical `GET /v1/valuations/*` requests
+both reach the backend instead of the second being served from a cache. That is
+**ADR-008 working as decided**, not a defect: the response cache was deliberately
+deleted and `Cache-Control: no-store` deliberately added so the market price
+would always be live. Investigation confirmed the statements cache is doing its
+job — a repeat costs **zero FMP calls** — and that what remains per repeat is one
+Supabase quota RPC, one Redis GET, one Finnhub call (~64 ms, the dominant
+latency), and ~10 pure-Python DCF runs. Caching only the price-independent part
+of the body was costed and rejected: it would save a few milliseconds of
+arithmetic, add a Redis round trip to do it, and still not stop the request
+reaching the backend, which was the actual complaint.
+
+Decision:
+
+- Reinstate a full valuation response cache — **including the price** — keyed by
+  ticker plus a fingerprint of the resolved assumptions, the sensitivity flag,
+  and `model_version`. This **supersedes ADR-008's** "the response is never
+  cached" and "no current price may be cached anywhere" clauses. ADR-008's other
+  rulings stand unchanged: Finnhub remains the sole price source, the DCF engine
+  stays pure, `BaseFinancials` stays price-free, and a Finnhub outage still
+  degrades to a null price rather than a stale one.
+- **`VALUATION_CACHE_TTL_SECONDS` defaults to `0`, meaning disabled**, and `0` is
+  a hard short-circuit rather than a zero-second TTL — a deployment that leaves
+  the default alone behaves exactly as it did under ADR-008 and does not spend a
+  Redis round trip discovering that. Turning caching on is an owner action in
+  environment configuration, reversible the same way, with no redeploy and no
+  code revert. The product decision therefore lives where it belongs while the
+  code change stands on its own merits.
+- **The TTL is the entire staleness bound, and it is stated rather than hidden.**
+  A hit returns `computed_at` and `price_fetched_at` as stored — deliberately
+  *not* re-stamped to now — so a caller can see the age of what they were handed
+  without knowing a cache exists. `Cache-Control` advertises the remaining
+  lifetime, not the full TTL, so a chain of caches cannot compound the bound.
+- **Always `private`, never `public`.** The body is served behind an API key and
+  the response carries per-caller `X-RateLimit-*` headers, so a shared cache must
+  not hold it.
+- **A cache hit is still metered.** The lookup happens after the middleware's
+  atomic quota consume. A cached answer is an answer the customer received;
+  making it free would misreport usage and hand out unlimited requests to anyone
+  replaying a URL.
+- **Degraded bodies are never stored.** A response carrying a price warning
+  (Finnhub outage, or the price feature switched off) is not cached, so a blip
+  cannot outlive itself and keep serving null prices for the rest of the TTL.
+  Errors are not cached either.
+- **No edge/CDN caching.** Authentication and quota run *inside* the function, so
+  an `s-maxage` would let Vercel's edge serve bodies to callers whose API key was
+  never checked and whose quota was never decremented. Edge caching would require
+  the API key in the cache key and is out of scope here.
+- The TTL is re-checked locally against the stored entry's age, so **lowering**
+  the setting binds on the next request instead of after old entries drain.
+
+Alternative considered and rejected: the 2026-07-14 module's `generation`
+pointer (`dcf:v1:gen:{TICKER}`), meant to let a refresh invalidate every cached
+variant of a ticker at once. Nothing ever rotated it, and reading it cost a Redis
+GET on every request. Under a short TTL, natural expiry *is* the invalidation
+mechanism. It returns only alongside a rotator that justifies it.
+
+Consequences: with the TTL set, a repeat identical request costs no Finnhub call,
+no statement lookup and no recompute, and — because `max-age` is now non-zero —
+may be answered by the caller's own HTTP cache without reaching the function at
+all. **That last part means such repeats are not metered**: quota and
+`usage_events` under-count by exactly the client-cached repeats. An owner who
+values billing accuracy over saving the round trip should keep the server-side
+cache and hold `max-age` at 0. The price a caller sees may be up to the TTL old,
+which during a halt, a gap, or an earnings print is a real difference; the
+default of `0` means nobody inherits that trade without choosing it.

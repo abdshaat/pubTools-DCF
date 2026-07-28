@@ -745,12 +745,18 @@ FMP_API_KEY=your-key-here</code></pre>
   <code>X-RateLimit-Reset</code>; a <code>429</code> adds <code>Retry-After</code>.</div>
 
   <h3 id="caching">Live price &amp; caching</h3>
-  <p>Every valuation carries a <strong>live market price</strong>: <code>current_price</code> is fetched from
-  Finnhub on every request and is never cached anywhere — not by the API, not by a CDN, not by your browser.
-  Responses are therefore <code>Cache-Control: no-store</code>, and conditional requests
+  <p>By default, every valuation carries a <strong>live market price</strong>: <code>current_price</code> is
+  fetched from Finnhub on every request and is never cached anywhere — not by the API, not by a CDN, not by your
+  browser. Responses are therefore <code>Cache-Control: no-store</code>, and conditional requests
   (<code>ETag</code>/<code>If-None-Match</code>) are not supported: every request returns a fresh
   <code>200</code> priced at that moment, and every request counts against your daily quota.</p>
-  <p>What <em>is</em> cached — server-side, per ticker — are the slow-moving <strong>financial statements</strong>.
+  <div class="note"><strong>Always read <code>Cache-Control</code> rather than assuming.</strong> This deployment
+  can optionally be configured to cache whole valuation responses for a few seconds. When that is on you will see
+  <code>Cache-Control: private, max-age=N</code> instead of <code>no-store</code>, and a repeated identical request
+  may be answered from cache — <code>N</code> is then the maximum age of the price you are looking at.
+  <code>computed_at</code> and <code>price_fetched_at</code> are always the real times the answer was produced, never
+  restamped, so you can tell a cached response from a fresh one by reading the body.</div>
+  <p>What is <em>always</em> cached — server-side, per ticker — are the slow-moving <strong>financial statements</strong>.
   Running several valuations of the same ticker with different assumptions reuses one statement snapshot instead of
   refetching it, so repeat requests stay fast; the DCF math itself is recomputed on every request from that
   snapshot plus the live price. <code>fundamentals_as_of</code> tells you which filing the statements come from,

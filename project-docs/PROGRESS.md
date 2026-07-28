@@ -1,5 +1,61 @@
 # Progress Log
 
+## 2026-07-28 (later) — ADR-010 implemented: bounded-staleness response cache, off by default
+
+The owner said "start implementing the caching plan", which is the sign-off the
+plan asked for. **Option C shipped**: whole valuation responses (price included)
+are cached in Redis for `VALUATION_CACHE_TTL_SECONDS`, which **defaults to `0` =
+disabled**. Suite **492 → 515 passing, 94.77% coverage**, `response_cache.py` at
+100%; ruff/format/mypy clean; the OpenAPI snapshot did not move.
+
+- **Default-off is the load-bearing property, and it is pinned by a test.** All
+  492 pre-existing tests pass untouched, and a new test asserts that with Redis
+  configured but the TTL left alone, two identical requests still produce two
+  DCF computes, two Finnhub calls, `no-store`, and nothing written to Redis.
+  `0` is a hard short-circuit, not a zero-second TTL — a second test drives a
+  backend that raises on every method to prove the disabled path never consults
+  Redis at all. So this is a config decision the owner flips either way with no
+  redeploy, not a behavior change shipped by fiat.
+- **The ADR is ADR-010, not ADR-009** — `ADR-009` was already the raw-provider-
+  evidence decision. Caught while writing it; every reference in code, tests,
+  and the plan was renumbered.
+- **Two designed-in details changed during implementation, both toward honesty
+  about staleness.** (1) `computed_at` is no longer stripped and re-stamped. The
+  plan inherited that from the 2026-07-14 module, where it existed only to
+  reproduce an ETag; re-stamping it now would hide exactly the staleness this
+  work promised to state, so a hit returns the original alongside the original
+  `price_fetched_at`. (2) `Cache-Control` advertises the *remaining* lifetime,
+  not the full TTL, so a chain of caches cannot compound the bound.
+- **The `generation` key segment was dropped**, not restored. Nothing in the
+  codebase ever rotated `dcf:v1:gen:{TICKER}` and reading it cost a Redis GET on
+  **every** request. Under a short TTL, expiry is the invalidation mechanism.
+- **Degraded bodies are never cached.** A response carrying a price warning
+  (Finnhub outage, or the price feature off) is not stored — otherwise a blip
+  would outlive itself and keep serving null prices for the rest of the TTL.
+  Errors are not cached either, and every Redis failure falls open to a live
+  compute rather than to a 5xx.
+- **A cache hit is still metered**, asserted against the Supabase fake: the
+  lookup sits after the atomic quota consume, so a hit still writes a
+  `usage_events` row and still decrements `X-RateLimit-Remaining`.
+- **Edge/CDN caching was deliberately not built**, as planned: auth and quota
+  run inside the function, so an `s-maxage` would serve bodies to callers whose
+  API key was never checked.
+- **Found and fixed en route:** `tests/conftest.py` did not clear the new
+  variable, so a developer setting it in `.env` would have silently flipped
+  caching on for the whole suite — the same class of leak as the 2026-07-11
+  ambient-credentials incident. Also added a `.venv` to the worktree, since the
+  project's dev dependencies were installed nowhere on this machine.
+- **Pre-existing staleness surfaced:** `project-docs/REQUEST_FLOW.md` has been
+  wrong since ADR-008 (still documents ETags, `304`s, and the generation
+  pointer). Step 5 is corrected and a dated banner flags the rest, rather than
+  quietly rewriting a document that needs its own verification pass.
+
+**Still owner-side:** the cache does nothing until `VALUATION_CACHE_TTL_SECONDS`
+is set in Vercel, and the exit criteria (two production requests ~5 s apart, the
+second logging `finnhub_calls=0`) need a real API key to close. `CLAUDE.md` was
+left alone deliberately — it is gitignored, and its "GET so responses are
+HTTP-cacheable" rationale is *more* true under ADR-010, not less.
+
 ## 2026-07-28 — Planning only: response caching for repeat identical valuation requests
 
 Owner reported that two identical `/v1/valuations/*` requests both reach the
@@ -1882,17 +1938,20 @@ specs live in CLAUDE.md; this file is only the running state.
 
 *(Verified against the working tree and the live deployment 2026-07-26; response-caching entry added 2026-07-28.)*
 
-- **Open decision: response caching for repeat identical valuations
-  (2026-07-28).** The owner reported that two identical requests both hit the
-  backend. Confirmed — but that is **ADR-008 working as decided**, not a bug:
-  the response cache was deliberately deleted and `no-store` deliberately added
-  so the market price is always live. The repeat already costs **zero FMP
-  calls**; what remains is one quota RPC, one Redis GET, one Finnhub call, and
-  the recompute. A decision-gated plan is at the top of `issues.MD` —
-  recommendation is a bounded-staleness response cache behind
-  `VALUATION_CACHE_TTL_SECONDS` **defaulting to `0` (off = today's behavior)**,
-  which needs an owner sign-off plus an ADR-009 because it reverses ADR-008.
-  **Nothing implemented; no code changed.**
+- **⚠️ Undeployed work in the tree: ADR-010, the bounded-staleness response
+  cache (2026-07-28).** The owner reported that two identical requests both hit
+  the backend; that turned out to be **ADR-008 working as decided**, not a bug,
+  so reversing it needed a sign-off — which the owner gave. Shipped: whole
+  valuation responses (price included) cached in Redis for
+  `VALUATION_CACHE_TTL_SECONDS`, which **defaults to `0` = disabled**, a hard
+  short-circuit that never touches Redis. Suite **515 passing, 94.77%**;
+  `response_cache.py` 100%; OpenAPI snapshot unmoved. A hit is still metered,
+  degraded/null-price bodies and errors are never stored, Redis failure falls
+  open, and `computed_at`/`price_fetched_at` come back as stored so a response
+  states its own age. Edge/CDN caching deliberately not built (auth and quota
+  run inside the function). **Nothing changes in production until the owner sets
+  the variable in Vercel**; the exit criteria in `issues.MD` need a real API key
+  to close.
 - **⚠️ Undeployed work in the tree: the 2026-07-26 safety & security audit.**
   Two HIGH, four MEDIUM and six LOW findings fixed; suite **492 passing, 94.68%
   coverage**, ruff/format/mypy clean. The two that matter most to a customer:

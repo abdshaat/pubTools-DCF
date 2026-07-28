@@ -1,5 +1,43 @@
 # Issues
 
+## ✅ Option C implemented 2026-07-28 — status of the plan below
+
+The owner gave the go-ahead ("start implementing the caching plan"), which is
+the sign-off the plan asked for. **Option C shipped, defaulting to off.**
+
+| Slice | Status |
+| --- | --- |
+| Phase 0 — measure `cache=` / `fmp_calls=` on a repeat | ⬜ **owner-side**, needs production + a real API key |
+| Slice 0 — fix a genuinely broken statements cache | ⬜ not needed unless Phase 0 shows `cache=provider` |
+| Slice 1 — `app/response_cache.py` with a configurable TTL | ✅ done |
+| Slice 2 — route wiring | ✅ done |
+| Slice 3 — edge/CDN caching | ✅ deliberately **not** built, as planned |
+| Slice 4 — tests | ✅ done — 23 new, suite **492 → 515**, 94.77% |
+| Slice 5 — ADR + cross-doc updates | ✅ done (**ADR-010**, not 009 — 009 was taken) |
+
+Three things came out different from the plan, each recorded where it lives:
+
+- **The ADR is ADR-010.** `ADR-009` already belonged to the raw-provider-evidence
+  decision, so the numbering in the plan below is wrong wherever it says 009.
+- **`computed_at` is no longer stripped.** The plan inherited "strip
+  `request_id`/`computed_at`" from the 2026-07-14 module, where it existed only
+  to reproduce an ETag. Re-stamping it now would hide exactly the staleness this
+  work promised to state, so a hit returns the original — and the response tells
+  you its own age without you having to know a cache exists.
+- **The `generation` key segment was dropped**, not carried over. Nothing ever
+  rotated it and reading it cost a Redis GET on every request; under a short TTL
+  expiry is the invalidation mechanism.
+
+Also fixed along the way: `project-docs/REQUEST_FLOW.md` had been stale since
+ADR-008 (still documenting ETags, `304`s, and the generation pointer). Step 5 is
+corrected and the rest is flagged, rather than silently rewritten.
+
+**What is still owner-side:** the cache is off until `VALUATION_CACHE_TTL_SECONDS`
+is set in Vercel, and the exit criteria at the bottom of this plan need a real
+production request to close.
+
+---
+
 ## Repeat identical requests are never served from cache — plan (2026-07-28)
 
 **Reported:** "There is no cache in my API. When I make the same exact request

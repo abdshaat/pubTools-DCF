@@ -4,6 +4,15 @@ Last verified against the code: 2026-07-14
 
 Implemented baseline: through Phase 8 Slice B
 
+> ⚠️ **This document predates ADR-008 (2026-07-18) and is stale in places.**
+> ADR-008 removed ETags, conditional `304`s, the deferred-quota "peek" phase,
+> and the FMP quote path, and made the market price a live per-request Finnhub
+> fetch; ADR-010 (2026-07-28) then reinstated the response cache in a different
+> shape. **Step 5 below has been corrected for both.** Step 14 (ETag/conditional
+> response) and any other mention of ETags, `304`, or `dcf:v1:quote:` describe
+> code that no longer exists — treat them as history until this document gets a
+> full re-verification pass.
+
 Primary application entrypoint: `app.api:app`
 
 This document explains how every public request moves through the application,
@@ -237,23 +246,40 @@ miss, the current code can therefore load financial data before those domain
 rules produce a 422. The domain rules live in `_validate()` in
 [`app/dcf_engine.py`](../app/dcf_engine.py#L86).
 
-### Step 5: distributed valuation-response cache
+### Step 5: valuation-response cache (ADR-010; **off by default**)
 
-The route creates a SHA-256 fingerprint from the fully resolved assumptions,
-the `sensitivity` flag, and `MODEL_VERSION`. It then checks Redis using:
+**Conditional — this step does not run at all unless an owner has set
+`VALUATION_CACHE_TTL_SECONDS` to a positive value.** At the default of `0` the
+route short-circuits before touching Redis, and every request recomputes against
+a live price exactly as ADR-008 specified.
+
+When enabled, the route creates a SHA-256 fingerprint from the fully resolved
+assumptions, the `sensitivity` flag, and `MODEL_VERSION`, then checks Redis
+using:
 
 ```text
-dcf:v1:resp:{TICKER}:{generation}:{fingerprint}
+dcf:v1:resp:{TICKER}:{fingerprint}
 ```
 
-The generation comes from `dcf:v1:gen:{TICKER}` and currently defaults to `0`.
-Slice C will rotate that value after durable financial-data promotion.
+There is no `{generation}` segment. The 2026-07-14 design carried one, read from
+`dcf:v1:gen:{TICKER}` and meant to be rotated by Slice C's refresh; nothing ever
+rotated it and reading it cost a Redis GET per request, so ADR-010 dropped it.
+Under a short TTL, expiry is the invalidation mechanism.
+
+The lookup happens **after** the middleware's atomic quota consume, so a hit is
+still metered.
 
 On a valid cache hit:
 
-1. Provider access and DCF computation are skipped.
-2. A new `request_id` and `computed_at` are injected.
-3. The cached data is validated through `ValuationResponse`.
+1. Statement loading, the live Finnhub quote, and DCF computation are all
+   skipped.
+2. A fresh `request_id` is injected. `computed_at` and `price_fetched_at` are
+   **not** re-stamped — they are returned as stored, so the response states its
+   own age.
+3. `Cache-Control: private, max-age=N` advertises the *remaining* lifetime.
+
+A response is stored only if it is a `200` **and** carries no price warning: a
+degraded null-price body must not outlive the outage that produced it.
 
 On a Redis error, corrupt payload, schema mismatch, or miss, processing falls
 through to the normal data/compute path. Redis is fail-open here.
@@ -447,8 +473,9 @@ normalized financial snapshot. See:
 - Response builder: [`app/schemas.py`](../app/schemas.py#L207)
 - Model version: [`app/__init__.py`](../app/__init__.py)
 
-Only successful responses are stored in the 60-second Redis response cache.
-`request_id` and `computed_at` are excluded from the cached content.
+Only successful, live-priced responses are stored in the Redis response cache,
+and only when it is enabled (ADR-010; see Step 5). `request_id` is excluded from
+the cached content; `computed_at` is deliberately kept.
 
 ### Step 14: ETag and conditional response
 

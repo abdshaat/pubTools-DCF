@@ -93,6 +93,12 @@ from .readiness import ReadinessChecker
 from .redis_cache import RedisBackend, UpstashRedisClient
 from .refresh import DailyRefreshRunner
 from .request_context import set_request_id
+from .response_cache import (
+    assumption_fingerprint,
+    get_cached_response,
+    store_response,
+    strip_per_request_fields,
+)
 from .schemas import (
     AccountKeysOut,
     ApiKeyCreatedOut,
@@ -197,9 +203,10 @@ _SECURITY_HEADERS = {
 _DOCS_DIR = FilePath(__file__).parent.parent / "docs"
 _PICS_DIR = (_DOCS_DIR / "Pics").resolve()
 
-# Valuation responses are never HTTP-cacheable (ADR-008): every response
-# carries a live, per-request market price, so no shared/browser cache may
-# retain one. Errors and auth/rate-limit responses use the same directive.
+# Errors and auth/rate-limit responses are never HTTP-cacheable, full stop.
+# Valuation 200s are `no-store` too whenever ADR-010's response cache is off
+# (the default), because each one then carries a live per-request market price;
+# see `_valuation_cache_control` for what an owner opts into by setting a TTL.
 NO_STORE = "no-store"
 
 _LANDING_PAGE_CSP = "; ".join(
@@ -276,6 +283,19 @@ _REDOC_PAGE_CSP = "; ".join(
 # platform default's.
 REVALIDATE = "public, max-age=0, must-revalidate"
 PRIVATE_NO_STORE = "private, no-store"
+
+
+def _valuation_cache_control(max_age_seconds: float, *, enabled: bool) -> str:
+    """Cacheability of a valuation response (ADR-010).
+
+    Disabled (the default) keeps ADR-008's `no-store`. Enabled advertises the
+    remaining lifetime — and always `private`, never `public`: the body is
+    served behind an API key and the response carries per-caller
+    `X-RateLimit-*` headers, so a shared cache must not hold it.
+    """
+    if not enabled:
+        return NO_STORE
+    return f"private, max-age={max(0, int(max_age_seconds))}"
 
 
 def _rate_limit_headers(result: RateLimitResult) -> dict[str, str]:
@@ -1257,10 +1277,44 @@ def create_app(
         )
         symbol = ticker.upper()
 
+        # --- ADR-010 response cache: off unless VALUATION_CACHE_TTL_SECONDS > 0 ---
+        # Consulted AFTER the middleware's atomic quota consume, so a hit is
+        # still metered — a cached answer is an answer the customer received,
+        # and not charging for it would both misreport usage and hand out free
+        # requests to anyone replaying a URL. When the TTL is 0 this costs
+        # nothing at all: `get_cached_response` short-circuits before Redis.
+        cache_enabled = resolved.valuation_cache_ttl_seconds > 0
+        fingerprint = assumption_fingerprint(assumptions, sensitivity=sensitivity)
+        cached = await get_cached_response(
+            request.app.state.redis,
+            ticker=symbol,
+            fingerprint=fingerprint,
+            ttl_seconds=resolved.valuation_cache_ttl_seconds,
+            now=time.time(),
+        )
+        if cached is not None:
+            record(
+                ticker=symbol,
+                model_version=MODEL_VERSION,
+                sensitivity=sensitivity,
+                response_cache="hit",
+                price="cached",
+            )
+            hit = JSONResponse(
+                # `computed_at` and `price_fetched_at` come back as stored, so
+                # the body states its own age rather than posing as fresh.
+                content={**cached.content, "request_id": request.state.request_id},
+            )
+            hit.headers["Cache-Control"] = _valuation_cache_control(
+                resolved.valuation_cache_ttl_seconds - cached.age_seconds,
+                enabled=cache_enabled,
+            )
+            return hit
+
         # Statements come through the cache-aside fundamentals layer
-        # (L1 -> Redis -> DB -> FMP); the DCF math is recomputed on every
-        # request — it is pure and cheap, and per the 2026-07-16 decision the
-        # request/response is never cached, only the statements are.
+        # (L1 -> Redis -> DB -> FMP); on a response-cache miss the DCF math is
+        # recomputed — it is pure and cheap — from those statements plus a
+        # live price.
         #
         # Statements and the live price are fetched CONCURRENTLY (performance
         # item P2): the quote feeds no DCF input — `BaseFinancials` has been
@@ -1321,10 +1375,29 @@ def create_app(
             ticker=symbol,
             model_version=MODEL_VERSION,
             sensitivity=sensitivity,
+            response_cache="miss" if cache_enabled else "off",
             price="live" if quote is not None else "unavailable",
         )
-        # Never HTTP-cacheable: the body carries a live per-request price.
-        response.headers["Cache-Control"] = NO_STORE
+
+        # Store only a response carrying a genuinely live price. A degraded
+        # body (Finnhub outage, or the price feature switched off) would
+        # otherwise outlive the outage that produced it and keep serving null
+        # prices for the whole TTL — turning a blip into a minute.
+        if cache_enabled and price_warning is None:
+            await store_response(
+                request.app.state.redis,
+                ticker=symbol,
+                fingerprint=fingerprint,
+                content=strip_per_request_fields(payload.model_dump(mode="json")),
+                ttl_seconds=resolved.valuation_cache_ttl_seconds,
+                stored_at=time.time(),
+            )
+
+        # `no-store` while the cache is off (ADR-008); a bounded private
+        # lifetime once ADR-010's TTL is set.
+        response.headers["Cache-Control"] = _valuation_cache_control(
+            resolved.valuation_cache_ttl_seconds, enabled=cache_enabled
+        )
         return payload
 
     @app.get("/internal/cron/refresh-financials", include_in_schema=False)

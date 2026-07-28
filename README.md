@@ -56,14 +56,35 @@ so an over-limit request never reaches a data provider.
 
 ### Live market price (ADR-008)
 
-`current_price` is fetched **live from Finnhub on every request** and is never
-cached anywhere. Valuation responses are `Cache-Control: no-store`, and
-conditional requests (`ETag`/`If-None-Match`) are not supported — every request
-is a fresh, fully metered `200` priced at that moment. If the live price is
-unavailable (outage, or a symbol Finnhub doesn't recognize), the valuation is
-still returned with `current_price`/`upside_pct` as `null` plus a warning; the
-DCF math never depends on the market price. Configure with `FINNHUB_API_KEY`
-(absent → the price feature is off and responses carry a config warning).
+`current_price` is fetched **live from Finnhub on every request**. Valuation
+responses are `Cache-Control: no-store`, and conditional requests
+(`ETag`/`If-None-Match`) are not supported — every request is a fresh, fully
+metered `200` priced at that moment. If the live price is unavailable (outage,
+or a symbol Finnhub doesn't recognize), the valuation is still returned with
+`current_price`/`upside_pct` as `null` plus a warning; the DCF math never
+depends on the market price. Configure with `FINNHUB_API_KEY` (absent → the
+price feature is off and responses carry a config warning).
+
+### Optional response cache (ADR-010)
+
+The paragraph above describes the **default** deployment, and stays exactly true
+while `VALUATION_CACHE_TTL_SECONDS` is `0`. Setting it to a positive number
+opts into caching the whole valuation response — price included — for that many
+seconds, so a repeat of an identical request costs no Finnhub call, no statement
+lookup and no recompute:
+
+- **The TTL is the entire staleness bound.** A hit can serve a price up to that
+  many seconds old. `computed_at` and `price_fetched_at` come back as stored
+  rather than re-stamped, so the response states its own age, and
+  `Cache-Control: private, max-age=…` advertises the *remaining* lifetime.
+- **Hits are still metered** — quota is consumed and a usage event is written
+  before the cache is consulted. But a non-zero `max-age` also lets the caller's
+  own HTTP cache answer repeats without reaching the API at all, and **those
+  repeats are not metered**. If billing accuracy matters more than saving the
+  round trip, leave the cache off.
+- Degraded (null-price) bodies and errors are never stored, so an outage cannot
+  outlive itself. Every Redis failure falls open to a live compute.
+- Requires Redis (`UPSTASH_REDIS_REST_*`); without it the setting has no effect.
 
 Production deployments should set `SUPABASE_URL` and
 `SUPABASE_SERVICE_ROLE_KEY`. When both are present, `/v1/valuations/{ticker}`
@@ -88,10 +109,11 @@ exists, the API fails with a controlled normalization error rather than valuing
 inconsistent data.
 
 Statements/profile data use a long cache lifetime (in-process L1 plus Redis L2
-when configured) — this is the only caching on the valuation path, so several
-differently-assumed valuations of one ticker reuse a single statement fetch.
-The market price is never part of that cache; it comes live from Finnhub per
-request. `fundamentals_as_of`, `fiscal_year`, `statement_period`, filing
+when configured), so several differently-assumed valuations of one ticker reuse
+a single statement fetch. The market price is never part of that cache; it comes
+live from Finnhub per request. By default this is the only caching on the
+valuation path — see "Optional response cache" above for the one setting that
+adds another layer. `fundamentals_as_of`, `fiscal_year`, `statement_period`, filing
 metadata, `price_as_of`, and `price_fetched_at` make the selected data
 auditable.
 
@@ -183,6 +205,7 @@ configurable.
 | `LOG_LEVEL` / `LOG_FORMAT` | `INFO` / `json` on Vercel, `text` locally | one structured line per request |
 | `METRICS_TOKEN` | unset | bearer token for `GET /internal/metrics`; without it the endpoint 401s |
 | `READINESS_CACHE_SECONDS` | `5` | how long `/ready` reuses a dependency check |
+| `VALUATION_CACHE_TTL_SECONDS` | `0` (off) | ADR-010 response cache; any positive value is the full staleness bound on the price a caller may be served |
 | `TRUSTED_PROXY_HOPS` | `1` on Vercel, `0` elsewhere | how many proxies stand in front; decides whether `X-Forwarded-For` is believed |
 
 Each request emits a single log line carrying the request id, route template,

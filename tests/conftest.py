@@ -20,6 +20,11 @@ def _no_ambient_service_env(monkeypatch):
     monkeypatch.delenv("KV_REST_API_TOKEN", raising=False)
     monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
     monkeypatch.delenv("CRON_SECRET", raising=False)
+    # ADR-010's response cache is off by default and the suite asserts that.
+    # A developer who set this in .env to try caching locally would otherwise
+    # silently flip it on for every test — the same class of leak as the
+    # ambient-credentials problem above.
+    monkeypatch.delenv("VALUATION_CACHE_TTL_SECONDS", raising=False)
 
 
 def make_base_financials() -> BaseFinancials:
