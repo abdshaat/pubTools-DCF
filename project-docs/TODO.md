@@ -36,8 +36,27 @@ one failure mode this project has actually hit.
   namespaced synthetic subject (`verify-005-<uuid>`, `customer_id` NULL) that
   cannot collide with a real API key, and **its three rows were deleted
   afterwards** — the ledger is exactly as it was.
-- [ ] **9.2 — Then deploy**, in that order. The gate is now clear: the database
-  is ahead of the code, which is the safe direction.
+- [x] **9.2 — Deployed 2026-07-28**, in that order (database first). Commit
+  `68bc9cb` built and went live as `dpl_G3wMZx6y…` in `iad1`, aliased to both
+  `www.ashaat.dev` and `ashaat.dev`; production `/health` reports instance
+  `38610b89`. Smoke-checked: `/health`, `/ready`, `/dcf`, `/apis`,
+  `/openapi.json` and `/docs` all 200; `/ready` reports **supabase ok
+  (required), redis ok, finnhub ok**; an unauthenticated valuation still
+  returns the correct 401; no 5xx and no error line in the runtime logs.
+- [ ] **9.3 — One keyed valuation, when convenient (yours — needs a customer
+  API key).** Everything above proves the app boots, reaches Supabase, and
+  serves; it cannot prove the *metered* path, because valuations require a key
+  and auth runs before quota — an unauthenticated request 401s without ever
+  reaching the new RPC. **What to do:** sign in at `www.ashaat.dev/dcf` and run
+  one valuation, exactly like §6.2. Then tell me and I will confirm two things
+  that are only observable afterwards: the request's log line should read
+  **`supabase_calls: 2`** (it was 3), and its `usage_events` row should carry
+  **`status_code: null`** with `quota_consumed: true`. *(Reminder from §6.2: run
+  it on the deployed site with your local server stopped, or the page sends the
+  request to your laptop and production never sees it.)*
+  **If it 503s instead**, that is the signal to roll back — `dpl_7EUe9c7W…`
+  (the merge commit before this one) is the rollback candidate, and the
+  migration is additive so it can stay.
 
 **One thing to know about the data, because it changes what a column means.**
 `usage_events.status_code` is now nullable, and going forward:

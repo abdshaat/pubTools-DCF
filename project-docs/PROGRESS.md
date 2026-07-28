@@ -114,10 +114,26 @@ the queue got built.
   C cheaper than it would have been before today. Also corrected in that plan:
   it asked for **ADR-009**, which is already taken (raw-evidence failure policy,
   Phase 10 Slice 1) — the next free number is **ADR-010**.
-- Next: **deploy** — the database is now ahead of the code, which is the safe
-  direction, and nothing else gates it. After that the code queue is Phase 12.
-  Owner-side otherwise unchanged: §7.3, §8.1, the SLO sign-off, §1.4c/§1.5,
-  §4b, §8.2/§8.3.
+- **Deployed the same session, database first.** Commit `68bc9cb` (rebased onto
+  the owner's response-caching plan merge, which landed mid-session) built and
+  went live as `dpl_G3wMZx6y…` in `iad1`, aliased to both hosts; instance
+  `38610b89`. Smoke-checked live: `/health`, `/ready`, `/dcf`, `/apis`,
+  `/openapi.json`, `/docs` all 200, `/ready` reporting **supabase ok (required),
+  redis ok, finnhub ok**, the unauthenticated valuation still a correct 401, and
+  **no 5xx or error line** in the runtime logs.
+- **What the deploy could NOT confirm, and why it is not hand-waving.** The
+  metered path needs a **keyed** request: valuations require an API key and auth
+  runs before quota, so an unauthenticated call 401s without ever reaching the
+  new RPC — and issuing a key needs a signed-in account. So the last mile is
+  one owner valuation (`TODO.md` §9.3), the same shape as §6.2 and §7.2. Two
+  things become observable the moment it runs: the log line should read
+  `supabase_calls: 2` where it read 3, and the `usage_events` row should carry
+  `status_code: null` with `quota_consumed: true`. The *database* half is
+  already proven directly — the RPC was exercised end to end against the same
+  production Supabase the deployed code now calls.
+- Next: the code queue is Phase 12. Owner-side unchanged: §9.3 (one keyed
+  valuation), §7.3, §8.1, the SLO sign-off, §1.4c/§1.5, §4b, §8.2/§8.3 — plus
+  the response-caching decision from the plan merged this evening.
 
 ## 2026-07-28 — Planning only: response caching for repeat identical valuation requests
 
@@ -2014,15 +2030,18 @@ specs live in CLAUDE.md; this file is only the running state.
   `VALUATION_CACHE_TTL_SECONDS` **defaulting to `0` (off = today's behavior)**,
   which needs an owner sign-off plus an ADR-009 because it reverses ADR-008.
   **Nothing implemented; no code changed.**
-- **⚠️ Undeployed work in the tree, and it is gated on a migration: P3.**
+- **P3 is deployed (2026-07-28, commit `68bc9cb`, instance `38610b89`).**
   Quota consumption and usage metering are now one Supabase round trip
   (`consume_daily_quota_and_record`), so a warm keyed valuation costs **2**
   Supabase calls instead of 3 and an over-quota 429 costs 2 instead of 3.
   `usage_events.status_code` is nullable now — `429` means the gate rejected it,
   `NULL` means admitted and served, anything else was recorded after the fact.
-  **`supabase/migrations/005_p3_metered_quota.sql` is applied and live-verified**
-  (owner, 2026-07-28), so the database is ahead of the code and the deploy is
-  unblocked. Suite **497 passing, 94.88% coverage**, ruff/format/mypy clean.
+  Migration 005 was applied **before** the deploy and live-verified through
+  every branch of its SQL. Suite **497 passing, 94.88% coverage**,
+  ruff/format/mypy clean; production smoke checks all green.
+  **One confirmation is still owner-side** (`TODO.md` §9.3): a keyed valuation,
+  which is the only request that reaches the metered path — it should log
+  `supabase_calls: 2` and leave a `status_code: null` ledger row.
 - **The 2026-07-26 safety & security audit is deployed** (commit `1582c69`),
   confirmed live 2026-07-28 by behavior: `/docs` carries the CSP it added, and
   `/dcf` answers `private, no-store` where Vercel used to say `public`.
