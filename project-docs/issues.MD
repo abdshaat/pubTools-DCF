@@ -1,5 +1,221 @@
 # Issues
 
+## Repeat identical requests are never served from cache — plan (2026-07-28)
+
+**Reported:** "There is no cache in my API. When I make the same exact request
+and I request it twice, it sends a request to the backend rather than retrieving
+the answer from cache."
+
+**Confirmed — and it is current design, not a regression.** Before planning a
+fix, the finding has to be stated plainly: the valuation response cache was
+**deliberately deleted**, and `no-store` was **deliberately added**, by an owner
+decision on 2026-07-16 that is recorded as ADR-008. So "fixing" this is not
+repairing something broken; it is **reversing a recorded product decision**, and
+that deserves a deliberate sign-off rather than a patch. The plan below is
+written so the reversal is explicit, bounded, and switchable back off.
+
+### Evidence that no response cache exists
+
+| Fact | Where |
+| --- | --- |
+| Valuation responses are `Cache-Control: no-store` | `app/api.py:1333` |
+| The route's own comment says the response is never cached, only the statements | `app/api.py:1266`–`1278` |
+| `compute_dcf` + `compute_sensitivity_grid` run on **every** request | `app/api.py:1313`–`1315` |
+| A live Finnhub quote is fetched on **every** request | `app/api.py:1285`–`1299` |
+| "The valuation request/response and the DCF math are **not** cached" | ADR-008, `project-docs/ARCHITECTURE_DECISIONS.md:198` |
+| `app/response_cache.py` (145 lines) existed at `7be4500`, deleted in `8e30cf4` (2026-07-18) | `git show 7be4500:app/response_cache.py` |
+| ETag / conditional-304 handling for this route was removed in the same change | this file, "Slices 2+3+4" |
+
+The one cache that *does* exist and *is* working is the **financial-statements**
+cache (L1 → Redis → Supabase snapshot → FMP), and it reports which layer answered
+via the `cache=` log field — `l1` / `l2` / `database` / `provider`
+(`app/fundamentals.py:564,574,602,673`).
+
+### What a second identical request costs today
+
+| Layer | Cost on the repeat request | Cached? |
+| --- | --- | --- |
+| Browser / CDN | full round trip | ❌ `no-store` forbids it |
+| Auth + quota | 1 Supabase RPC (`check_and_increment`, `app/api.py:620`) | ❌ by design (must meter) |
+| Statements | 1 Redis GET, or 1 Supabase read | ✅ **already works** — 0 FMP calls |
+| Market price | 1 Finnhub HTTP call | ❌ ADR-008 forbids caching it |
+| DCF + sensitivity grid | 10 pure-Python DCF runs | ❌ recomputed |
+
+**Read this table before choosing a fix.** The expensive upstream dependency —
+FMP — is *already* cached to zero on the repeat. What actually remains is one
+Supabase RPC, one Redis GET, one Finnhub call, and a few milliseconds of
+arithmetic. The Finnhub call is the dominant latency (measured at ~64 ms in
+production on 2026-07-27) and the only real rate-limit exposure (free tier:
+60 req/min).
+
+### Phase 0 — establish which "cache miss" is meant (do first, no code)
+
+The report is consistent with three different problems that have three different
+fixes. One measurement separates them. Send the same request twice against
+production with a real API key and read the structured log line for each:
+
+```
+GET /v1/valuations/AAPL?wacc=0.09&terminal_growth=0.025&ebit_margin=0.30&revenue_growth=0.08&projection_years=5
+```
+
+| What the 2nd request logs | What it means | Go to |
+| --- | --- | --- |
+| `cache=provider` or `fmp_calls=4` | **A real bug** — the statements cache is not holding. Fix this first; it is the only reading where money is being wasted. | Slice 0 |
+| `cache=l2` / `cache=database`, `fmp_calls=0`, `finnhub_calls=1` | Working as designed. The request reaches the server because ADR-008 says it must. | Slice 1+ |
+| No log line at all for the 2nd request | It never reached the server — something upstream already cached it. Nothing to fix. | — |
+
+Also confirm Redis is actually configured in production (`UPSTASH_REDIS_REST_URL`
++ `_TOKEN`, or the legacy `KV_REST_API_*`, `app/redis_cache.py:42`–`47`). With
+Redis absent, L1 is per-instance and Vercel churns instances, so the statements
+cache degrades to a Supabase read per request — still no FMP call, but a round
+trip that was supposed to be free. `GET /ready` reports Redis as `degraded` when
+it is unreachable.
+
+### Slice 0 — only if Phase 0 shows `cache=provider` on a repeat
+
+Genuine defect; fix before anything else. Likely suspects, in order:
+
+1. Redis unconfigured in production → every instance starts cold. Check `/ready`.
+2. `_is_current()` (`app/fundamentals.py:357`–`366`) rejects any entry stored
+   before the last 6 PM Eastern refresh boundary whenever the snapshot store is
+   configured. An entry cached at 10:00 ET stops counting as current at 18:00 ET
+   even though its TTL has hours left — by design (ADR-007), but it means the
+   afternoon→evening transition sends traffic to the DB layer until the nightly
+   refresh re-stamps `verified_at`.
+3. `FUNDAMENTALS_TTL_SECONDS` (default `14400`) set too low in the environment.
+
+### The decision this needs (owner)
+
+Three options. They are not variations on one fix — they trade different things.
+
+**Option A — change nothing; document it.** Phase 0 confirms the statements
+cache works, and the answer to "why does it hit the backend twice" is "because
+you required a live price on every call." Cost: zero. Delivers: nothing the
+report asked for.
+
+**Option B — cache the price-independent body, keep the price live.** Restore
+the response cache but store it **price-free**: strip `current_price`,
+`price_as_of`, `price_fetched_at`, `upside_pct` on write and re-inject them from
+a fresh Finnhub call on read. ADR-008 stays intact — no price is ever cached.
+Saves: the DCF recompute and the statements lookup. Keeps: `no-store`, the
+Finnhub call, the quota RPC. **Honest assessment: this is close to worthless.**
+It removes a few milliseconds of pure arithmetic and adds a Redis round trip to
+do it, and it does not stop the request reaching the backend — which is the
+actual complaint. Recorded here so it is not re-proposed later as if it were new.
+
+**Option C — bounded-staleness response cache (what the report actually asks
+for).** Cache the whole body, price included, for a short TTL, and let the
+response say so. This is the only option where a repeat request can be answered
+without a Finnhub call — and, with a client-visible `max-age`, without reaching
+the server at all. It **reverses** ADR-008's "never cached" clause, so it needs
+an ADR-009 recording the supersession and the reason.
+
+### Recommendation — Option C, defaulting to off
+
+Ship Option C behind `VALUATION_CACHE_TTL_SECONDS`, **default `0` (disabled =
+today's exact behavior)**. The owner turns caching on by setting it to `30` or
+`60` in Vercel, and turns it off again by setting it back to `0` — no redeploy of
+new code, no revert. That way the code change is reviewable and tested on its own
+merits, the product decision stays a config decision, and ADR-008's guarantee
+remains literally true in any environment that leaves the default alone.
+
+The staleness must be **stated, not hidden**: when a cached body is served, the
+response has to let the caller see how old the price is rather than presenting it
+as live.
+
+### Implementation plan (Option C)
+
+**Slice 1 — restore the cache module.**
+- Recover the deleted file as the starting point: `git show
+  7be4500:app/response_cache.py > app/response_cache.py`. It already implements
+  everything structural — key = `dcf:v1:resp:{ticker}:{generation}:{fingerprint}`
+  where the fingerprint covers the resolved assumptions, the `sensitivity` flag,
+  and `model_version`; a 60 s TTL; per-request fields stripped on write and
+  re-injected on read; errors never cached; every Redis failure fails open.
+- Change from the 2026-07-14 version: `RESPONSE_CACHE_TTL_SECONDS` becomes
+  configurable (`VALUATION_CACHE_TTL_SECONDS`, default `0`), and `0` means the
+  module is never consulted at all — not a 0-second TTL, an actual short-circuit,
+  so the disabled path costs no Redis call.
+- Keep `request_id` and `computed_at` in the stripped set. Add nothing to it: the
+  price fields are now deliberately **inside** the cached body, which is the whole
+  point of Option C and the one line where it differs from Option B.
+
+**Slice 2 — wire the route.**
+- In `get_valuation` (`app/api.py:1215`), after the quota pre-flight and before
+  `asyncio.gather`: on a cache hit, skip **both** `load_statements()` and
+  `load_quote()`, re-inject `request_id`/`computed_at`, and return.
+- **The quota RPC stays pre-flight and a cache hit is still metered.** A cached
+  answer is still an answer the customer received; not charging for it makes the
+  ledger disagree with reality and hands out free requests to whoever replays a
+  URL. The old implementation got this right — keep it right.
+- Set `Cache-Control` from the same setting: `private, max-age={ttl}` when the
+  cache is on, `no-store` when it is off. `private`, never `public` — the body is
+  served behind an API key and the response carries per-caller `X-RateLimit-*`
+  headers.
+- Surface the price age. `price_fetched_at` is already in the body, and on a hit
+  it will correctly show the older timestamp — that is sufficient, provided the
+  docs say so explicitly (Slice 5).
+
+**Slice 3 — do NOT add edge/CDN caching in this slice.** Tempting, because the
+API was designed for it (canonical query-param ordering, GET) — but auth and
+quota run **inside** the function. An `s-maxage` that lets Vercel's edge answer
+from cache serves the body to callers whose API key was never checked and whose
+quota was never decremented. If edge caching is wanted later it needs the API key
+in the cache key, and that is its own design note, not a header tweak.
+
+**Slice 4 — tests.** `tests/test_response_cache.py` (357 lines) was deleted with
+the module and is recoverable the same way. It must be extended, not just
+restored:
+- default `VALUATION_CACHE_TTL_SECONDS=0` → two identical requests produce
+  **two** Finnhub calls and `no-store` (today's behavior gets pinned, so nobody
+  enables caching by accident);
+- TTL > 0 → two identical requests produce **one** Finnhub call, one FMP-free
+  statements load, and identical bodies apart from `request_id`;
+- a cache hit still decrements quota and still writes a `usage_events` row;
+- differing assumptions, differing `sensitivity`, and a bumped `model_version`
+  each miss the cache;
+- 404/422/502/503 outcomes are never cached;
+- Redis unreachable → falls open to a live compute, never a 5xx.
+
+**Slice 5 — cross-doc updates.** These currently state the opposite of what the
+code would do, and a stale doc here is how the 2026-07-13 `PUBLIC_BASE_URL`
+incident happened:
+- `project-docs/ARCHITECTURE_DECISIONS.md` — add **ADR-009** superseding ADR-008's
+  "never cached" clause; state the bounded-staleness trade-off and that the
+  default is off. Do not edit ADR-008's text; supersede it, the way ADR-007 was.
+- `docs/index.html:747` — the "Live price & caching" section says the price is
+  "never cached anywhere — not by the API, not by a CDN, not by your browser."
+  That becomes false the moment the TTL is non-zero.
+- `README.md:60`, `:90`–`:93` — the same claim; plus add the new env var to the
+  configuration table near `:180`.
+- `CLAUDE.md` — the response-cacheability rationale for choosing GET.
+- Regenerate the OpenAPI snapshot only if the response schema actually changes.
+
+### Risks to weigh before enabling
+
+- **A cached price is a wrong price.** For a 30–60 s TTL on a slow-moving large
+  cap this is immaterial; during a halt, a gap, or an earnings print it is not.
+  This is the entire reason ADR-008 exists — the plan does not dismiss it, it
+  turns it into a knob with a stated bound.
+- **`max-age` on the client means repeat requests are not metered.** They never
+  reach the function, so quota and `usage_events` under-count by exactly the
+  cached repeats. If billing accuracy matters more than saving the round trip,
+  ship the server-side cache but keep `max-age=0, must-revalidate` — the customer
+  still pays a round trip, but it costs no Finnhub call and no compute.
+- **Redis becomes load-bearing for latency**, though not for correctness — every
+  path already fails open.
+
+### Exit criteria
+
+Two identical production requests, ~5 s apart, with the TTL set to 60: the first
+logs `finnhub_calls=1`, the second logs a cache hit with `finnhub_calls=0`, both
+return byte-identical bodies apart from `request_id`, both appear in
+`usage_events`, and the quota counter drops by 2. With the TTL back at 0, the
+same pair produces two Finnhub calls and `no-store` — proving the switch works in
+both directions.
+
+---
+
 ## Safety & security audit — 2026-07-26
 
 Scope: the whole application (`app/`, `docs/`, `scripts/`, `supabase/migrations/`,
