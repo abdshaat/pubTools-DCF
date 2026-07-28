@@ -1,5 +1,46 @@
 # Progress Log
 
+## 2026-07-28 — Planning only: response caching for repeat identical valuation requests
+
+Owner reported that two identical `/v1/valuations/*` requests both reach the
+backend instead of the second being served from cache. **Investigated and
+confirmed — but it is current design, not a regression**, so nothing was
+implemented; the session produced a decision-gated plan at the top of
+`issues.MD` ("Repeat identical requests are never served from cache").
+
+- **Root cause is a recorded decision, not a defect.** `app/response_cache.py`
+  and the ETag/304 handling were deliberately deleted in `8e30cf4` (2026-07-18)
+  and `Cache-Control: no-store` deliberately added, implementing the owner's
+  2026-07-16 decision recorded as **ADR-008** ("the valuation request/response
+  and the DCF math are **not** cached"; the price must be live on every call).
+  Fixing this means *reversing* an ADR, which is why the plan asks for a
+  sign-off instead of proposing a patch.
+- **The cache that exists is working.** The repeat request costs **zero FMP
+  calls** — statements resolve from L1/Redis/Supabase. What actually remains per
+  repeat is one Supabase quota RPC, one Redis GET, one Finnhub call (~64 ms, the
+  dominant latency), and ~10 pure-Python DCF runs. Recorded as a table in the
+  plan so the fix is not aimed at the wrong layer.
+- **Phase 0 before any code:** one measurement (`cache=` and `fmp_calls=` in the
+  log line for a repeated request) separates three different problems — a
+  genuinely broken statements cache (`cache=provider` → real bug, fix first), the
+  by-design no-store, or something already caching upstream.
+- **Three options costed, one recommended.** A (document it), B (cache the
+  price-free body — assessed as near-worthless and written down so it is not
+  re-proposed), C (bounded-staleness response cache, which is what the report
+  actually asks for). **Recommendation: C behind `VALUATION_CACHE_TTL_SECONDS`
+  defaulting to `0`** — disabled is byte-identical to today, so the code ships
+  and reviews on its own merits while the product decision stays a config flag
+  the owner flips either way without a redeploy.
+- **Two consequences called out rather than discovered later:** a client-visible
+  `max-age` means repeat requests never reach the function and are therefore
+  **not metered** (quota and `usage_events` under-count); and edge/CDN caching is
+  explicitly *out* of the plan, because auth and quota run inside the function —
+  an `s-maxage` would serve bodies to callers whose API key was never checked.
+- The deleted module and its 357-line test file are both recoverable from
+  `7be4500`, so Slice 1 starts from working code rather than a rewrite.
+
+No code, tests, or configuration changed this session.
+
 ## 2026-07-26 (last) — Safety & security audit: 2 HIGH, 4 MEDIUM, 6 LOW found and fixed
 
 Full-application audit for security, null safety, and unhandled runtime errors,
@@ -1839,8 +1880,19 @@ specs live in CLAUDE.md; this file is only the running state.
 
 ## Current state (TL;DR)
 
-*(Verified against the working tree and the live deployment 2026-07-26.)*
+*(Verified against the working tree and the live deployment 2026-07-26; response-caching entry added 2026-07-28.)*
 
+- **Open decision: response caching for repeat identical valuations
+  (2026-07-28).** The owner reported that two identical requests both hit the
+  backend. Confirmed — but that is **ADR-008 working as decided**, not a bug:
+  the response cache was deliberately deleted and `no-store` deliberately added
+  so the market price is always live. The repeat already costs **zero FMP
+  calls**; what remains is one quota RPC, one Redis GET, one Finnhub call, and
+  the recompute. A decision-gated plan is at the top of `issues.MD` —
+  recommendation is a bounded-staleness response cache behind
+  `VALUATION_CACHE_TTL_SECONDS` **defaulting to `0` (off = today's behavior)**,
+  which needs an owner sign-off plus an ADR-009 because it reverses ADR-008.
+  **Nothing implemented; no code changed.**
 - **⚠️ Undeployed work in the tree: the 2026-07-26 safety & security audit.**
   Two HIGH, four MEDIUM and six LOW findings fixed; suite **492 passing, 94.68%
   coverage**, ruff/format/mypy clean. The two that matter most to a customer:
