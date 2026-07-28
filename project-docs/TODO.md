@@ -5,11 +5,53 @@ a product decision. Nothing in this file is something Claude can complete alone.
 Each item says what it unblocks, so you can skip sections that aren't relevant
 yet.
 
-Last updated 2026-07-26.
+Last updated 2026-07-28.
 
-**Open right now:** §7.3 — rotate `FMP_API_KEY`, and §8.1 — one click to turn on
-private vulnerability reporting. Everything else here is smaller or deferred.
+**Open right now:** §9 — apply migration 005 **before** the next deploy (this
+one blocks a deploy), §7.3 — rotate `FMP_API_KEY`, and §8.1 — one click to turn
+on private vulnerability reporting. Everything else here is smaller or deferred.
 *(§6 closed 2026-07-27: the live price is working in production.)*
+
+---
+
+## 9. ⚠️ Apply migration 005 before the next deploy
+
+`supabase/migrations/005_p3_metered_quota.sql` is in the working tree. It is the
+database half of performance item P3 (quota consumption and usage metering in
+one round trip instead of two). **The code that calls it is committed alongside
+it, so deploying without applying the migration first would 503 every keyed
+valuation** — exactly the way the Slice C push did on 2026-07-18, which is the
+one failure mode this project has actually hit.
+
+- [x] **9.1 — Apply it. Done by you 2026-07-28, and live-verified the same
+  session.** Every branch of the SQL was exercised against the real Supabase:
+  `status_code` is no longer a required column (PostgREST's own schema says so);
+  both new functions exist with the right signatures and all three input guards
+  raise *before* any write; an admitted call returned `allowed=true` and wrote a
+  row with `status_code: null, quota_consumed: true`; `finalize_usage_event` set
+  it to 502 and then **refused to overwrite** on a second call; the over-limit
+  call returned `allowed=false` and wrote its own `429, quota_consumed: false,
+  rate_limited: true`. 001's `consume_daily_quota` is still present, so the
+  currently-deployed code keeps working until the deploy. The check used a
+  namespaced synthetic subject (`verify-005-<uuid>`, `customer_id` NULL) that
+  cannot collide with a real API key, and **its three rows were deleted
+  afterwards** — the ledger is exactly as it was.
+- [ ] **9.2 — Then deploy**, in that order. The gate is now clear: the database
+  is ahead of the code, which is the safe direction.
+
+**One thing to know about the data, because it changes what a column means.**
+`usage_events.status_code` is now nullable, and going forward:
+
+| Value | Meaning |
+|---|---|
+| `429` | the quota gate rejected the request |
+| `NULL` | the request was admitted and served without failing — a 200 (or, rarely, a request that died before it could record its status) |
+| anything else | a non-200 response, recorded after the fact |
+
+So "how many of my requests succeeded" becomes `status_code is null` rather than
+`status_code = 200`. If you have any saved SQL or dashboard that counts 200s,
+that is the one query to update. Rows written before this migration are
+unaffected and still carry their literal 200.
 
 ---
 
@@ -415,7 +457,8 @@ for a year is single-digit MB.
 | ~~§4.2–4.4~~ | ~~Ship Phase 8 Slice C live + enable the daily refresh cron~~ Done; five clean runs observed |
 | §4b (evidence backend) | Give production a durable raw-capture trail (Phase 10 Slice 2) |
 | §6 of `RUNBOOKS.md` (SLOs) | Close the last Phase 11 item |
-| Nothing | P3 (fold the usage event into the quota RPC, migration 005) and Phase 12 |
+| **§9 (apply migration 005)** | **Deploy P3 — until then it must not ship** |
+| Nothing | Phase 12 |
 
 ## Also worth knowing
 
@@ -450,14 +493,14 @@ for a year is single-digit MB.
   are scrubbed, so provider keys no longer reach the logs. It needs a deploy,
   and then the key rotation in §7. See `issues.MD` → "Live production defects
   found 2026-07-26".
-- **Current state 2026-07-26:** 461 tests passing, 94.88% coverage;
-  ruff/format/mypy clean; working tree clean and `main` fully pushed. Commit
-  `912c9de` (Phase 11 Slices 1–4 + P1/P2) is **deployed** — production `/health`
-  returns `instance`, confirming the new code is live. Migrations 001–004 are
-  applied; **005 does not exist yet** (P3 is unstarted). Phase 10 Slice 1
-  (raw-evidence capture) needs no deployment step — it changes only local
-  behavior. Remaining: §6, the Redis observation (§4.1), the §4b decision, and
-  the SLO sign-off.
+- **Current state 2026-07-28:** 497 tests passing, 94.88% coverage;
+  ruff/format/mypy clean. The security-audit commit `1582c69` is **deployed and
+  confirmed live** (production `/docs` now carries the CSP it added, and `/dcf`
+  answers `Cache-Control: private, no-store` where Vercel used to say `public` —
+  both are audit-only behaviors). Migrations 001–004 are applied; **005 exists
+  in the tree and is not applied — see §9, it gates the next deploy.**
+  Remaining after that: the Redis observation (§4.1), the §4b decision, and the
+  SLO sign-off.
 - Detailed context: Phase 9 in `IMPLEMENTATION_PLAN.md`, the domain checklist and
   feature definitions in `issues.MD`, decisions in `ARCHITECTURE_DECISIONS.md`
   (ADR-008 = Finnhub), session history in `PROGRESS.md`.

@@ -142,19 +142,29 @@ class SupabaseClient:
         if response.status_code >= 400:
             raise SupabaseError("Supabase last-used update failed")
 
-    async def consume_daily_quota(
+    async def consume_daily_quota_and_record(
         self,
         *,
         subject_id: str,
         limit: int,
         window: str,
+        event: dict[str, Any] | None = None,
     ) -> RateLimitResult:
+        """Consume a quota slot and write the metering row in one round trip
+        (performance item P3, migration 005).
+
+        The RPC derives `status_code`/`quota_consumed`/`rate_limited` from the
+        decision it just made, so the event carries only what the caller knows
+        before serving. A response that is not a 200 corrects its own row
+        afterwards through `finalize_usage_event`; a 200 needs no second call.
+        """
         response = await self._client.post(
-            "/rest/v1/rpc/consume_daily_quota",
+            "/rest/v1/rpc/consume_daily_quota_and_record",
             json={
                 "p_subject_id": subject_id,
                 "p_limit": limit,
                 "p_window": window,
+                "p_event": event,
             },
         )
         if response.status_code >= 400:
@@ -181,14 +191,21 @@ class SupabaseClient:
         except (KeyError, TypeError, ValueError) as exc:
             raise SupabaseError("Supabase quota RPC returned unusable fields") from exc
 
-    async def record_usage_event(
+    async def finalize_usage_event(
         self,
         *,
-        event: dict[str, Any],
+        request_id: str,
+        status_code: int,
     ) -> None:
+        """Record the final status on a row the quota call already wrote.
+
+        Only called when the response was not a 200, so the common path keeps
+        its single round trip. The RPC updates nothing if the status is already
+        set, so this cannot overwrite the 429 the quota gate recorded.
+        """
         response = await self._client.post(
-            "/rest/v1/rpc/record_usage_event",
-            json={"p_event": event},
+            "/rest/v1/rpc/finalize_usage_event",
+            json={"p_request_id": request_id, "p_status_code": status_code},
         )
         if response.status_code >= 400:
             raise SupabaseError("Supabase usage-event RPC failed")
@@ -797,37 +814,28 @@ class SupabaseDailyQuotaLimiter:
             retry_after=retry_after,
         )
 
-    async def check_and_increment(
+    async def consume_and_record(
         self,
         *,
         identity: str = "anonymous",
         limit: int | None = None,
+        principal: AuthenticatedPrincipal | None = None,
+        request_id: str,
+        method: str,
+        path: str,
+        ticker: str | None,
     ) -> RateLimitResult:
+        """One round trip: consume the quota slot and write the metering row.
+
+        Metering is no longer a separate operation that could succeed or fail
+        on its own -- a request that was billed always leaves a ledger row,
+        because the counter and the row are written in the same transaction.
+        """
         now = datetime.now(UTC)
-        return await self._client.consume_daily_quota(
+        return await self._client.consume_daily_quota_and_record(
             subject_id=identity,
             limit=limit or self._default_limit,
             window=now.date().isoformat(),
-        )
-
-
-class SupabaseUsageMeter:
-    def __init__(self, client: SupabaseClient):
-        self._client = client
-
-    async def record(
-        self,
-        *,
-        request_id: str,
-        principal: AuthenticatedPrincipal | None,
-        method: str,
-        path: str,
-        status_code: int,
-        ticker: str | None,
-        quota_consumed: bool,
-        rate_limited: bool,
-    ) -> None:
-        await self._client.record_usage_event(
             event={
                 "request_id": request_id,
                 "customer_id": principal.customer_id if principal else None,
@@ -835,9 +843,8 @@ class SupabaseUsageMeter:
                 "method": method,
                 "path": path,
                 "ticker": ticker,
-                "status_code": status_code,
-                "quota_consumed": quota_consumed,
-                "rate_limited": rate_limited,
-                "recorded_at": datetime.now(UTC).isoformat(),
-            }
+            },
         )
+
+    async def finalize_usage(self, *, request_id: str, status_code: int) -> None:
+        await self._client.finalize_usage_event(request_id=request_id, status_code=status_code)

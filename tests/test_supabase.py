@@ -24,6 +24,18 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+def _consume(limiter, *, identity: str, limit: int):
+    """The P3 consume, with the request metadata every caller has to supply."""
+    return limiter.consume_and_record(
+        identity=identity,
+        limit=limit,
+        request_id="11111111-1111-1111-1111-111111111111",
+        method="GET",
+        path="/v1/valuations/AAPL",
+        ticker="AAPL",
+    )
+
+
 def test_supabase_config_from_env(monkeypatch):
     monkeypatch.delenv("SUPABASE_URL", raising=False)
     monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
@@ -128,7 +140,7 @@ def test_supabase_lookup_and_quota_malformed_payloads_raise():
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/rest/v1/api_keys":
             return httpx.Response(200, json={"not": "a list"})
-        if request.url.path == "/rest/v1/rpc/consume_daily_quota":
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota_and_record":
             return httpx.Response(200, json=["not", "an", "object"])
         raise AssertionError(f"unexpected request: {request.url}")
 
@@ -142,7 +154,7 @@ def test_supabase_lookup_and_quota_malformed_payloads_raise():
                 await client.get_api_key_by_prefix("live")
             limiter = SupabaseDailyQuotaLimiter(client)
             with pytest.raises(SupabaseError):
-                await limiter.check_and_increment(identity="key-1", limit=100)
+                await _consume(limiter, identity="key-1", limit=100)
         finally:
             await client.aclose()
 
@@ -161,7 +173,7 @@ def test_supabase_quota_rejects_empty_row_array():
         try:
             limiter = SupabaseDailyQuotaLimiter(client)
             with pytest.raises(SupabaseError):
-                await limiter.check_and_increment(identity="key-1", limit=100)
+                await _consume(limiter, identity="key-1", limit=100)
         finally:
             await client.aclose()
 
@@ -193,7 +205,7 @@ def test_supabase_quota_parses_real_postgrest_table_rpc_shape():
         )
         try:
             limiter = SupabaseDailyQuotaLimiter(client)
-            result = await limiter.check_and_increment(identity="key-1", limit=100)
+            result = await _consume(limiter, identity="key-1", limit=100)
             assert result.allowed is True
             assert result.limit == 100
             assert result.remaining == 99
@@ -380,7 +392,9 @@ def test_unusable_quota_rpc_payload_raises_supabase_error(rows, case):
 
     client = SupabaseClient(_config(), transport=httpx.MockTransport(handler))
     with pytest.raises(SupabaseError):
-        asyncio.run(client.consume_daily_quota(subject_id="k", limit=10, window="2026-07-26"))
+        asyncio.run(
+            client.consume_daily_quota_and_record(subject_id="k", limit=10, window="2026-07-26")
+        )
 
 
 def test_malformed_expires_at_fails_closed_instead_of_500ing():

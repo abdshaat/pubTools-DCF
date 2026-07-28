@@ -1,5 +1,124 @@
 # Progress Log
 
+## 2026-07-28 (last) — P3: quota and metering in one round trip (migration 005)
+
+Session opened by auditing where the project actually stands. Two things the
+docs asserted turned out to need correcting, and then the only code item left in
+the queue got built.
+
+- **The audit work is deployed — the previous entry's "Not yet deployed" was
+  true when written and is not now.** It was committed as `1582c69` and pushed,
+  and production is running it. Proven by behavior rather than by a commit id:
+  live `/docs` carries the Content-Security-Policy that M1 added (it previously
+  had **none**), and `/dcf` answers `Cache-Control: private, no-store` where
+  Vercel used to label it `public` (M4). Both exist only in that commit.
+  `/health` is 200 at model 0.2.0. The apex still 308s to `www` — `TODO.md`
+  §1.4c is still real.
+- **Verified rather than assumed, before touching anything:** suite 492 passing
+  at 94.68%, matching the last entry exactly; tree clean; `main` level with
+  `origin/main`; migrations 001–004 present and **005 absent**, confirming P3
+  was genuinely unstarted. Every other open item across `issues.MD` and
+  `TODO.md` is owner-side or deliberately accepted, so P3 was the whole
+  code-side queue.
+- **P3 could not be built as the plan specified, and finding out why was the
+  work.** The plan said "fold `record_usage_event` into `consume_daily_quota`;
+  one round trip; metering rows unchanged in shape". But the quota RPC runs
+  **pre-flight** — it decides whether the request may be served at all — while
+  the usage write ran after the response because it carried `status_code`, a
+  `not null` column. **You cannot record the status of a response you have not
+  produced.** Those two acceptance criteria are mutually exclusive; the item was
+  written before P1/P2 traced the path. Raised with the owner with three
+  options, who chose the one that keeps the ledger honest.
+- **What shipped.** `usage_events.status_code` is nullable with an explicit
+  meaning: **429** = the gate rejected it (the RPC derives that from the same
+  count that produced the rejection, so a 429 needs no second call); **NULL** =
+  admitted and did not fail — a 200, or a request that died before finalizing;
+  **anything else** = recorded afterwards by `finalize_usage_event`, which runs
+  only for non-200 responses and only updates rows still NULL, so a late write
+  can never overwrite the gate's 429. The common path loses a hop; the
+  *interesting* rows keep full fidelity. **Warm 200: 3 Supabase round trips →
+  2. Over-quota 429: 3 → 2. Cold: 5 → 4. A failed valuation stays at 3**, which
+  is the deliberate trade — errors are rare and their status is worth a call.
+- **Two improvements that were not in the ask.** (1) The counter and the ledger
+  row are now written in **one transaction**, so a billed request can no longer
+  end up with no trace of itself; the old split could increment the counter and
+  then fail the insert, leaving billing and ledger disagreeing. That also makes
+  a metering failure a **fail-closed 503** instead of a suppressed error, which
+  is what the comment "never serve a valuation we couldn't meter" had always
+  claimed. (2) A request whose ticker is unparseable is now **metered with a
+  NULL ticker** instead of silently uncounted — it consumed a quota slot like
+  any other. The security property that produced that gap (never write raw path
+  text into the ledger) is unchanged and still pinned by its test.
+- **The outcome fields are derived in SQL, not sent by the caller.**
+  `status_code`, `quota_consumed`, and `rate_limited` are computed inside the
+  RPC from the decision it just made, so the app cannot claim a request was
+  admitted when the counter says it was rejected. The event the app sends now
+  carries only what it knows before serving: request id, customer, key, method,
+  path, ticker. `recorded_at` moved to the database's `now()` for the same
+  reason.
+- **Removed:** `SupabaseUsageMeter`, `SupabaseClient.record_usage_event`, the
+  `usage_meter` parameter and `app.state.usage_meter`. After the fold, metering
+  is not an independent operation — keeping a second, non-atomic way to write
+  the same row would re-create the divergence the fold removes. The middleware
+  detects the capability (`consume_and_record`), so the in-process fallback
+  limiter, which has no ledger, still works untouched.
+- **Migration 005 is deliberately additive and leaves 001's two functions in
+  place**, because it must be applied *before* the code that uses the new one is
+  deployed, and the code running in production until that deploy still calls
+  both.
+- **Tests: suite 492 → 497, coverage 94.68% → 94.88%**; ruff lint + format and
+  mypy clean. Five new tests pin the contract in both directions: the gate's own
+  429 row, an admitted row carrying no status, a 404 correcting its own row, a
+  junk ticker metered without being stored, and a metering failure returning a
+  fail-closed 503 having spent **zero** provider calls.
+- **Migration 005 applied by the owner the same day, and live-verified against
+  the real Supabase — every branch of the SQL, not just its existence.** The
+  fake mirrors the RPC's semantics, and a fake agreeing with itself is exactly
+  the gap that bit Slice C on 2026-07-18, so the checks were run twice over:
+  first non-mutating (PostgREST's own schema confirms `status_code` is no longer
+  required; all three input guards raise *before* any write; 001's functions are
+  still present for the code currently in production), then through the write
+  paths, because a broken INSERT would 503 every keyed valuation and the guards
+  cannot reach it. Observed end to end: an admitted call returned `allowed=true`
+  and wrote `status_code: null, quota_consumed: true, rate_limited: false`;
+  `finalize_usage_event` set that row to 502 and then **refused to overwrite it**
+  on a second call, which is the idempotence guard working; the over-limit call
+  returned `allowed=false` and wrote its own `429, quota_consumed: false,
+  rate_limited: true`. Run against a namespaced synthetic subject
+  (`verify-005-<uuid>`, `customer_id` NULL) that cannot collide with a real API
+  key — real subjects are key uuids or the literal `anonymous` — and **all three
+  synthetic rows were deleted afterwards**, leaving the 1,653-row ledger exactly
+  as found. *(The 2026-07-26 session's accidental write to the live `anonymous`
+  quota subject is why this one was namespaced by construction rather than by
+  care.)* **Not verified from here:** that `PUBLIC` cannot execute the two new
+  functions — that needs the anon key, which is not in the local `.env`. The
+  revoke/grant pair is copied verbatim from 001's, which was verified when it
+  shipped.
+- **Also corrected:** `REQUEST_FLOW.md` is stale in a way nobody had recorded —
+  it is stamped "Phase 8 Slice B, 2026-07-14" and still describes ETags,
+  conditional 304s, the response cache and the quota *peek*, all retired by
+  ADR-008, plus modules that no longer exist. Its Step 15 was also the one place
+  describing metering as a separate write. Flagged at the top with what is
+  stale, rather than patched in one section so the rest reads as current. A full
+  rewrite is its own task.
+- **Deliberately left alone:** `SupabaseDailyQuotaLimiter.peek` is dead code
+  (the Phase 7 conditional-request gate ADR-008 retired) and is now the only
+  uncovered block in `app/supabase.py`. Removing it is not P3's business.
+- **Where this lands against the response-caching plan** merged the same evening
+  (entry below): they do not conflict, and P3 helps. That plan's Option C warns
+  that a client-visible `max-age` makes repeat requests **unmetered**, because a
+  response served without reaching the server cannot be billed. A *server-side*
+  cache hit has the opposite property now — quota and metering are a single
+  call, so "serve from cache but still meter the request" costs exactly one
+  Supabase round trip instead of two, which makes the metered variant of Option
+  C cheaper than it would have been before today. Also corrected in that plan:
+  it asked for **ADR-009**, which is already taken (raw-evidence failure policy,
+  Phase 10 Slice 1) — the next free number is **ADR-010**.
+- Next: **deploy** — the database is now ahead of the code, which is the safe
+  direction, and nothing else gates it. After that the code queue is Phase 12.
+  Owner-side otherwise unchanged: §7.3, §8.1, the SLO sign-off, §1.4c/§1.5,
+  §4b, §8.2/§8.3.
+
 ## 2026-07-28 — Planning only: response caching for repeat identical valuation requests
 
 Owner reported that two identical `/v1/valuations/*` requests both reach the
@@ -41,7 +160,7 @@ implemented; the session produced a decision-gated plan at the top of
 
 No code, tests, or configuration changed this session.
 
-## 2026-07-26 (last) — Safety & security audit: 2 HIGH, 4 MEDIUM, 6 LOW found and fixed
+## 2026-07-26 — Safety & security audit: 2 HIGH, 4 MEDIUM, 6 LOW found and fixed
 
 Full-application audit for security, null safety, and unhandled runtime errors,
 with "this is a public repo" as a standing assumption. New section at the top of
@@ -139,9 +258,11 @@ code. **Suite 461 → 492 passing, 94.68% coverage**; ruff/format/mypy clean.
   HSTS header. Checking the live site disproved it — Vercel injects
   `max-age=63072000`. Recorded as informational, and the same check is what
   found M4. *Reading production beat reading the code twice in one session.*
-- **Not yet deployed.** All of the above is in the working tree only. No
-  migration and no new configuration is required; the OpenAPI snapshot changed
-  by exactly one description field.
+- ~~**Not yet deployed.** All of the above is in the working tree only.~~
+  **Superseded 2026-07-28:** committed as `1582c69`, pushed, and confirmed live
+  in production — see the entry above for the evidence. No migration and no new
+  configuration was required; the OpenAPI snapshot changed by exactly one
+  description field.
 - Next: unchanged — P3 + migration 005, then Phase 12. Owner-side, in order:
   §7.3 (`FMP_API_KEY` rotation), §8.1 (one click), the SLO sign-off, §1.4c/§1.5,
   §4b, and the two audit decisions in §8.2/§8.3.
@@ -1880,7 +2001,7 @@ specs live in CLAUDE.md; this file is only the running state.
 
 ## Current state (TL;DR)
 
-*(Verified against the working tree and the live deployment 2026-07-26; response-caching entry added 2026-07-28.)*
+*(Verified against the working tree and the live deployment 2026-07-28.)*
 
 - **Open decision: response caching for repeat identical valuations
   (2026-07-28).** The owner reported that two identical requests both hit the
@@ -1893,9 +2014,20 @@ specs live in CLAUDE.md; this file is only the running state.
   `VALUATION_CACHE_TTL_SECONDS` **defaulting to `0` (off = today's behavior)**,
   which needs an owner sign-off plus an ADR-009 because it reverses ADR-008.
   **Nothing implemented; no code changed.**
-- **⚠️ Undeployed work in the tree: the 2026-07-26 safety & security audit.**
-  Two HIGH, four MEDIUM and six LOW findings fixed; suite **492 passing, 94.68%
-  coverage**, ruff/format/mypy clean. The two that matter most to a customer:
+- **⚠️ Undeployed work in the tree, and it is gated on a migration: P3.**
+  Quota consumption and usage metering are now one Supabase round trip
+  (`consume_daily_quota_and_record`), so a warm keyed valuation costs **2**
+  Supabase calls instead of 3 and an over-quota 429 costs 2 instead of 3.
+  `usage_events.status_code` is nullable now — `429` means the gate rejected it,
+  `NULL` means admitted and served, anything else was recorded after the fact.
+  **`supabase/migrations/005_p3_metered_quota.sql` is applied and live-verified**
+  (owner, 2026-07-28), so the database is ahead of the code and the deploy is
+  unblocked. Suite **497 passing, 94.88% coverage**, ruff/format/mypy clean.
+- **The 2026-07-26 safety & security audit is deployed** (commit `1582c69`),
+  confirmed live 2026-07-28 by behavior: `/docs` carries the CSP it added, and
+  `/dcf` answers `private, no-store` where Vercel used to say `public`.
+  Two HIGH, four MEDIUM and six LOW findings fixed. The two that matter most to
+  a customer:
   the **sensitivity grid was returning 422 for documented-valid inputs**
   (`wacc=0.50`, `terminal_growth=±0.10`, `wacc<0.011` — and `sensitivity`
   defaults to true, so it was the default path), and **any non-ASCII CSRF token
@@ -1922,18 +2054,20 @@ specs live in CLAUDE.md; this file is only the running state.
   same line. Written up in `issues.MD` → "Live production defects found
   2026-07-26". Remaining: rotate `FMP_API_KEY` (`TODO.md` §7.3), since the old
   value is already in log storage.
-- **Deployment:** production runs **`b068a96`** (Phase 11 Slices 1–4 + P1/P2 +
-  the log-scrubbing fix), rebuilt 2026-07-26 so it carries the corrected Finnhub
-  key — instance `d1721502`. Migrations 001–004 applied; **005 does not exist**
-  (P3 unstarted). Still open: confirm in production logs that an FMP line reads
-  `apikey=REDACTED`, then rotate `FMP_API_KEY` (`TODO.md` §7).
+- **Deployment:** production runs **`1582c69`** (the security audit, on top of
+  Phase 11 Slices 1–4 + P1/P2 + the log-scrubbing fix and the corrected Finnhub
+  key). Migrations 001–004 applied; **005 exists in the tree and is not
+  applied** — it gates the next deploy (`TODO.md` §9). Still open: confirm in
+  production logs that an FMP line reads `apikey=REDACTED`, then rotate
+  `FMP_API_KEY` (`TODO.md` §7).
 - **Done:** pure DCF engine and sensitivity grid, FMP client/normalization,
   FastAPI route/error mapping, customer docs, real-key/live endpoint
-  verification, and **461 passing tests (94.88% coverage, 93% floor)**;
+  verification, and **497 passing tests (94.88% coverage, 93% floor)**;
   ruff/format/mypy clean. Performance items **P1** (last-used write coalesced
-  off the critical path) and **P2** (statements and live price fetched
-  concurrently) landed 2026-07-26: a warm keyed request now costs 3 Supabase
-  round trips, and the price fetch hides inside the statement fetch. **ADR-008 and Slice C parts
+  off the critical path), **P2** (statements and live price fetched
+  concurrently) and **P3** (metering folded into the quota RPC, 2026-07-28)
+  are all done: a warm keyed request now costs **2** Supabase round trips, and
+  the price fetch hides inside the statement fetch. **ADR-008 and Slice C parts
   1–2 are committed (`8e30cf4`), deployed, and live-verified; migration 003
   is applied to the production Supabase.** Supabase auth, quotas, and usage
   metering are live-verified end to end. CSRF enforcement
@@ -1949,8 +2083,9 @@ specs live in CLAUDE.md; this file is only the running state.
   construction; upside is computed at the API layer from the live quote; any
   Finnhub failure degrades to null price + warning. The Phase 7 ETag/304/
   public-cache handling and the Phase 8 Slice B response cache are **retired**
-  for this endpoint, and the quota flow is back to one atomic
-  `check_and_increment` with `X-RateLimit-*` on all valuation responses.
+  for this endpoint, and the quota flow is one atomic pre-flight consume —
+  which since P3 (2026-07-28) also writes the metering row — with
+  `X-RateLimit-*` on all valuation responses.
   **What remains of Phase 8 Slices A+B:** the statement cache — L1 +
   Redis `fund:`/`profile:`/`neg:` + distributed single-flight (N
   differently-assumed valuations of one ticker cost one FMP statement fetch)
@@ -1959,7 +2094,8 @@ specs live in CLAUDE.md; this file is only the running state.
   validity: `FINNHUB_API_KEY`'s stored *value* is wrong (see the defect note at
   the top of this section).
   `project-docs/REQUEST_FLOW.md` predates ADR-008 on the price/response-cache
-  path — trust `issues.MD`/ADRs where they disagree.
+  path **and P3 on the metering path** — it now carries a header saying so.
+  Trust `issues.MD`/ADRs where they disagree.
 - **Phase 8 Slice C is complete and confirmed live (2026-07-26): five
   consecutive successful daily runs, clean claim reconciliation, and no
   duplicate snapshot rows. Only the Redis-side observations remain, blocked
@@ -2022,11 +2158,11 @@ specs live in CLAUDE.md; this file is only the running state.
   request timings, drains in-flight statement loads on shutdown, and added
   `project-docs/RUNBOOKS.md`.
 - **Not started:** the durable production evidence backend (Phase 10 Slice 2),
-  **P3 only** of the round-trip optimizations (P1, P2, P4 are done — P3 needs
-  migration 005, which does not exist yet), OpenTelemetry export (deliberately
-  an owner decision — it adds a runtime dependency), advanced DCF drivers, and
-  Phase 15 (on hold — separate frontend split, superseded in practice by
-  Phase 9).
+  OpenTelemetry export (deliberately an owner decision — it adds a runtime
+  dependency), advanced DCF drivers (Phase 12, the next code item), and Phase 15
+  (on hold — separate frontend split, superseded in practice by Phase 9).
+  **P1–P4 are all done**, P3 as of 2026-07-28 with migration 005 awaiting the
+  owner.
 - **Run tests:** `./.venv313/Scripts/python -m pytest -q` (current Windows/OneDrive
   recovery environment; standard clean setups may use `.venv`).
 - **Run server:** `./.venv313/Scripts/uvicorn app.api:app --reload` (needs

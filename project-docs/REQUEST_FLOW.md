@@ -4,6 +4,17 @@ Last verified against the code: 2026-07-14
 
 Implemented baseline: through Phase 8 Slice B
 
+> ⚠️ **Stale as of 2026-07-28, and known to be — read the code, not this, for
+> anything below Step 12.** This document predates ADR-008 and everything after
+> it. Concretely: ETags, conditional 304s, the response cache, and the quota
+> *peek* it describes were all retired (`app/http_cache.py` and
+> `app/response_cache.py` no longer exist), and Step 15's separate usage-meter
+> write was folded into the quota RPC by performance item P3 — there is no
+> `SupabaseUsageMeter` any more. The origin/edge, configuration, and
+> authentication sections are still broadly accurate. Rewriting the rest is
+> tracked as its own task rather than done piecemeal, so no section here is half
+> current.
+
 Primary application entrypoint: `app.api:app`
 
 This document explains how every public request moves through the application,

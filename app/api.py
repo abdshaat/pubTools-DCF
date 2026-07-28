@@ -114,7 +114,6 @@ from .supabase import (
     SupabaseClient,
     SupabaseDailyQuotaLimiter,
     SupabaseError,
-    SupabaseUsageMeter,
 )
 
 # Load a local .env (gitignored) so `uvicorn app.api:app` picks up FMP_API_KEY
@@ -374,12 +373,13 @@ async def _resolve(value: Any) -> Any:
 
 
 # The same shape the route's path parameter enforces. The middleware reads the
-# ticker off the *raw* path, before FastAPI has validated anything, and hands it
-# to the usage meter -- so without this a request to `/v1/valuations/<junk>`
+# ticker off the *raw* path, before FastAPI has validated anything, and puts it
+# in the metering row -- so without this a request to `/v1/valuations/<junk>`
 # that then 422s still wrote that junk into `usage_events.ticker`, letting a
 # caller choose the contents of a row in our database (bounded only by the
 # platform's URL limit). Anything that could not be a real ticker is metered as
-# "no ticker" rather than stored verbatim.
+# "no ticker" rather than stored verbatim. The request is still metered: it
+# consumed a quota slot, so it belongs in the ledger either way.
 _TICKER_PATTERN = re.compile(r"\A[A-Z][A-Z.\-]{0,9}\Z")
 
 
@@ -399,7 +399,6 @@ def create_app(
     daily_rate_limit: int | None = None,
     rate_limiter: Any | None = None,
     authenticator: Any | None = None,
-    usage_meter: Any | None = None,
     supabase_client: SupabaseClient | None = None,
     auth_client: SupabaseAuthClient | None = None,
     redis_backend: RedisBackend | None = None,
@@ -528,8 +527,6 @@ def create_app(
         rate_limiter = SupabaseDailyQuotaLimiter(
             configured_supabase_client, default_limit=resolved.daily_rate_limit
         )
-    if usage_meter is None and configured_supabase_client is not None:
-        usage_meter = SupabaseUsageMeter(configured_supabase_client)
 
     app.state.settings = resolved
     app.state.metrics = MetricsRegistry()
@@ -538,7 +535,6 @@ def create_app(
     app.state.readiness = ReadinessChecker(cache_seconds=resolved.readiness_cache_seconds)
     app.state.rate_limiter = rate_limiter or DailyRequestLimiter(resolved.daily_rate_limit)
     app.state.authenticator = authenticator or APIKeyAuthenticator(required=False)
-    app.state.usage_meter = usage_meter
     app.state.supabase_client = configured_supabase_client
     app.state.auth_client = configured_auth_client
     app.state.login_rate_limiter = DailyRequestLimiter(LOGIN_ATTEMPTS_DAILY_LIMIT)
@@ -599,32 +595,41 @@ def create_app(
                 if principal is not None and principal.daily_quota is not None
                 else resolved.daily_rate_limit
             )
+            limiter = request.app.state.rate_limiter
+            # P3: when the limiter can meter (the Supabase one, migration 005),
+            # the quota slot and the usage row are written by a single RPC in a
+            # single transaction. The in-process fallback limiter has no ledger
+            # to write to, so it keeps the plain consume.
+            consume_and_record = getattr(limiter, "consume_and_record", None)
             try:
                 with stage("quota"):
-                    consumed = await _resolve(
-                        request.app.state.rate_limiter.check_and_increment(
-                            identity=identity, limit=limit
+                    if consume_and_record is not None:
+                        consumed = await _resolve(
+                            consume_and_record(
+                                identity=identity,
+                                limit=limit,
+                                principal=principal,
+                                request_id=request.state.request_id,
+                                method=request.method,
+                                path=request.url.path,
+                                ticker=valuation_ticker,
+                            )
                         )
-                    )
+                    else:
+                        consumed = await _resolve(
+                            limiter.check_and_increment(identity=identity, limit=limit)
+                        )
             except SupabaseError:
-                # Fail closed: never serve a valuation we couldn't meter.
+                # Fail closed: never serve a valuation we couldn't meter. Since
+                # P3 that is literal -- the metering row is part of the same
+                # call, so there is no longer a way to bill a request and lose
+                # its ledger entry.
                 return _storage_error_response(request)
             record(quota="exceeded" if not consumed.allowed else "allowed")
             if not consumed.allowed:
-                response = _over_quota_response(request, consumed)
-                if request.app.state.usage_meter is not None:
-                    with suppress(SupabaseError):
-                        await request.app.state.usage_meter.record(
-                            request_id=request.state.request_id,
-                            principal=principal,
-                            method=request.method,
-                            path=request.url.path,
-                            status_code=response.status_code,
-                            ticker=valuation_ticker,
-                            quota_consumed=False,
-                            rate_limited=True,
-                        )
-                return response
+                # The rejection is already in the ledger with its 429: the RPC
+                # derived it from the same count that produced this response.
+                return _over_quota_response(request, consumed)
 
         response = await call_next(request)
         response.headers["X-Request-ID"] = request.state.request_id
@@ -644,18 +649,20 @@ def create_app(
             # Error responses on the valuation path must never be cached.
             if response.status_code != 200:
                 response.headers["Cache-Control"] = NO_STORE
-            if request.app.state.usage_meter is not None and valuation_ticker is not None:
-                with suppress(SupabaseError):
-                    await request.app.state.usage_meter.record(
-                        request_id=request.state.request_id,
-                        principal=principal,
-                        method=request.method,
-                        path=request.url.path,
-                        status_code=response.status_code,
-                        ticker=valuation_ticker,
-                        quota_consumed=True,
-                        rate_limited=False,
-                    )
+                # The ledger row was written pre-flight with no status, which
+                # reads as "admitted"; only a response that is not a 200 is
+                # worth a second round trip to correct. Best effort: the
+                # response is already built and the request is already billed,
+                # so a failed correction must not change what the caller gets.
+                finalize_usage = getattr(request.app.state.rate_limiter, "finalize_usage", None)
+                if finalize_usage is not None:
+                    with suppress(SupabaseError):
+                        await _resolve(
+                            finalize_usage(
+                                request_id=request.state.request_id,
+                                status_code=response.status_code,
+                            )
+                        )
         return response
 
     @app.middleware("http")

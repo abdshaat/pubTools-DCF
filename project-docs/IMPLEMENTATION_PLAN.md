@@ -173,18 +173,27 @@ Traced in code 2026-07-25 (`app/api.py` middleware + route, `app/supabase.py`):
 |---|---|---|---|
 | 1 | `GET /api_keys` (auth lookup) | yes | kept — fail-closed auth must be exact |
 | 2 | `PATCH /api_keys` (`last_used_at`) | ~~yes~~ | **removed from the warm path** (P1): coalesced to at most once per key per 5 min per instance |
-| 3 | `POST /rpc/consume_daily_quota` | yes | kept — atomic, durable, fail-closed |
+| 3 | `POST /rpc/consume_daily_quota` | yes | **now `consume_daily_quota_and_record`** (P3): also writes the metering row, in the same transaction |
 | 4 | `GET /quote` (Finnhub) | yes | **no longer serialized** (P2): runs concurrently with the statement fetch |
-| 5 | `POST /rpc/record_usage_event` | yes | kept for now — P3 would fold it into #3 |
+| 5 | `POST /rpc/record_usage_event` | ~~yes~~ | **gone** (P3): folded into #3. A response that is not a 200 pays one `finalize_usage_event` call to record its status; a 200 pays nothing |
 
 It *was* **4 blocking Supabase/Finnhub round trips on a cache-warm request**, one
 of which (#2) bought nothing a customer can see. Measured end to end from this
 dev machine against the real production Supabase: ~365 ms median per warm keyed
-valuation — dominated entirely by those hops. **After P1 and P2 a warm keyed
-request makes 3 Supabase round trips (lookup, quota, usage) and overlaps the
+valuation — dominated entirely by those hops. **After P1, P2 and P3 a warm keyed
+request makes 2 Supabase round trips (lookup, quota+metering) and overlaps the
 price fetch with the statement fetch.** In-region (Vercel `iad1` next to
 Supabase) each hop is single-digit milliseconds, but the *count* is what the
 architecture controls, and it is the same everywhere.
+
+Where the remaining calls land, by outcome:
+
+| Outcome | Supabase round trips | Was |
+|---|---|---|
+| Warm 200 | 2 (lookup, quota+metering) | 3 |
+| 429 over quota | 2 (lookup, quota+metering) — the gate knows the status | 3 |
+| 404/422/502 valuation | 3 (+ `finalize_usage_event`) | 3 |
+| Cold 200 | 4 (+ snapshot read, snapshot store) | 5 |
 
 ### Standing performance work items (evidence-backed, not speculative)
 
@@ -213,12 +222,33 @@ architecture controls, and it is the same everywhere.
   are consumed pre-flight, so only authenticated, quota-paying requests reach
   the route. Note the stage timings `t_statements_ms` and `t_price_ms` now
   overlap by design and no longer sum to the request duration.
-- [ ] **P3 — Merge usage metering into the quota RPC** (migration-level).
-  `consume_daily_quota` and `record_usage_event` are two RPCs against the same
-  database in the same request. One RPC that increments and records loses no
-  durability (ADR-004 keeps billing in Postgres either way) and removes a hop.
-  Acceptance: one round trip, metering rows unchanged in shape, existing tests
-  green.
+- [x] **P3 — Merge usage metering into the quota RPC** (migration-level). Done
+  2026-07-28 with `supabase/migrations/005_p3_metered_quota.sql`.
+  **The item as originally written could not be built as specified, and the
+  reason is worth keeping:** `consume_daily_quota` runs *pre-flight* (it decides
+  whether the request may be served at all) while `record_usage_event` ran after
+  the response, because it carried `status_code` — and `usage_events.status_code`
+  was `not null`. "One round trip" and "metering rows unchanged in shape" cannot
+  both hold, because you cannot record the status of a response you have not
+  produced yet. Resolved by making the column nullable with an explicit meaning
+  rather than by dropping the outcome from the ledger:
+  **429** = rejected by the gate (derived inside the RPC from the same count
+  that produced the rejection, so it needs no second call); **NULL** = admitted,
+  no final status recorded — a 200, or a request that died before finalizing;
+  **anything else** = written afterwards by `finalize_usage_event`, which fires
+  only when the response is not a 200 and only updates rows whose status is
+  still NULL. So the common path loses a hop and the *interesting* rows keep
+  full fidelity.
+  **Two things improved that were not in the ask.** The counter and the ledger
+  row are now one transaction, so a billed request can no longer end up with no
+  trace of itself — the split could increment and then fail the insert.
+  Correspondingly, a metering failure is now a fail-closed 503 rather than a
+  suppressed error, which is what "never serve a valuation we couldn't meter"
+  always claimed to mean. And a request whose ticker is unparseable is metered
+  (with a NULL ticker) instead of silently uncounted; it spent a quota slot like
+  any other. Acceptance met: `test_a_warm_keyed_request_makes_at_most_two_supabase_round_trips`
+  asserts the exact sequence — cold `lookup, last_used, quota, snapshot_read,
+  snapshot_store`, warm `lookup, quota`.
 - [x] **P4 — Publish the numbers.** Done 2026-07-25 with Phase 11 Slice 2: every
   request logs `duration_ms`, `cache` (l1/l2/database/provider/stale), and a
   per-service call count (`fmp_calls`, `finnhub_calls`, `supabase_calls`,

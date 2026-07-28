@@ -242,7 +242,7 @@ class FakeSupabaseBackend:
                 k.update(body)
             return httpx.Response(200, json=matches)
 
-        if path == "/rest/v1/rpc/consume_daily_quota" and method == "POST":
+        if path == "/rest/v1/rpc/consume_daily_quota_and_record" and method == "POST":
             body = json.loads(request.content)
             subject_id = body["p_subject_id"]
             limit = int(body["p_limit"])
@@ -250,11 +250,24 @@ class FakeSupabaseBackend:
             key = (subject_id, window)
             count = self.quota_counters.get(key, 0) + 1
             self.quota_counters[key] = count
+            allowed = count <= limit
+            # Migration 005 derives the outcome fields from the decision the
+            # RPC just made -- the caller never sends them.
+            event = body.get("p_event")
+            if event is not None:
+                self.usage_events.append(
+                    {
+                        **event,
+                        "status_code": None if allowed else 429,
+                        "quota_consumed": allowed,
+                        "rate_limited": not allowed,
+                    }
+                )
             return httpx.Response(
                 200,
                 json=[
                     {
-                        "allowed": count <= limit,
+                        "allowed": allowed,
                         "limit": limit,
                         "remaining": max(limit - count, 0),
                         "reset_epoch": 9_999_999_999,
@@ -263,9 +276,15 @@ class FakeSupabaseBackend:
                 ],
             )
 
-        if path == "/rest/v1/rpc/record_usage_event" and method == "POST":
+        if path == "/rest/v1/rpc/finalize_usage_event" and method == "POST":
             body = json.loads(request.content)
-            self.usage_events.append(body.get("p_event", {}))
+            for event in self.usage_events:
+                # `status_code is null` in the RPC: a recorded status wins, so a
+                # late correction cannot overwrite the gate's 429.
+                if event.get("request_id") == body["p_request_id"] and (
+                    event.get("status_code") is None
+                ):
+                    event["status_code"] = body["p_status_code"]
             return httpx.Response(200, json={})
 
         if path == "/rest/v1/daily_quota_counters" and method == "GET":

@@ -710,7 +710,7 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
             # Phase 7 pre-flight peek: read-only, must NOT increment.
             calls.append(("peek", dict(request.url.params)))
             return httpx.Response(200, json=[])
-        if request.url.path == "/rest/v1/rpc/consume_daily_quota":
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota_and_record":
             calls.append(("quota", json.loads(request.content)))
             return httpx.Response(
                 200,
@@ -724,8 +724,8 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
                     }
                 ],
             )
-        if request.url.path == "/rest/v1/rpc/record_usage_event":
-            calls.append(("usage", json.loads(request.content)))
+        if request.url.path == "/rest/v1/rpc/finalize_usage_event":
+            calls.append(("finalize", json.loads(request.content)))
             return httpx.Response(200, json={"ok": True})
         if request.url.path == "/rest/v1/ticker_snapshot_heads" and request.method == "GET":
             # Phase 8 Slice C read-through: a confirmed miss precedes the
@@ -757,26 +757,28 @@ def test_supabase_auth_quota_and_usage_metering_are_used():
     assert response.status_code == 200
     # ADR-008 flow: auth (lookup + last_used), then ONE atomic consume before
     # any fetch/compute (the old non-consuming peek is gone). Slice C adds the
-    # durable-store read (miss -> bootstrap) and the awaited snapshot write
-    # BEFORE the usage record/response. Then usage.
+    # durable-store read (miss -> bootstrap) and the awaited snapshot write.
+    # Since P3 the metering row rides the consume, so a 200 makes no further
+    # Supabase call at all.
     assert [name for name, _ in calls] == [
         "lookup",
         "last_used",
         "quota",
         "snapshot_read",
         "snapshot_store",
-        "usage",
     ]
     assert "X-RateLimit-Remaining" in response.headers
     quota_payload = dict(calls)["quota"]
     assert quota_payload["p_subject_id"] == "key-1"
     assert quota_payload["p_limit"] == 100
-    usage_payload = dict(calls)["usage"]["p_event"]
+    usage_payload = quota_payload["p_event"]
     assert usage_payload["customer_id"] == "customer-1"
     assert usage_payload["api_key_id"] == "key-1"
     assert usage_payload["ticker"] == "AAPL"
-    assert usage_payload["status_code"] == 200
-    assert usage_payload["quota_consumed"] is True
+    assert usage_payload["request_id"] == response.headers["X-Request-ID"]
+    # The outcome fields are the RPC's to derive, not the caller's to assert.
+    assert "status_code" not in usage_payload
+    assert "quota_consumed" not in usage_payload
     assert key not in str(calls)
 
 
@@ -805,7 +807,7 @@ def _keyed_supabase_app(calls: list, key: str, *, clock=None):
         if path == "/rest/v1/api_keys" and method == "PATCH":
             calls.append("last_used")
             return httpx.Response(204)
-        if path == "/rest/v1/rpc/consume_daily_quota":
+        if path == "/rest/v1/rpc/consume_daily_quota_and_record":
             calls.append("quota")
             return httpx.Response(
                 200,
@@ -819,8 +821,8 @@ def _keyed_supabase_app(calls: list, key: str, *, clock=None):
                     }
                 ],
             )
-        if path == "/rest/v1/rpc/record_usage_event":
-            calls.append("usage")
+        if path == "/rest/v1/rpc/finalize_usage_event":
+            calls.append("finalize")
             return httpx.Response(200, json={"ok": True})
         if path == "/rest/v1/ticker_snapshot_heads" and method == "GET":
             calls.append("snapshot_read")
@@ -854,8 +856,13 @@ def _split_by_request(calls: list[str]) -> list[list[str]]:
     return grouped
 
 
-def test_a_warm_keyed_request_makes_at_most_three_supabase_round_trips():
-    """Performance item P1: the last-used write is off the critical path."""
+def test_a_warm_keyed_request_makes_at_most_two_supabase_round_trips():
+    """Performance items P1 and P3, as an exact call sequence.
+
+    P1 took the last-used write off the critical path; P3 folded the metering
+    row into the quota consume, so a warm successful valuation is down to the
+    two calls that decide something: is this key real, and may it spend a slot.
+    """
     key = "dcf_live_testsecret"
     calls: list[str] = []
     with TestClient(_keyed_supabase_app(calls, key)) as client:
@@ -865,12 +872,12 @@ def test_a_warm_keyed_request_makes_at_most_three_supabase_round_trips():
 
     cold, *warm = _split_by_request(calls)
     # The cold request still pays for the durable-store miss and the bootstrap.
-    assert cold == ["lookup", "last_used", "quota", "snapshot_read", "snapshot_store", "usage"]
-    # Warm requests: lookup + quota + usage only. The last-used PATCH is the
-    # round trip this item removed, and no decision a customer sees reads it.
+    assert cold == ["lookup", "last_used", "quota", "snapshot_read", "snapshot_store"]
+    # Warm requests: lookup + quota. Nothing follows the response -- a 200 has
+    # no status worth a second round trip to record.
     for request_calls in warm:
-        assert request_calls == ["lookup", "quota", "usage"]
-        assert len(request_calls) <= 3
+        assert request_calls == ["lookup", "quota"]
+        assert len(request_calls) <= 2
 
 
 def test_last_used_is_refreshed_again_after_its_interval():
@@ -911,7 +918,7 @@ def test_a_failed_last_used_write_never_denies_a_valid_key():
             )
         if request.url.path == "/rest/v1/api_keys" and request.method == "PATCH":
             return httpx.Response(500, json={"message": "write failed"})
-        if request.url.path == "/rest/v1/rpc/consume_daily_quota":
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota_and_record":
             return httpx.Response(
                 200,
                 json=[
@@ -924,7 +931,7 @@ def test_a_failed_last_used_write_never_denies_a_valid_key():
                     }
                 ],
             )
-        if request.url.path == "/rest/v1/rpc/record_usage_event":
+        if request.url.path == "/rest/v1/rpc/finalize_usage_event":
             return httpx.Response(200, json={"ok": True})
         if request.url.path == "/rest/v1/ticker_snapshot_heads":
             return httpx.Response(200, json=[])
@@ -2103,3 +2110,139 @@ def test_over_quota_returns_429_no_store_even_with_conditional_headers():
         )
     assert response.status_code == 429
     assert response.headers["Cache-Control"] == "no-store"
+
+
+def test_a_rejected_request_is_metered_by_the_gate_that_rejected_it():
+    """P3: the 429's ledger row needs no second round trip.
+
+    Its status is the one status known before the response exists, so the RPC
+    derives it from the same count that produced the rejection.
+    """
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key, daily_quota=1)
+    today = datetime.now(UTC).date().isoformat()
+    backend.quota_counters[("key-1", today)] = 1  # already at the limit
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 429
+    assert len(backend.usage_events) == 1
+    event = backend.usage_events[0]
+    assert event["status_code"] == 429
+    assert event["quota_consumed"] is False
+    assert event["rate_limited"] is True
+    assert event["ticker"] == "AAPL"
+    assert event["request_id"] == response.headers["X-Request-ID"]
+
+
+def test_a_served_request_is_metered_as_admitted_with_no_recorded_status():
+    """The other half of the same contract: an admitted request's row is
+    written before the status exists, and a 200 never comes back to fill it
+    in -- NULL is what "we billed this and it did not fail" looks like."""
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key)
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 200
+    assert len(backend.usage_events) == 1
+    event = backend.usage_events[0]
+    assert event["status_code"] is None
+    assert event["quota_consumed"] is True
+    assert event["rate_limited"] is False
+    assert event["customer_id"] == "cust-1"
+    assert event["api_key_id"] == "key-1"
+
+
+def test_a_failed_valuation_corrects_its_own_ledger_row():
+    """Only a response that is not a 200 is worth the second round trip."""
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key)
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        response = test_client.get(
+            f"/v1/valuations/ZZZZZZ?{VALID_QUERY}", headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 404
+    assert len(backend.usage_events) == 1
+    event = backend.usage_events[0]
+    assert event["status_code"] == 404
+    # Still billed: an unknown ticker consumes a slot, which is the behavior
+    # the pre-flight consume was chosen for in the first place.
+    assert event["quota_consumed"] is True
+    assert event["ticker"] == "ZZZZZZ"
+
+
+def test_a_request_whose_ticker_is_junk_is_metered_without_storing_it():
+    """The security fix (never write raw path text into the ledger) survives
+    the fold, and the request is now metered rather than silently uncounted --
+    it spent a quota slot like any other."""
+    backend = FakeSupabaseBackend()
+    key = "dcf_live_testsecret"
+    _seed_valuation_key(backend, key)
+    with TestClient(_valuation_supabase_app(backend)) as test_client:
+        response = test_client.get(
+            f"/v1/valuations/<script>?{VALID_QUERY}", headers={"X-API-Key": key}
+        )
+
+    assert response.status_code == 422
+    assert len(backend.usage_events) == 1
+    event = backend.usage_events[0]
+    assert event["ticker"] is None
+    assert event["status_code"] == 422
+
+
+def test_a_metering_failure_is_now_a_fail_closed_503():
+    """The fold makes "never serve a valuation we couldn't meter" literal: the
+    counter and the ledger row are one transaction, so a metering failure can
+    no longer leave a billed request with no trace -- it denies the request
+    instead, and no provider call is spent."""
+    key = "dcf_live_testsecret"
+    call_log: list = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/rest/v1/api_keys" and request.method == "GET":
+            return httpx.Response(
+                200,
+                json=[
+                    {
+                        "id": "key-1",
+                        "customer_id": "customer-1",
+                        "prefix": "live",
+                        "secret_hash": APIKeyAuthenticator.hash_secret(key),
+                        "scopes": ["valuation:read"],
+                        "revoked": False,
+                        "expires_at": None,
+                        "daily_quota": 100,
+                    }
+                ],
+            )
+        if request.url.path == "/rest/v1/api_keys" and request.method == "PATCH":
+            return httpx.Response(204)
+        if request.url.path == "/rest/v1/rpc/consume_daily_quota_and_record":
+            return httpx.Response(500, json={"message": "insert failed"})
+        raise AssertionError(f"unexpected Supabase request: {request.url}")
+
+    supabase = SupabaseClient(
+        SupabaseConfig(url="https://example.supabase.co", service_role_key="service-key"),
+        transport=httpx.MockTransport(handler),
+    )
+    fmp = FMPClient(api_key="test-key", transport=fixture_transport(call_log))
+    finnhub = FakeFinnhubClient()
+    app = create_app(
+        fmp_client=fmp,
+        supabase_client=supabase,
+        authenticator=SupabaseAPIKeyAuthenticator(supabase),
+        finnhub_client=finnhub,
+    )
+    with TestClient(app) as test_client:
+        response = test_client.get(f"/v1/valuations/AAPL?{VALID_QUERY}", headers={"X-API-Key": key})
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "auth_storage_unavailable"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert call_log == []
+    assert finnhub.calls == 0

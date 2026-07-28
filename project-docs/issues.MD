@@ -108,7 +108,9 @@ for).** Cache the whole body, price included, for a short TTL, and let the
 response say so. This is the only option where a repeat request can be answered
 without a Finnhub call — and, with a client-visible `max-age`, without reaching
 the server at all. It **reverses** ADR-008's "never cached" clause, so it needs
-an ADR-009 recording the supersession and the reason.
+an **ADR-010** recording the supersession and the reason. *(Corrected
+2026-07-28: this plan first said ADR-009, which is already taken — ADR-009 is
+the raw-evidence failure policy from Phase 10 Slice 1. Next free number is 010.)*
 
 ### Recommendation — Option C, defaulting to off
 
@@ -180,9 +182,10 @@ restored:
 **Slice 5 — cross-doc updates.** These currently state the opposite of what the
 code would do, and a stale doc here is how the 2026-07-13 `PUBLIC_BASE_URL`
 incident happened:
-- `project-docs/ARCHITECTURE_DECISIONS.md` — add **ADR-009** superseding ADR-008's
+- `project-docs/ARCHITECTURE_DECISIONS.md` — add **ADR-010** superseding ADR-008's
   "never cached" clause; state the bounded-staleness trade-off and that the
   default is off. Do not edit ADR-008's text; supersede it, the way ADR-007 was.
+  *(Not 009 — that number belongs to the raw-evidence failure policy.)*
 - `docs/index.html:747` — the "Live price & caching" section says the price is
   "never cached anywhere — not by the API, not by a CDN, not by your browser."
   That becomes false the moment the TTL is non-zero.
