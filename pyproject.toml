@@ -14,7 +14,7 @@ requires-python = ">=3.11"
 # releases, the next minor) so patch-level security fixes still arrive
 # automatically; Dependabot raises the rest as reviewable PRs.
 dependencies = [
-    "httpx>=0.27,<0.29",
+    "httpx>=0.28.1,<0.29",
     "fastapi>=0.115,<1.0",
     # IANA timezone data for zoneinfo on platforms without a system tz
     # database (Windows dev machines). Linux (Vercel) ships its own; the
