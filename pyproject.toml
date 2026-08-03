@@ -25,14 +25,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-    "uvicorn>=0.30,<1.0",
+    "uvicorn>=0.52.0,<1.0",
     "python-dotenv>=1.0,<2.0",
-    "pytest>=8.0,<10.0",
-    "hypothesis>=6.100,<7.0",
-    "ruff>=0.14,<1.0",
-    "mypy>=1.18,<2.0",
-    "build>=1.2,<2.0",
-    "pytest-cov>=6,<8",
+    "pytest>=9.1.1,<10.0",
+    "hypothesis>=6.164.0,<7.0",
+    "ruff>=0.16.1,<1.0",
+    "mypy>=2.3.0,<3.0",
+    "build>=1.5.0,<2.0",
+    "pytest-cov>=7.1.0,<8",
 ]
 
 # Only the app/ tree is the installable package. Without this, setuptools'
