@@ -15,7 +15,7 @@ requires-python = ">=3.11"
 # automatically; Dependabot raises the rest as reviewable PRs.
 dependencies = [
     "httpx>=0.28.1,<0.29",
-    "fastapi>=0.115,<1.0",
+    "fastapi>=0.141.1,<1.0",
     # IANA timezone data for zoneinfo on platforms without a system tz
     # database (Windows dev machines). Linux (Vercel) ships its own; the
     # marker keeps production installs unchanged. Needed for the daily
